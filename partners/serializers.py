@@ -7,14 +7,35 @@ from .models import (PartnerProfile, Wallet, PartnerServices, IndividualProfile,
                      PartnerBankAccount, PartnerWithdraw, PartnerTransactionHistory)
 
 
+def _get_prefetched_items(instance, relation_name):
+    prefetched_cache = getattr(instance, '_prefetched_objects_cache', {})
+    if relation_name in prefetched_cache:
+        return prefetched_cache.get(relation_name) or []
+
+    relation = getattr(instance, relation_name, None)
+    if relation is None:
+        return []
+
+    try:
+        return list(relation.all())
+    except Exception:
+        return []
+
+
 def get_type_and_detail(partner_profile):
     if partner_profile.partner_type == "Individual":
+        prefetched_individuals = _get_prefetched_items(partner_profile, 'individual_profile_of_partner')
+        if prefetched_individuals:
+            return IndividualSerializer(prefetched_individuals[0]).data
         try:
             identity_detail = IndividualProfile.objects.get(individual_profile_of_partner=partner_profile.partner_id)
             return IndividualSerializer(identity_detail).data
         except IndividualProfile.DoesNotExist:
             return None
     elif partner_profile.partner_type == "Company":
+        prefetched_companies = _get_prefetched_items(partner_profile, 'company_of_partner')
+        if prefetched_companies:
+            return BusinessSerializer(prefetched_companies[0]).data
         try:
             company_detail = BusinessProfile.objects.get(company_of_partner=partner_profile.partner_id)
             return BusinessSerializer(company_detail).data
@@ -133,9 +154,18 @@ class PartnerProfileSerializer(serializers.ModelSerializer):
         return obj
 
     def get_wallet_amount(self, obj):
-        return Wallet.objects.values_list('wallet_amount', flat=True).get(wallet_session=obj)
+        prefetched_wallets = _get_prefetched_items(obj, 'wallet_session')
+        if prefetched_wallets:
+            return prefetched_wallets[0].wallet_amount
+
+        wallet_amount = Wallet.objects.filter(wallet_session=obj).values_list('wallet_amount', flat=True).first()
+        return wallet_amount if wallet_amount is not None else 0.0
 
     def get_partner_service_detail(self, obj):
+        prefetched_services = _get_prefetched_items(obj, 'services_of_partner')
+        if prefetched_services:
+            return PartnerServiceSerializer(prefetched_services[0]).data
+
         try:
             service = PartnerServices.objects.get(services_of_partner=obj)
             return PartnerServiceSerializer(service).data
@@ -146,7 +176,10 @@ class PartnerProfileSerializer(serializers.ModelSerializer):
         return get_type_and_detail(obj)
 
     def get_mailing_detail(self, obj):
-        mailing_detail = PartnerMailingDetail.objects.filter(mailing_of_partner=obj).first()
+        prefetched_mailing = _get_prefetched_items(obj, 'mailing_of_partner')
+        mailing_detail = prefetched_mailing[0] if prefetched_mailing else None
+        if mailing_detail is None:
+            mailing_detail = PartnerMailingDetail.objects.filter(mailing_of_partner=obj).first()
         if not mailing_detail:
             return {}
         return PartnerMailingDetailSerializer(mailing_detail).data

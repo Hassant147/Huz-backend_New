@@ -6,7 +6,34 @@ from partners.models import PartnerProfile, HuzBasicDetail, BusinessProfile, Par
 from partners.serializers import ShortBusinessSerializer, PartnerMailingDetailSerializer, HuzAirlineSerializer
 
 
+def _get_prefetched_items(instance, relation_name):
+    prefetched_cache = getattr(instance, '_prefetched_objects_cache', {})
+    if relation_name in prefetched_cache:
+        return prefetched_cache.get(relation_name) or []
+
+    relation = getattr(instance, relation_name, None)
+    if relation is None:
+        return []
+
+    try:
+        return list(relation.all())
+    except Exception:
+        return []
+
+
+def _get_first_prefetched_item(instance, relation_name):
+    prefetched_items = _get_prefetched_items(instance, relation_name)
+    return prefetched_items[0] if prefetched_items else None
+
+
 def get_company_detail(obj):
+    if not obj.order_to or obj.order_to.partner_type != "Company":
+        return None
+
+    prefetched_company = _get_first_prefetched_item(obj.order_to, 'company_of_partner')
+    if prefetched_company:
+        return ShortBusinessSerializer(prefetched_company).data
+
     if obj.order_to.partner_type == "Company":
         try:
             company_detail = BusinessProfile.objects.get(company_of_partner=obj.order_to.partner_id)
@@ -18,6 +45,13 @@ def get_company_detail(obj):
 
 
 def get_user_address_detail(obj):
+    if not obj.order_by:
+        return None
+
+    prefetched_address = _get_first_prefetched_item(obj.order_by, 'mailing_session')
+    if prefetched_address:
+        return MailingDetailSerializer(prefetched_address).data
+
     try:
         address_detail = MailingDetail.objects.get(mailing_session=obj.order_by)
         return MailingDetailSerializer(address_detail).data
@@ -26,6 +60,13 @@ def get_user_address_detail(obj):
 
 
 def get_partner_address_detail(obj):
+    if not obj.order_to:
+        return None
+
+    prefetched_address = _get_first_prefetched_item(obj.order_to, 'mailing_of_partner')
+    if prefetched_address:
+        return PartnerMailingDetailSerializer(prefetched_address).data
+
     try:
         address_detail = PartnerMailingDetail.objects.get(mailing_of_partner=obj.order_to)
         return PartnerMailingDetailSerializer(address_detail).data
@@ -34,27 +75,30 @@ def get_partner_address_detail(obj):
 
 
 def get_booking_objections(obj):
-    try:
-        objections_detail = BookingObjections.objects.filter(objection_for_booking=obj.booking_id)
-        return BookingObjectionsSerializer(objections_detail, many=True).data
-    except BookingObjections.DoesNotExist:
-        return None
+    prefetched_objections = _get_prefetched_items(obj, 'objection_for_booking')
+    if prefetched_objections:
+        return BookingObjectionsSerializer(prefetched_objections, many=True).data
+
+    objections_detail = BookingObjections.objects.filter(objection_for_booking=obj.booking_id)
+    return BookingObjectionsSerializer(objections_detail, many=True).data
 
 
 def get_passport_validity(obj):
-    try:
-        passport_validity = PassportValidity.objects.filter(passport_for_booking_number=obj.booking_id)
-        return PassportValiditySerializer(passport_validity, many=True).data
-    except PassportValidity.DoesNotExist:
-        return None
+    prefetched_passports = _get_prefetched_items(obj, 'passport_for_booking_number')
+    if prefetched_passports:
+        return PassportValiditySerializer(prefetched_passports, many=True).data
+
+    passport_validity = PassportValidity.objects.filter(passport_for_booking_number=obj.booking_id)
+    return PassportValiditySerializer(passport_validity, many=True).data
 
 
 def get_payment_detail(obj):
-    try:
-        payment_paid = Payment.objects.filter(booking_token=obj.booking_id)
-        return PaymentSerializer(payment_paid, many=True).data
-    except Payment.DoesNotExist:
-        return None
+    prefetched_payments = _get_prefetched_items(obj, 'booking_token')
+    if prefetched_payments:
+        return PaymentSerializer(prefetched_payments, many=True).data
+
+    payment_paid = Payment.objects.filter(booking_token=obj.booking_id)
+    return PaymentSerializer(payment_paid, many=True).data
 
 
 class ShortBookingSerializer(serializers.ModelSerializer):
@@ -72,7 +116,7 @@ class ShortBookingSerializer(serializers.ModelSerializer):
     huz_token = serializers.CharField(source='package_token.huz_token', read_only=True)
     package_type = serializers.CharField(source='package_token.package_type', read_only=True)
     package_name = serializers.CharField(source='package_token.package_name', read_only=True)
-    package_cost = serializers.CharField(source='package_token.package_cost', read_only=True)
+    package_cost = serializers.CharField(source='package_token.package_base_cost', read_only=True)
     mecca_nights = serializers.CharField(source='package_token.mecca_nights', read_only=True)
     madinah_nights = serializers.CharField(source='package_token.madinah_nights', read_only=True)
     is_visa_included = serializers.CharField(source='package_token.is_visa_included', read_only=True)
@@ -141,7 +185,7 @@ class DetailBookingSerializer(serializers.ModelSerializer):
     huz_token = serializers.CharField(source='package_token.huz_token', read_only=True)
     package_type = serializers.CharField(source='package_token.package_type', read_only=True)
     package_name = serializers.CharField(source='package_token.package_name', read_only=True)
-    package_cost = serializers.CharField(source='package_token.package_cost', read_only=True)
+    package_cost = serializers.CharField(source='package_token.package_base_cost', read_only=True)
     mecca_nights = serializers.CharField(source='package_token.mecca_nights', read_only=True)
     madinah_nights = serializers.CharField(source='package_token.madinah_nights', read_only=True)
     is_visa_included = serializers.CharField(source='package_token.is_visa_included', read_only=True)
@@ -199,11 +243,15 @@ class DetailBookingSerializer(serializers.ModelSerializer):
         return get_company_detail(obj)
 
     def get_airline_detail(self, obj):
-        try:
-            airline = HuzAirlineDetail.objects.filter(airline_for_package=obj.package_token)
-            return HuzAirlineSerializer(airline, many=True).data
-        except HuzAirlineDetail.DoesNotExist:
-            return None
+        if not obj.package_token:
+            return []
+
+        prefetched_airlines = _get_prefetched_items(obj.package_token, 'airline_for_package')
+        if prefetched_airlines:
+            return HuzAirlineSerializer(prefetched_airlines, many=True).data
+
+        airline = HuzAirlineDetail.objects.filter(airline_for_package=obj.package_token)
+        return HuzAirlineSerializer(airline, many=True).data
 
     def get_passport_validity_detail(self, obj):
         return get_passport_validity(obj)
@@ -218,48 +266,118 @@ class DetailBookingSerializer(serializers.ModelSerializer):
         return get_booking_objections(obj)
 
     def get_booking_documents_status(self, obj):
-        try:
-            documents = DocumentsStatus.objects.filter(status_for_booking=obj.booking_id)
-            return DocumentsStatusSerializer(documents, many=True).data
-        except DocumentsStatus.DoesNotExist:
-            return None
+        prefetched_documents = _get_prefetched_items(obj, 'status_for_booking')
+        if prefetched_documents:
+            return DocumentsStatusSerializer(prefetched_documents, many=True).data
+
+        documents = DocumentsStatus.objects.filter(status_for_booking=obj.booking_id)
+        return DocumentsStatusSerializer(documents, many=True).data
 
     def get_user_documents(self, obj):
-        try:
-            documents = UserRequiredDocuments.objects.filter(user_document_for_booking_token=obj.booking_id)
-            return UserRequiredBookingDocumentsSerializer(documents, many=True).data
-        except UserRequiredDocuments.DoesNotExist:
-            return None
+        prefetched_documents = _get_prefetched_items(obj, 'user_document_for_booking_token')
+        if prefetched_documents:
+            return UserRequiredBookingDocumentsSerializer(prefetched_documents, many=True).data
+
+        documents = UserRequiredDocuments.objects.filter(user_document_for_booking_token=obj.booking_id)
+        return UserRequiredBookingDocumentsSerializer(documents, many=True).data
 
     def get_booking_documents(self, obj):
-        try:
-            documents = BookingDocuments.objects.filter(document_for_booking_token=obj.booking_id)
-            return BookingDocumentsSerializer(documents, many=True).data
-        except BookingDocuments.DoesNotExist:
-            return None
+        prefetched_documents = _get_prefetched_items(obj, 'document_for_booking_token')
+        if prefetched_documents:
+            return BookingDocumentsSerializer(prefetched_documents, many=True).data
+
+        documents = BookingDocuments.objects.filter(document_for_booking_token=obj.booking_id)
+        return BookingDocumentsSerializer(documents, many=True).data
 
     def get_booking_airline_details(self, obj):
-        try:
-            airline = BookingAirlineDetail.objects.filter(airline_for_booking=obj.booking_id)
-            return BookingAirlineSerializer(airline, many=True).data
-        except BookingAirlineDetail.DoesNotExist:
-            return None
+        prefetched_airline_details = _get_prefetched_items(obj, 'airline_for_booking')
+        if prefetched_airline_details:
+            return BookingAirlineSerializer(prefetched_airline_details, many=True).data
+
+        airline = BookingAirlineDetail.objects.filter(airline_for_booking=obj.booking_id)
+        return BookingAirlineSerializer(airline, many=True).data
 
     def get_booking_hotel_and_transport_details(self, obj):
-        try:
-            airline = BookingHotelAndTransport.objects.filter(hotel_or_transport_for_booking=obj.booking_id)
-            return BookingHotelOrTransportSerializer(airline, many=True).data
-        except BookingHotelAndTransport.DoesNotExist:
-            return None
+        prefetched_details = _get_prefetched_items(obj, 'hotel_or_transport_for_booking')
+        if prefetched_details:
+            return BookingHotelOrTransportSerializer(prefetched_details, many=True).data
+
+        airline = BookingHotelAndTransport.objects.filter(hotel_or_transport_for_booking=obj.booking_id)
+        return BookingHotelOrTransportSerializer(airline, many=True).data
 
 
 
     def get_booking_rating(self, obj):
-        try:
-            airline = BookingRatingAndReview.objects.filter(rating_for_booking=obj.booking_id)
-            return BookingRatingAndReviewSerializer(airline, many=True).data
-        except BookingRatingAndReview.DoesNotExist:
-            return None
+        prefetched_ratings = _get_prefetched_items(obj, 'rating_for_booking')
+        if prefetched_ratings:
+            return BookingRatingAndReviewSerializer(prefetched_ratings, many=True).data
+
+        airline = BookingRatingAndReview.objects.filter(rating_for_booking=obj.booking_id)
+        return BookingRatingAndReviewSerializer(airline, many=True).data
+
+    def get_payment_detail(self, obj):
+        return get_payment_detail(obj)
+
+
+class AdminPaidBookingSerializer(serializers.ModelSerializer):
+    # Partner Section
+    partner_session_token = serializers.CharField(source='order_to.partner_session_token', read_only=True)
+    partner_email = serializers.CharField(source='order_to.email', read_only=True)
+    partner_name = serializers.CharField(source='order_to.name', read_only=True)
+    partner_username = serializers.CharField(source='order_to.user_name', read_only=True)
+    company_detail = serializers.SerializerMethodField()
+    partner_address_detail = serializers.SerializerMethodField()
+
+    # User Section
+    user_session_token = serializers.CharField(source='order_by.session_token', read_only=True)
+    user_fullName = serializers.CharField(source='order_by.name', read_only=True)
+    user_email = serializers.CharField(source='order_by.email', read_only=True)
+    user_country_code = serializers.CharField(source='order_by.country_code', read_only=True)
+    user_phone_number = serializers.CharField(source='order_by.phone_number', read_only=True)
+    user_photo = serializers.CharField(source='order_by.user_photo', read_only=True)
+
+    # Package Detail
+    huz_token = serializers.CharField(source='package_token.huz_token', read_only=True)
+    package_type = serializers.CharField(source='package_token.package_type', read_only=True)
+    package_name = serializers.CharField(source='package_token.package_name', read_only=True)
+    package_cost = serializers.CharField(source='package_token.package_base_cost', read_only=True)
+    mecca_nights = serializers.CharField(source='package_token.mecca_nights', read_only=True)
+    madinah_nights = serializers.CharField(source='package_token.madinah_nights', read_only=True)
+    is_visa_included = serializers.CharField(source='package_token.is_visa_included', read_only=True)
+    is_airport_reception_included = serializers.CharField(source='package_token.is_airport_reception_included', read_only=True)
+    is_tour_guide_included = serializers.CharField(source='package_token.is_tour_guide_included', read_only=True)
+    is_insurance_included = serializers.CharField(source='package_token.is_insurance_included', read_only=True)
+    is_breakfast_included = serializers.CharField(source='package_token.is_breakfast_included', read_only=True)
+    is_lunch_included = serializers.CharField(source='package_token.is_lunch_included', read_only=True)
+    is_dinner_included = serializers.CharField(source='package_token.is_dinner_included', read_only=True)
+
+    payment_detail = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Booking
+        fields = (
+            'booking_number', 'adults', 'child', 'infants', 'start_date', 'end_date', 'sharing', 'quad', 'triple',
+            'double', 'single', 'total_price', 'special_request', 'booking_status', 'order_time', 'payment_type',
+            'is_payment_received',
+
+            'partner_session_token', 'partner_email', 'partner_name', 'partner_username',
+            'company_detail', 'partner_address_detail',
+
+            'user_session_token', 'user_fullName', 'user_email', 'user_country_code', 'user_phone_number',
+            'user_photo',
+
+            'huz_token', 'package_type', 'package_name', 'package_cost', 'mecca_nights', 'madinah_nights',
+            'is_visa_included', 'is_airport_reception_included', 'is_tour_guide_included', 'is_insurance_included',
+            'is_breakfast_included', 'is_lunch_included', 'is_dinner_included',
+
+            'payment_detail',
+        )
+
+    def get_company_detail(self, obj):
+        return get_company_detail(obj)
+
+    def get_partner_address_detail(self, obj):
+        return get_partner_address_detail(obj)
 
     def get_payment_detail(self, obj):
         return get_payment_detail(obj)
@@ -349,7 +467,7 @@ class BookingComplaintsSerializer(serializers.ModelSerializer):
     partner_contact_detail = serializers.SerializerMethodField()
     package_type = serializers.CharField(source='complaint_for_package.package_type', read_only=True)
     package_name = serializers.CharField(source='complaint_for_package.package_name', read_only=True)
-    package_cost = serializers.CharField(source='complaint_for_package.package_cost', read_only=True)
+    package_cost = serializers.CharField(source='complaint_for_package.package_base_cost', read_only=True)
     booking_number = serializers.CharField(source='complaint_for_booking.booking_number', read_only=True)
 
     class Meta:
@@ -388,6 +506,11 @@ class PartnersBookingPaymentSerializer(serializers.ModelSerializer):
         fields = ['package_type', 'package_name', 'booking_number', 'payment_status', 'receivable_amount', 'pending_amount', 'processed_amount', 'processed_date', 'create_date', 'partner_contact_detail', 'partner_name', 'partner_session_token']
 
     def get_partner_contact_detail(self, obj):
+        if obj.payment_for_partner:
+            prefetched_company = _get_first_prefetched_item(obj.payment_for_partner, 'company_of_partner')
+            if prefetched_company:
+                return ShortBusinessSerializer(prefetched_company).data
+
         try:
             company_detail = BusinessProfile.objects.get(company_of_partner=obj.payment_for_partner)
             return ShortBusinessSerializer(company_detail).data
@@ -402,7 +525,7 @@ class BookingRequestSerializer(serializers.ModelSerializer):
     partner_contact_detail = serializers.SerializerMethodField()
     package_type = serializers.CharField(source='request_for_package.package_type', read_only=True)
     package_name = serializers.CharField(source='request_for_package.package_name', read_only=True)
-    package_cost = serializers.CharField(source='request_for_package.package_cost', read_only=True)
+    package_cost = serializers.CharField(source='request_for_package.package_base_cost', read_only=True)
     booking_number = serializers.CharField(source='request_for_booking.booking_number', read_only=True)
 
     class Meta:

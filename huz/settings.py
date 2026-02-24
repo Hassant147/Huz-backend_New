@@ -158,7 +158,14 @@ DATABASES = {
         'USER': config('DB_USER'),
         'PASSWORD': config('DB_PASSWORD'),
         'HOST': config('DB_HOST'),
-        'PORT': config('DB_PORT')
+        'PORT': config('DB_PORT'),
+        # Keep DB connections open across requests to avoid expensive reconnects
+        # when using a remote MySQL host during local/dev runs.
+        'CONN_MAX_AGE': config('DB_CONN_MAX_AGE', cast=int, default=300),
+        'CONN_HEALTH_CHECKS': config('DB_CONN_HEALTH_CHECKS', cast=bool, default=True),
+        'OPTIONS': {
+            'connect_timeout': config('DB_CONNECT_TIMEOUT_SECONDS', cast=int, default=10),
+        },
     }
 }
 

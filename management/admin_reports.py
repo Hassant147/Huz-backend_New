@@ -5,12 +5,66 @@ from rest_framework.permissions import IsAdminUser
 from django.utils.dateparse import parse_datetime
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
-from partners.models import PartnerProfile, HuzBasicDetail
+from django.db.models import Prefetch
+from partners.models import PartnerProfile, HuzBasicDetail, BusinessProfile, PartnerMailingDetail
 from booking.models import BookingRatingAndReview, Booking, BookingComplaints
 from common.models import UserProfile
 from django.db.models import Count, Sum, F
 from common.logs_file import logger
-from django.db.models import Q
+
+
+def _parse_date_filters(request):
+    start_raw = request.query_params.get('start_date', None)
+    end_raw = request.query_params.get('end_date', None)
+
+    start_date = None
+    end_date = None
+
+    if start_raw:
+        start_date = parse_datetime(start_raw)
+        if start_date is None:
+            return None, None, Response({"detail": "Invalid start_date format."}, status=status.HTTP_400_BAD_REQUEST)
+
+    if end_raw:
+        end_date = parse_datetime(end_raw)
+        if end_date is None:
+            return None, None, Response({"detail": "Invalid end_date format."}, status=status.HTTP_400_BAD_REQUEST)
+
+    return start_date, end_date, None
+
+
+def _build_partner_lookup(partner_ids):
+    if not partner_ids:
+        return {}
+
+    partners = PartnerProfile.objects.filter(partner_id__in=partner_ids).only(
+        'partner_id', 'user_name', 'name', 'email', 'phone_number'
+    ).prefetch_related(
+        Prefetch(
+            'mailing_of_partner',
+            queryset=PartnerMailingDetail.objects.only('mailing_of_partner_id', 'city', 'country'),
+        ),
+        Prefetch(
+            'company_of_partner',
+            queryset=BusinessProfile.objects.only('company_of_partner_id', 'company_name', 'company_logo'),
+        ),
+    )
+    return {partner.partner_id: partner for partner in partners}
+
+
+def _extract_partner_summary(partner):
+    mailing_records = getattr(partner, '_prefetched_objects_cache', {}).get('mailing_of_partner') or []
+    company_records = getattr(partner, '_prefetched_objects_cache', {}).get('company_of_partner') or []
+
+    mailing = mailing_records[0] if mailing_records else None
+    company = company_records[0] if company_records else None
+
+    return {
+        'country': mailing.country if mailing else "N/A",
+        'city': mailing.city if mailing else "N/A",
+        'company_name': company.company_name if company else "N/A",
+        'company_logo': company.company_logo.url if company and company.company_logo else None,
+    }
 
 
 class PartnerStatusCountView(APIView):
@@ -45,14 +99,9 @@ class PartnerStatusCountView(APIView):
             # Get the parameters from the request query params
             country = request.query_params.get('country')
             city = request.query_params.get('city')
-            start_date = request.query_params.get('start_date')
-            end_date = request.query_params.get('end_date')
-
-            # Parse start_date and end_date to datetime objects
-            if start_date:
-                start_date = parse_datetime(start_date)
-            if end_date:
-                end_date = parse_datetime(end_date)
+            start_date, end_date, error_response = _parse_date_filters(request)
+            if error_response:
+                return error_response
 
             # Start building the query
             queryset = PartnerProfile.objects.all()
@@ -146,15 +195,10 @@ class TopPartnersRatingAPIView(APIView):
             # Get query parameters
             country = request.query_params.get('country', None)
             city = request.query_params.get('city', None)
-            start_date = request.query_params.get('start_date', None)
-            end_date = request.query_params.get('end_date', None)
             package_type = request.query_params.get('package_type', None)
-
-            # Check if the start_date and end_date are valid
-            if start_date:
-                start_date = parse_datetime(start_date)
-            if end_date:
-                end_date = parse_datetime(end_date)
+            start_date, end_date, error_response = _parse_date_filters(request)
+            if error_response:
+                return error_response
 
             # Filter the PartnerProfile model based on the country and city in PartnerMailingDetail
             queryset = PartnerProfile.objects.all()
@@ -172,8 +216,12 @@ class TopPartnersRatingAPIView(APIView):
                 # Here we are checking that the related HuzBasicDetail model's package_type matches the requested one
                 queryset = queryset.filter(package_provider__package_type=package_type)
 
+            partner_ids = list(queryset.values_list('partner_id', flat=True).distinct())
+            if not partner_ids:
+                return Response([], status=status.HTTP_200_OK)
+
             # Now, filter the related reviews based on the date range if provided
-            partner_reviews = BookingRatingAndReview.objects.all()
+            partner_reviews = BookingRatingAndReview.objects.filter(rating_for_partner__in=partner_ids)
 
             if start_date:
                 partner_reviews = partner_reviews.filter(rating_time__gte=start_date)
@@ -181,63 +229,53 @@ class TopPartnersRatingAPIView(APIView):
                 partner_reviews = partner_reviews.filter(rating_time__lte=end_date)
 
             # Aggregate the total stars and the number of reviews for each partner
-            partner_reviews = partner_reviews.values('rating_for_partner') \
+            partner_reviews = list(
+                partner_reviews.values('rating_for_partner')
                 .annotate(total_stars=Sum('partner_total_stars'), num_reviews=Count('rating_id')) \
-                .order_by('-total_stars')
+                .order_by('-total_stars', '-num_reviews')[:5]
+            )
+
+            if not partner_reviews:
+                return Response([], status=status.HTTP_200_OK)
 
             # Get the partner IDs of the top 5 partners
             top_partner_ids = [review['rating_for_partner'] for review in partner_reviews]
-
-            # Now, filter the partners by the IDs of the top 5 partners
-            top_partners = queryset.filter(partner_id__in=top_partner_ids)
+            partner_lookup = _build_partner_lookup(top_partner_ids)
 
             # Prepare the response data
             response_data = []
-            existing_partner_ids = set()  # A set to track already added partner IDs
+            for review in partner_reviews:
+                partner_id = review['rating_for_partner']
+                partner = partner_lookup.get(partner_id)
+                if not partner:
+                    continue
 
-            for partner in top_partners:
-                # Check if the partner is already added to the response data
-                if partner.partner_id in existing_partner_ids:
-                    continue  # Skip this partner if already added
-
-                total_stars = sum(review['total_stars'] for review in partner_reviews if
-                                  review['rating_for_partner'] == partner.partner_id)
-                num_reviews = sum(review['num_reviews'] for review in partner_reviews if
-                                  review['rating_for_partner'] == partner.partner_id)
+                total_stars = review['total_stars'] or 0
+                num_reviews = review['num_reviews'] or 0
 
                 # Calculate average stars per review
                 average_stars_per_review = total_stars / num_reviews if num_reviews > 0 else 0
 
-                # Access the first related PartnerMailingDetail object for the partner
-                partner_address = partner.mailing_of_partner.first()  # Use .first() to get the first related record
-                country = partner_address.country if partner_address else "N/A"
-                city = partner_address.city if partner_address else "N/A"
-
-                business_profile = partner.company_of_partner.first()  # Use .first() to get the first related record
-                company_name = business_profile.company_name if business_profile else "N/A"
-                company_logo = business_profile.company_logo.url if business_profile and business_profile.company_logo else None
+                partner_meta = _extract_partner_summary(partner)
 
                 # Append partner to the response data and mark this partner ID as added
                 response_data.append({
                     'partner_id': partner.partner_id,
                     'name': partner.name,
-                    'company_name': company_name,
+                    'company_name': partner_meta['company_name'],
                     'total_stars': total_stars,
                     'num_reviews': num_reviews,
                     'average_stars_per_review': average_stars_per_review,  # Added average stars per review
                     'email': partner.email,
                     'phone_number': partner.phone_number,
-                    'country': country,
-                    'city': city,
-                    'company_logo': company_logo
+                    'country': partner_meta['country'],
+                    'city': partner_meta['city'],
+                    'company_logo': partner_meta['company_logo']
                 })
-
-                # Mark this partner as added to the response
-                existing_partner_ids.add(partner.partner_id)
 
             # Sort by average_stars_per_review (ascending), and then by num_reviews (descending) if there's a tie
             sorted_response_data = sorted(response_data,
-                                          key=lambda x: (-x['num_reviews'], -x['average_stars_per_review']))
+                                          key=lambda x: (-x['num_reviews'], -x['average_stars_per_review']))[:5]
 
             return Response(sorted_response_data, status=status.HTTP_200_OK)
         except Exception as e:
@@ -292,15 +330,10 @@ class TopOperatorsWithTravelerAPIView(APIView):
             # Get query parameters
             country = request.query_params.get('country', None)
             city = request.query_params.get('city', None)
-            start_date = request.query_params.get('start_date', None)
-            end_date = request.query_params.get('end_date', None)
             package_type = request.query_params.get('package_type', None)
-
-            # Check if the start_date and end_date are valid
-            if start_date:
-                start_date = parse_datetime(start_date)
-            if end_date:
-                end_date = parse_datetime(end_date)
+            start_date, end_date, error_response = _parse_date_filters(request)
+            if error_response:
+                return error_response
 
             # Filter the PartnerProfile model based on the country and city in PartnerMailingDetail
             queryset = PartnerProfile.objects.all()
@@ -317,7 +350,10 @@ class TopOperatorsWithTravelerAPIView(APIView):
             if package_type and package_type != 'all':
                 queryset = queryset.filter(package_provider__package_type=package_type)
 
-            partner_ids = queryset.values_list('partner_id', flat=True)
+            partner_ids = list(queryset.values_list('partner_id', flat=True).distinct())
+            if not partner_ids:
+                return Response([], status=status.HTTP_200_OK)
+
             valid_statuses = ['Objection', 'objection', 'Active', 'active', 'Completed', 'completed', 'Closed', 'closed', 'Report', 'report']
             # Filter bookings based on the start_date and end_date if provided
             if start_date and end_date:
@@ -342,35 +378,37 @@ class TopOperatorsWithTravelerAPIView(APIView):
             else:
                 bookings_queryset = Booking.objects.filter(order_to__in=partner_ids, booking_status__in=valid_statuses)
 
-            aggregated_travelers = bookings_queryset.values('order_to') \
-                                       .annotate(total_travelers=Sum(F('adults') + F('child') + F('infants'))) \
-                                       .order_by('-total_travelers')  # Top 5 partners with most travelers
+            aggregated_travelers = list(
+                bookings_queryset.values('order_to')
+                .annotate(total_travelers=Sum(F('adults') + F('child') + F('infants')))
+                .order_by('-total_travelers')[:5]
+            )
+
+            if not aggregated_travelers:
+                return Response([], status=status.HTTP_200_OK)
 
             # Now retrieve the PartnerProfile for these partners and their address details
+            lookup_partner_ids = [entry['order_to'] for entry in aggregated_travelers]
+            partner_lookup = _build_partner_lookup(lookup_partner_ids)
             top_partners = []
             for entry in aggregated_travelers:
-                partner = PartnerProfile.objects.get(partner_id=entry['order_to'])
+                partner = partner_lookup.get(entry['order_to'])
+                if not partner:
+                    continue
 
-                # Access the first related PartnerMailingDetail object for the partner
-                partner_address = partner.mailing_of_partner.first()  # Use .first() to get the first related record
-                country = partner_address.country if partner_address else "N/A"
-                city = partner_address.city if partner_address else "N/A"
-
-                business_profile = partner.company_of_partner.first()  # Use .first() to get the first related record
-                company_name = business_profile.company_name if business_profile else "N/A"
-                company_logo = business_profile.company_logo.url if business_profile and business_profile.company_logo else None
+                partner_meta = _extract_partner_summary(partner)
 
                 top_partners.append({
                     'partner_id': partner.partner_id,
                     'user_name': partner.user_name,
-                    'company_name': company_name,
+                    'company_name': partner_meta['company_name'],
                     'name': partner.name,
                     'email': partner.email,
                     'phone_number': partner.phone_number,
-                    'country': country,
-                    'city': city,
+                    'country': partner_meta['country'],
+                    'city': partner_meta['city'],
                     'total_travelers': entry['total_travelers'],
-                    'company_logo': company_logo,
+                    'company_logo': partner_meta['company_logo'],
                 })
 
             return Response(top_partners, status=status.HTTP_200_OK)
@@ -426,15 +464,10 @@ class TopOperatorsWithBookingAPIView(APIView):
             # Get query parameters
             country = request.query_params.get('country', None)
             city = request.query_params.get('city', None)
-            start_date = request.query_params.get('start_date', None)
-            end_date = request.query_params.get('end_date', None)
             package_type = request.query_params.get('package_type', None)
-
-            # Check if the start_date and end_date are valid
-            if start_date:
-                start_date = parse_datetime(start_date)
-            if end_date:
-                end_date = parse_datetime(end_date)
+            start_date, end_date, error_response = _parse_date_filters(request)
+            if error_response:
+                return error_response
 
             # Filter the PartnerProfile model based on the country and city in PartnerMailingDetail
             queryset = PartnerProfile.objects.all()
@@ -451,7 +484,10 @@ class TopOperatorsWithBookingAPIView(APIView):
             if package_type and package_type != 'all':
                 queryset = queryset.filter(package_provider__package_type=package_type)
 
-            partner_ids = queryset.values_list('partner_id', flat=True)
+            partner_ids = list(queryset.values_list('partner_id', flat=True).distinct())
+            if not partner_ids:
+                return Response([], status=status.HTTP_200_OK)
+
             valid_statuses = ['Objection', 'objection', 'Active', 'active', 'Completed', 'completed', 'Closed', 'closed']
             # Filter bookings based on the start_date and end_date if provided
             if start_date and end_date:
@@ -476,35 +512,37 @@ class TopOperatorsWithBookingAPIView(APIView):
             else:
                 bookings_queryset = Booking.objects.filter(order_to__in=partner_ids, booking_status__in=valid_statuses)
 
-            aggregated_bookings = bookings_queryset.values('order_to') \
-                                       .annotate(total_bookings=Count('booking_id')) \
-                                       .order_by('-total_bookings')
+            aggregated_bookings = list(
+                bookings_queryset.values('order_to')
+                .annotate(total_bookings=Count('booking_id'))
+                .order_by('-total_bookings')[:5]
+            )
+
+            if not aggregated_bookings:
+                return Response([], status=status.HTTP_200_OK)
 
             # Now retrieve the PartnerProfile for these partners and their address details
+            lookup_partner_ids = [entry['order_to'] for entry in aggregated_bookings]
+            partner_lookup = _build_partner_lookup(lookup_partner_ids)
             top_partners = []
             for entry in aggregated_bookings:
-                partner = PartnerProfile.objects.get(partner_id=entry['order_to'])
+                partner = partner_lookup.get(entry['order_to'])
+                if not partner:
+                    continue
 
-                # Access the first related PartnerMailingDetail object for the partner
-                partner_address = partner.mailing_of_partner.first()  # Use .first() to get the first related record
-                country = partner_address.country if partner_address else "N/A"
-                city = partner_address.city if partner_address else "N/A"
-
-                business_profile = partner.company_of_partner.first()  # Use .first() to get the first related record
-                company_name = business_profile.company_name if business_profile else "N/A"
-                company_logo = business_profile.company_logo.url if business_profile and business_profile.company_logo else None
+                partner_meta = _extract_partner_summary(partner)
 
                 top_partners.append({
                     'partner_id': partner.partner_id,
                     'user_name': partner.user_name,
-                    'company_name': company_name,
+                    'company_name': partner_meta['company_name'],
                     'name': partner.name,
                     'email': partner.email,
                     'phone_number': partner.phone_number,
-                    'country': country,
-                    'city': city,
+                    'country': partner_meta['country'],
+                    'city': partner_meta['city'],
                     'total_bookings': entry['total_bookings'],
-                    'company_logo': company_logo,
+                    'company_logo': partner_meta['company_logo'],
                 })
 
             return Response(top_partners, status=status.HTTP_200_OK)
@@ -560,15 +598,10 @@ class TopOperatorsWithBusinessAPIView(APIView):
             # Get query parameters
             country = request.query_params.get('country', None)
             city = request.query_params.get('city', None)
-            start_date = request.query_params.get('start_date', None)
-            end_date = request.query_params.get('end_date', None)
             package_type = request.query_params.get('package_type', None)
-
-            # Check if the start_date and end_date are valid
-            if start_date:
-                start_date = parse_datetime(start_date)
-            if end_date:
-                end_date = parse_datetime(end_date)
+            start_date, end_date, error_response = _parse_date_filters(request)
+            if error_response:
+                return error_response
 
             # Filter the PartnerProfile model based on the country and city in PartnerMailingDetail
             queryset = PartnerProfile.objects.all()
@@ -585,7 +618,10 @@ class TopOperatorsWithBusinessAPIView(APIView):
             if package_type and package_type != 'all':
                 queryset = queryset.filter(package_provider__package_type=package_type)
 
-            partner_ids = queryset.values_list('partner_id', flat=True)
+            partner_ids = list(queryset.values_list('partner_id', flat=True).distinct())
+            if not partner_ids:
+                return Response([], status=status.HTTP_200_OK)
+
             valid_statuses = ['Pending', 'pending', 'Confirm', 'confirm', 'Objection', 'objection', 'Active', 'active', 'Completed', 'completed', 'Closed', 'closed']
             # Filter bookings based on the start_date and end_date if provided
             if start_date and end_date:
@@ -610,35 +646,37 @@ class TopOperatorsWithBusinessAPIView(APIView):
             else:
                 bookings_queryset = Booking.objects.filter(order_to__in=partner_ids, booking_status__in=valid_statuses)
 
-            aggregated_business = bookings_queryset.values('order_to') \
-                                       .annotate(total_price=Sum('total_price')) \
-                                       .order_by('-total_price')
+            aggregated_business = list(
+                bookings_queryset.values('order_to')
+                .annotate(total_price=Sum('total_price'))
+                .order_by('-total_price')[:5]
+            )
+
+            if not aggregated_business:
+                return Response([], status=status.HTTP_200_OK)
 
             # Now retrieve the PartnerProfile for these partners and their address details
+            lookup_partner_ids = [entry['order_to'] for entry in aggregated_business]
+            partner_lookup = _build_partner_lookup(lookup_partner_ids)
             top_partners = []
             for entry in aggregated_business:
-                partner = PartnerProfile.objects.get(partner_id=entry['order_to'])
+                partner = partner_lookup.get(entry['order_to'])
+                if not partner:
+                    continue
 
-                # Access the first related PartnerMailingDetail object for the partner
-                partner_address = partner.mailing_of_partner.first()  # Use .first() to get the first related record
-                country = partner_address.country if partner_address else "N/A"
-                city = partner_address.city if partner_address else "N/A"
-
-                business_profile = partner.company_of_partner.first()  # Use .first() to get the first related record
-                company_name = business_profile.company_name if business_profile else "N/A"
-                company_logo = business_profile.company_logo.url if business_profile and business_profile.company_logo else None
+                partner_meta = _extract_partner_summary(partner)
 
                 top_partners.append({
                     'partner_id': partner.partner_id,
                     'user_name': partner.user_name,
-                    'company_name': company_name,
+                    'company_name': partner_meta['company_name'],
                     'name': partner.name,
                     'email': partner.email,
                     'phone_number': partner.phone_number,
-                    'country': country,
-                    'city': city,
+                    'country': partner_meta['country'],
+                    'city': partner_meta['city'],
                     'total_price': entry['total_price'],
-                    'company_logo': company_logo,
+                    'company_logo': partner_meta['company_logo'],
                 })
 
             return Response(top_partners, status=status.HTTP_200_OK)
@@ -694,15 +732,10 @@ class TopPartnersComplaintsAPIView(APIView):
             # Get query parameters
             country = request.query_params.get('country', None)
             city = request.query_params.get('city', None)
-            start_date = request.query_params.get('start_date', None)
-            end_date = request.query_params.get('end_date', None)
             package_type = request.query_params.get('package_type', None)
-
-            # Check if the start_date and end_date are valid
-            if start_date:
-                start_date = parse_datetime(start_date)
-            if end_date:
-                end_date = parse_datetime(end_date)
+            start_date, end_date, error_response = _parse_date_filters(request)
+            if error_response:
+                return error_response
 
             # Filter the PartnerProfile model based on the country and city in PartnerMailingDetail
             queryset = PartnerProfile.objects.all()
@@ -719,8 +752,12 @@ class TopPartnersComplaintsAPIView(APIView):
             if package_type and package_type != 'all':
                 queryset = queryset.filter(package_provider__package_type=package_type)
 
+            partner_ids = list(queryset.values_list('partner_id', flat=True).distinct())
+            if not partner_ids:
+                return Response([], status=status.HTTP_200_OK)
+
             # Now, filter the related complaints based on the date range if provided
-            partner_complaints = BookingComplaints.objects.all()
+            partner_complaints = BookingComplaints.objects.filter(complaint_for_partner__in=partner_ids)
 
             if start_date:
                 partner_complaints = partner_complaints.filter(complaint_time__gte=start_date)
@@ -728,59 +765,47 @@ class TopPartnersComplaintsAPIView(APIView):
                 partner_complaints = partner_complaints.filter(complaint_time__lte=end_date)
 
             # Aggregate the total number of complaints for each partner
-            partner_complaints_count = partner_complaints.values('complaint_for_partner') \
+            partner_complaints_count = list(
+                partner_complaints.values('complaint_for_partner')
                 .annotate(total_complaints=Count('complaint_id')) \
-                .order_by('-total_complaints')
+                .order_by('-total_complaints')[:5]
+            )
+
+            if not partner_complaints_count:
+                return Response([], status=status.HTTP_200_OK)
 
             # Get the top 5 partners based on complaints
             top_partner_ids = [complaint['complaint_for_partner'] for complaint in partner_complaints_count]
-
-            # Now, filter the partners by the IDs of the top 5 partners
-            top_partners = queryset.filter(partner_id__in=top_partner_ids)
+            partner_lookup = _build_partner_lookup(top_partner_ids)
 
             # Prepare the response data
             response_data = []
-            existing_partner_ids = set()  # A set to track already added partner IDs
-
-            for partner in top_partners:
-                # Check if the partner is already added to the response data
-                if partner.partner_id in existing_partner_ids:
-                    continue  # Skip this partner if already added
+            for complaint_entry in partner_complaints_count:
+                partner = partner_lookup.get(complaint_entry['complaint_for_partner'])
+                if not partner:
+                    continue
 
                 # Find the total complaints for the partner
-                total_complaints = next(
-                    (complaint['total_complaints'] for complaint in partner_complaints_count if
-                     complaint['complaint_for_partner'] == partner.partner_id), 0)
-
-                # Access the first related PartnerMailingDetail object for the partner
-                partner_address = partner.mailing_of_partner.first()  # Use .first() to get the first related record
-                country = partner_address.country if partner_address else "N/A"
-                city = partner_address.city if partner_address else "N/A"
-
-                business_profile = partner.company_of_partner.first()  # Use .first() to get the first related record
-                company_name = business_profile.company_name if business_profile else "N/A"
-                company_logo = business_profile.company_logo.url if business_profile and business_profile.company_logo else None
+                total_complaints = complaint_entry['total_complaints']
+                partner_meta = _extract_partner_summary(partner)
 
                 # Append partner to the response data and mark this partner ID as added
                 response_data.append({
                     'partner_id': partner.partner_id,
                     'name': partner.name,
-                    'company_name': company_name,
+                    'company_name': partner_meta['company_name'],
                     'total_complaints': total_complaints,
                     'num_complaints': total_complaints,  # Total complaints count
                     'email': partner.email,
                     'phone_number': partner.phone_number,
-                    'country': country,
-                    'city': city,
-                    'company_logo': company_logo
+                    'country': partner_meta['country'],
+                    'city': partner_meta['city'],
+                    'company_logo': partner_meta['company_logo']
                 })
-
-                # Mark this partner as added to the response
-                existing_partner_ids.add(partner.partner_id)
 
             # Sort by total_complaints (descending)
             sorted_response_data = sorted(response_data,
-                                          key=lambda x: (-x['total_complaints']))
+                                          key=lambda x: (-x['total_complaints']))[:5]
 
             return Response(sorted_response_data, status=status.HTTP_200_OK)
         except Exception as e:
@@ -826,15 +851,10 @@ class DistinctComplaintTitlesAPIView(APIView):
         try:
             country = request.query_params.get('country', None)
             city = request.query_params.get('city', None)
-            start_date = request.query_params.get('start_date', None)
-            end_date = request.query_params.get('end_date', None)
             package_type = request.query_params.get('package_type', None)
-
-            # Parse start_date and end_date if they exist
-            if start_date:
-                start_date = parse_datetime(start_date)
-            if end_date:
-                end_date = parse_datetime(end_date)
+            start_date, end_date, error_response = _parse_date_filters(request)
+            if error_response:
+                return error_response
 
             # Filter conditions
             complaints_queryset = BookingComplaints.objects.all()
@@ -858,9 +878,11 @@ class DistinctComplaintTitlesAPIView(APIView):
 
             # Filter by complaint time range
             if start_date and end_date:
-                complaints_queryset = complaints_queryset.filter(
-                    complaint_time__range=[start_date, end_date]
-                )
+                complaints_queryset = complaints_queryset.filter(complaint_time__range=[start_date, end_date])
+            elif start_date:
+                complaints_queryset = complaints_queryset.filter(complaint_time__gte=start_date)
+            elif end_date:
+                complaints_queryset = complaints_queryset.filter(complaint_time__lte=end_date)
 
             # Count the number of complaints grouped by their title (complaint_title)
             complaint_count = complaints_queryset.values('complaint_title').annotate(
@@ -931,15 +953,10 @@ class ComplaintStatusCountAPIView(APIView):
         try:
             country = request.query_params.get('country', None)
             city = request.query_params.get('city', None)
-            start_date = request.query_params.get('start_date', None)
-            end_date = request.query_params.get('end_date', None)
             package_type = request.query_params.get('package_type', None)
-
-            # Parse start_date and end_date if they exist
-            if start_date:
-                start_date = parse_datetime(start_date)
-            if end_date:
-                end_date = parse_datetime(end_date)
+            start_date, end_date, error_response = _parse_date_filters(request)
+            if error_response:
+                return error_response
 
             # Filter conditions
             complaints_queryset = BookingComplaints.objects.all()
@@ -963,9 +980,11 @@ class ComplaintStatusCountAPIView(APIView):
 
             # Filter by complaint time range
             if start_date and end_date:
-                complaints_queryset = complaints_queryset.filter(
-                    complaint_time__range=[start_date, end_date]
-                )
+                complaints_queryset = complaints_queryset.filter(complaint_time__range=[start_date, end_date])
+            elif start_date:
+                complaints_queryset = complaints_queryset.filter(complaint_time__gte=start_date)
+            elif end_date:
+                complaints_queryset = complaints_queryset.filter(complaint_time__lte=end_date)
 
             # Count the number of complaints grouped by their status (complaint_status)
             complaint_status_count = complaints_queryset.values('complaint_status').annotate(
@@ -975,11 +994,22 @@ class ComplaintStatusCountAPIView(APIView):
             response_data = []
 
             status_count_dict = {statuses: 0 for statuses in all_statuses}
-            # Normalize case to ensure no mismatches due to case sensitivity
+            status_aliases = {
+                "open": "Open",
+                "inprogress": "InProgress",
+                "in_progress": "InProgress",
+                "close": "Close",
+                "closed": "Close",
+                "solved": "Solved",
+            }
+
+            # Normalize case to ensure no mismatches due to case sensitivity.
             for item in complaint_status_count:
-                statuses = item['complaint_status'].strip().capitalize()  # Normalize the case
-                if statuses in status_count_dict:
-                    status_count_dict[statuses] = item['count']
+                raw_status = (item.get('complaint_status') or '').strip().lower()
+                normalized_key = raw_status.replace(' ', '_')
+                mapped_status = status_aliases.get(normalized_key) or status_aliases.get(raw_status)
+                if mapped_status in status_count_dict:
+                    status_count_dict[mapped_status] += item['count']
 
             for statuses, count in status_count_dict.items():
                 response_data.append({
@@ -1154,15 +1184,10 @@ class BookingStatusCountAPIView(APIView):
             # Get query parameters
             country = request.query_params.get('country', None)
             city = request.query_params.get('city', None)
-            start_date = request.query_params.get('start_date', None)
-            end_date = request.query_params.get('end_date', None)
             package_type = request.query_params.get('package_type', None)
-
-            # Parse start_date and end_date if provided
-            if start_date:
-                start_date = parse_datetime(start_date)
-            if end_date:
-                end_date = parse_datetime(end_date)
+            start_date, end_date, error_response = _parse_date_filters(request)
+            if error_response:
+                return error_response
 
             # Filter the PartnerProfile model based on the country and city
             queryset = PartnerProfile.objects.all()
@@ -1256,15 +1281,10 @@ class PackageStatusCountAPIView(APIView):
             # Get query parameters
             country = request.query_params.get('country', None)
             city = request.query_params.get('city', None)
-            start_date = request.query_params.get('start_date', None)
-            end_date = request.query_params.get('end_date', None)
             package_type = request.query_params.get('package_type', None)
-
-            # Parse start_date and end_date if provided
-            if start_date:
-                start_date = parse_datetime(start_date)
-            if end_date:
-                end_date = parse_datetime(end_date)
+            start_date, end_date, error_response = _parse_date_filters(request)
+            if error_response:
+                return error_response
 
             # Filter the PartnerProfile model based on the country and city
             partner_queryset = PartnerProfile.objects.all()
@@ -1361,15 +1381,10 @@ class UserRegistrationCountAPIView(APIView):
             # Get query parameters
             country = request.query_params.get('country', None)
             city = request.query_params.get('city', None)
-            start_date = request.query_params.get('start_date', None)
-            end_date = request.query_params.get('end_date', None)
             package_type = request.query_params.get('package_type', None)
-
-            # Parse start_date and end_date if provided
-            if start_date:
-                start_date = parse_datetime(start_date)
-            if end_date:
-                end_date = parse_datetime(end_date)
+            start_date, end_date, error_response = _parse_date_filters(request)
+            if error_response:
+                return error_response
 
             # Filter the UserProfile model based on the country, city, and date range
             user_queryset = UserProfile.objects.all()
@@ -1390,9 +1405,12 @@ class UserRegistrationCountAPIView(APIView):
             elif end_date:
                 user_queryset = user_queryset.filter(created_time__lte=end_date)
 
-            # If package_type is provided, filter based on user profile's package_type
+            # UserProfile does not contain package type; rejecting this filter avoids misleading zero counts.
             if package_type and package_type != 'all':
-                user_queryset = user_queryset.filter(user_type=package_type)  # Assuming user_type correlates with package_type
+                return Response(
+                    {"detail": "package_type filter is not supported for register-users-count."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
             # Count the new users based on the filtered queryset
             new_user_count = user_queryset.count()
@@ -1509,14 +1527,10 @@ class BookingTypeStatusCountWithPriceAPIView(APIView):
         try:
             country = request.query_params.get('country', 'all')
             city = request.query_params.get('city', 'all')
-            start_date = request.query_params.get('start_date')
-            end_date = request.query_params.get('end_date')
             package_type = request.query_params.get('package_type', 'all')
-
-            if start_date:
-                start_date = parse_datetime(start_date)
-            if end_date:
-                end_date = parse_datetime(end_date)
+            start_date, end_date, error_response = _parse_date_filters(request)
+            if error_response:
+                return error_response
 
             # Start with all bookings
             bookings = Booking.objects.all()
@@ -1634,14 +1648,10 @@ class BookingStatsByPackageAPIView(APIView):
         try:
             country = request.query_params.get('country', 'all')
             city = request.query_params.get('city', 'all')
-            start_date = request.query_params.get('start_date')
-            end_date = request.query_params.get('end_date')
             package_type = request.query_params.get('package_type', 'all')
-
-            if start_date:
-                start_date = parse_datetime(start_date)
-            if end_date:
-                end_date = parse_datetime(end_date)
+            start_date, end_date, error_response = _parse_date_filters(request)
+            if error_response:
+                return error_response
 
             # Start with all bookings
             bookings = Booking.objects.all()
