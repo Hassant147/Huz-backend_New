@@ -12,6 +12,7 @@ class CustomSchemaGenerator(OpenAPISchemaGenerator):
             '/partner_login/',
             '/is_user_exist/',
             '/create_partner_profile/',
+            '/get_partner_profile/',
             '/resend_otp/',
             '/verify_otp/',
             '/partner_service/',

@@ -12,7 +12,7 @@ https://docs.djangoproject.com/en/5.0/ref/settings/
 
 from pathlib import Path
 import os
-from decouple import config
+from decouple import config, Csv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -28,7 +28,19 @@ SECRET_KEY = 'django-insecure-)_a%x5b_vzdbf-r&eb1*yw*hd(!jaf_cb6f@576d9uitb5t)n)
 DEBUG = False
 # DEBUG = True
 
-ALLOWED_HOSTS = ['hajjumrah.org', 'www.hajjumrah.org', '165.232.160.29']
+ALLOWED_HOSTS = config(
+    'ALLOWED_HOSTS',
+    cast=Csv(),
+    default=(
+        'hajjumrah.org,'
+        'www.hajjumrah.org,'
+        '165.232.160.29,'
+        '127.0.0.1,'
+        'localhost,'
+        '.ngrok-free.app,'
+        '.ngrok.io'
+    )
+)
 # ALLOWED_HOSTS = ['209.97.172.88']
 
 
@@ -83,14 +95,31 @@ MIDDLEWARE = [
     'whitenoise.middleware.WhiteNoiseMiddleware',
 ]
 
-CORS_ALLOW_ALL_ORIGINS = True
-CORS_ALLOWED_ORIGINS = [
-    "https://hajjumrah.co",
-    "https://hajjumrah.org",
-    "https://www.hajjumrah.co",
-    "http://localhost:3000",
-    "http://hajjumrah.org"
-]
+CORS_ALLOW_ALL_ORIGINS = config('CORS_ALLOW_ALL_ORIGINS', cast=bool, default=False)
+CORS_ALLOWED_ORIGINS = config(
+    'CORS_ALLOWED_ORIGINS',
+    cast=Csv(),
+    default=(
+        'https://hajjumrah.co,'
+        'https://hajjumrah.org,'
+        'https://www.hajjumrah.co,'
+        'http://hajjumrah.org,'
+        'http://localhost:3000,'
+        'http://127.0.0.1:3000,'
+        'http://localhost:3001,'
+        'http://127.0.0.1:3001,'
+        'http://localhost:5173,'
+        'http://127.0.0.1:5173'
+    )
+)
+CORS_ALLOWED_ORIGIN_REGEXES = config(
+    'CORS_ALLOWED_ORIGIN_REGEXES',
+    cast=Csv(),
+    default=(
+        r'^https://[a-z0-9-]+\.ngrok-free\.app$,'
+        r'^https://[a-z0-9-]+\.ngrok\.io$'
+    )
+)
 
 # CHANNEL_LAYERS = {
 #     "default": {
@@ -177,13 +206,17 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'static')
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 
-EMAIL_ADDRESS = 'HajjUmrah.co <no-reply@hajjumrah.co>'
-EMAIL_HOST = 'smtp.hostinger.com'
-SERVER_EMAIL = 'no-reply@hajjumrah.co'
-SERVER_EMAIL_PASSWORD = 'H@so4H2so3'
+EMAIL_ADDRESS = config('EMAIL_ADDRESS', default='HajjUmrah.co <no-reply@hajjumrah.co>')
+EMAIL_HOST = config('EMAIL_HOST', default='smtp.hostinger.com')
+EMAIL_PORT = config('EMAIL_PORT', cast=int, default=465)
+SERVER_EMAIL = config('SERVER_EMAIL', default='no-reply@hajjumrah.co')
+SERVER_EMAIL_PASSWORD = config('SERVER_EMAIL_PASSWORD', default='')
+EMAIL_SEND_TIMEOUT_SECONDS = config('EMAIL_SEND_TIMEOUT_SECONDS', cast=int, default=20)
+EMAIL_OTP_EXPIRY_MINUTES = config('EMAIL_OTP_EXPIRY_MINUTES', cast=int, default=5)
+PASSWORD_RESET_EXPIRY_MINUTES = config('PASSWORD_RESET_EXPIRY_MINUTES', cast=int, default=60)
+OPERATOR_PANEL_BASE_URL = config('OPERATOR_PANEL_BASE_URL', default='http://localhost:3000')
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.0/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
-

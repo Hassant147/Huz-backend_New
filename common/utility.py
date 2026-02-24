@@ -13,6 +13,7 @@ from django.core.files.storage import FileSystemStorage
 from rest_framework.pagination import PageNumberPagination
 from django.template.loader import render_to_string
 import threading
+from common.logs_file import logger
 
 
 cred = credentials.Certificate("common/firebase.json")
@@ -99,34 +100,54 @@ class EmailThread(threading.Thread):
         self.email = email
         self.html_content = html_content
         self.subject = subject
-        threading.Thread.__init__(self)
+        self.error = None
+        self.sent = False
+        threading.Thread.__init__(self, daemon=True)
 
     def run(self):
-        try:
-            msg = MIMEMultipart()
-            msg['From'] = settings.EMAIL_ADDRESS
-            msg['To'] = self.email
-            subject = self.subject
-            html_content = self.html_content
-            msg['Subject'] = subject
-            msg.attach(MIMEText(html_content, 'html'))
-            with smtplib.SMTP_SSL(settings.EMAIL_HOST, 465) as mailserver:
-                mailserver.login(settings.SERVER_EMAIL, settings.SERVER_EMAIL_PASSWORD)
-                mailserver.sendmail(settings.EMAIL_ADDRESS, self.email, msg.as_string())
-        except smtplib.SMTPException as smtp_err:
-            print(f"SMTP Error: {smtp_err}")
-        except Exception as e:
-            print(f"Error: {e}")
+        self.sent = _send_email(self.email, self.subject, self.html_content)
+        if not self.sent:
+            self.error = RuntimeError(f"Unable to send email to {self.email}.")
 
 
-def send_verification_email(email, name, verification_otp):
+def _send_email(email, subject, html_content):
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = settings.EMAIL_ADDRESS
+        msg['To'] = email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(html_content, 'html'))
+        with smtplib.SMTP_SSL(settings.EMAIL_HOST, settings.EMAIL_PORT, timeout=settings.EMAIL_SEND_TIMEOUT_SECONDS) as mailserver:
+            mailserver.login(settings.SERVER_EMAIL, settings.SERVER_EMAIL_PASSWORD)
+            mailserver.sendmail(settings.EMAIL_ADDRESS, email, msg.as_string())
+        return True
+    except smtplib.SMTPException as smtp_err:
+        logger.error("SMTP Error while sending email to %s: %s", email, str(smtp_err))
+        return False
+    except Exception as e:
+        logger.error("Email sending error for %s: %s", email, str(e))
+        return False
+
+
+def _dispatch_email(email, subject, html_content, wait_for_result=False):
+    if wait_for_result:
+        return _send_email(email, subject, html_content)
+
+    email_thread = EmailThread(email, subject, html_content)
+    email_thread.start()
+    return True
+
+
+def send_verification_email(email, name, verification_otp, wait_for_result=False):
     subject = 'Verify your email address'
     html_content = render_to_string('emails/verify-email.html', {
         'verification_otp': verification_otp,
-        'email': email
+        'email': email,
+        'otp_expiry_minutes': settings.EMAIL_OTP_EXPIRY_MINUTES,
     })
-    email_thread = EmailThread(email, subject, html_content)
-    email_thread.start()
+    is_sent = _dispatch_email(email, subject, html_content, wait_for_result=wait_for_result)
+    if wait_for_result:
+        return is_sent
     return "Verification email is being sent"
 
 
@@ -135,8 +156,7 @@ def send_company_approval_email(email, name):
     html_content = render_to_string('emails/company-approved.html', {
         'email': email
     })
-    email_thread = EmailThread(email, subject, html_content)
-    email_thread.start()
+    _dispatch_email(email, subject, html_content)
     return "Company approval email is being sent"
 
 
@@ -148,8 +168,7 @@ def send_objection_email(email, name, booking_number, remarks):
         'booking_number': booking_number,
         'remarks': remarks
     })
-    email_thread = EmailThread(email, subject, html_content)
-    email_thread.start()
+    _dispatch_email(email, subject, html_content)
     return "Objection email is being sent"
 
 
@@ -161,8 +180,7 @@ def send_complaint_email(email, name, booking_number, remarks):
         'booking_number': booking_number,
         'remarks': remarks
     })
-    email_thread = EmailThread(email, subject, html_content)
-    email_thread.start()
+    _dispatch_email(email, subject, html_content)
     return "Complaint email is being sent"
 
 
@@ -173,8 +191,7 @@ def send_payment_verification_email(email, name, booking_number):
         'name': name,
         'booking_number': booking_number
     })
-    email_thread = EmailThread(email, subject, html_content)
-    email_thread.start()
+    _dispatch_email(email, subject, html_content)
     return "Payment verification email is being sent"
 
 
@@ -190,8 +207,7 @@ def send_new_order_email(email, name, package_type, package_name, start_date,  a
         'adults': adults,
         'total_price': total_price
     })
-    email_thread = EmailThread(email, subject, html_content)
-    email_thread.start()
+    _dispatch_email(email, subject, html_content)
     return "New order booking email is being sent"
 
 
@@ -203,8 +219,7 @@ def send_booking_documents_email(email, name, booking_number, document_type):
         'booking_number': booking_number,
         'document_type': document_type
     })
-    email_thread = EmailThread(email, subject, html_content)
-    email_thread.start()
+    _dispatch_email(email, subject, html_content)
     return "Document email is being sent"
 
 
@@ -214,8 +229,7 @@ def new_user_welcome_email(email, name):
         'email': email,
         'name': name
     })
-    email_thread = EmailThread(email, subject, html_content)
-    email_thread.start()
+    _dispatch_email(email, subject, html_content)
     return "new user welcome email is being sent"
 
 
@@ -224,8 +238,7 @@ def user_subscribe_email(email):
     html_content = render_to_string('emails/subscribe.html', {
         'email': email
     })
-    email_thread = EmailThread(email, subject, html_content)
-    email_thread.start()
+    _dispatch_email(email, subject, html_content)
     return "subscribe email is being sent"
 
 
@@ -235,8 +248,7 @@ def forgot_password_email(email, forgot_link):
         'email': email,
         'forgot_link': forgot_link
     })
-    email_thread = EmailThread(email, subject, html_content)
-    email_thread.start()
+    _dispatch_email(email, subject, html_content)
     return "forgot email is being sent"
 
 
@@ -256,8 +268,7 @@ def user_new_booking_email(email, name, package_type, package_name, booking_numb
         'remaining_amount': int(total_amount)-int(paid_amount),
         'total_amount': total_amount
     })
-    email_thread = EmailThread(email, subject, html_content)
-    email_thread.start()
+    _dispatch_email(email, subject, html_content)
     return "new user welcome email is being sent"
 
 
@@ -268,8 +279,7 @@ def preparation_email(email, name, package_type):
         'name': name,
         'package_type': package_type,
     })
-    email_thread = EmailThread(email, subject, html_content)
-    email_thread.start()
+    _dispatch_email(email, subject, html_content)
     return "checklist email is being sent"
 
 

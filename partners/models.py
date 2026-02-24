@@ -6,7 +6,13 @@ from common.models import UserProfile
 
 class PartnerProfile(models.Model):
     TYPE_CHOICES = [('NA', 'na'), ('Individual', 'individual'), ('Company', 'company')]
-    ACCOUNT_STATUS_CHOICES = [('Active', 'active'), ('Pending', 'pending'), ('Deactivate', 'deactivate'), ('Block', 'block')]
+    ACCOUNT_STATUS_CHOICES = [
+        ('Active', 'active'),
+        ('Pending', 'pending'),
+        ('Rejected', 'rejected'),
+        ('Deactivate', 'deactivate'),
+        ('Block', 'block')
+    ]
     SIGN_TYPE_CHOICES = [('Gmail', 'gmail'), ('Apple', 'apple'), ('Email', 'email')]
 
     # Unique identifier for the partner
@@ -35,7 +41,7 @@ class PartnerProfile(models.Model):
     firebase_token = models.CharField(max_length=500, null=True)
     web_firebase_token = models.CharField(max_length=700, null=True)
     user_photo = models.ImageField(upload_to='user_images', blank=True, null=True)
-    # Account status (e.g., Active, Pending, Deactivate, Block)
+    # Account status (e.g., Active, Pending, Rejected, Deactivate, Block)
     account_status = models.CharField(max_length=50, choices=ACCOUNT_STATUS_CHOICES, null=True, default="Pending")
     created_time = models.DateTimeField(default=timezone.now)
     # ForeignKey linking to the UserProfile, representing a sales agent token
@@ -445,4 +451,3 @@ class HuzZiyarahDetail(models.Model):
 #
 #     def __str__(self):
 #         return f"{self.transport_token} - {self.transport_package_provider}"
-

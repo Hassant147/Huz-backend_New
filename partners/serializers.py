@@ -91,6 +91,7 @@ class PartnerProfileSerializer(serializers.ModelSerializer):
     partner_type_and_detail = serializers.SerializerMethodField()
     # Get Partner offered services
     partner_service_detail = serializers.SerializerMethodField()
+    mailing_detail = serializers.SerializerMethodField()
     wallet_amount = serializers.SerializerMethodField()
 
     class Meta:
@@ -99,8 +100,14 @@ class PartnerProfileSerializer(serializers.ModelSerializer):
             'partner_session_token', 'user_name', 'email', 'name', 'country_code', 'phone_number', 'partner_type',
             'is_phone_verified', 'is_email_verified', 'is_address_exist', 'firebase_token', 'web_firebase_token',
             'account_status', 'wallet_amount', 'created_time',  'user_photo', 'partner_service_detail',
-            'partner_type_and_detail'
+            'partner_type_and_detail', 'mailing_detail'
         )
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if data.get('account_status') == "UnderReview":
+            data['account_status'] = "Pending"
+        return data
 
     def validate_email(self, value):
         regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
@@ -138,6 +145,12 @@ class PartnerProfileSerializer(serializers.ModelSerializer):
     def get_partner_type_and_detail(self, obj):
         return get_type_and_detail(obj)
 
+    def get_mailing_detail(self, obj):
+        mailing_detail = PartnerMailingDetail.objects.filter(mailing_of_partner=obj).first()
+        if not mailing_detail:
+            return {}
+        return PartnerMailingDetailSerializer(mailing_detail).data
+
 
 class PartnerServiceSerializer(serializers.ModelSerializer):
     class Meta:
@@ -167,7 +180,7 @@ class BusinessSerializer(serializers.ModelSerializer):
     class Meta:
         model = BusinessProfile
         fields = [
-            'company_name', 'contact_name', 'contact_number', 'company_website', 'total_experience',
+            'company_id', 'company_name', 'contact_name', 'contact_number', 'company_website', 'total_experience',
             'company_bio', 'license_type', 'license_number', 'license_certificate', 'company_logo'
         ]
 

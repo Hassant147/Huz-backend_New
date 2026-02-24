@@ -1,5 +1,5 @@
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAdminUser
+from rest_framework.permissions import IsAdminUser, AllowAny
 from rest_framework.response import Response
 from rest_framework import status, serializers
 from .models import UserProfile, Wallet, UserOTP, MailingDetail, SubscribeUser
@@ -188,7 +188,7 @@ class MatchOTPSMSAPIView(APIView):
 
 
 class IsUserExistView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
     @swagger_auto_schema(
         operation_description="Check if a user exists by phone number.",
         request_body=openapi.Schema(

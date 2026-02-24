@@ -9,6 +9,7 @@ urlpatterns = [
     path('partner_login/', partner_profile.PartnerLoginView.as_view()),
     path('is_user_exist/', partner_profile.IsPartnerExistView.as_view()),
     path('create_partner_profile/', partner_profile.CreatePartnerProfileView.as_view()),
+    path('get_partner_profile/', partner_profile.GetPartnerProfileView.as_view()),
     path('resend_otp/', partner_profile.SendEmailOTPView.as_view()),
     path('verify_otp/', partner_profile.MatchEmailOTPView.as_view()),
     path('partner_service/', partner_profile.PartnerServicesView.as_view()),

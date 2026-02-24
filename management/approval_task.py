@@ -17,15 +17,15 @@ from django.utils import timezone
 
 class ApprovedORRejectCompanyView(APIView):
     permission_classes = [IsAdminUser]
-    ACCOUNT_STATUS_CHOICES = ['Active', 'Pending', 'Deactivate', 'Block']
+    ACCOUNT_STATUS_CHOICES = ['Active', 'Rejected']
     @swagger_auto_schema(
         operation_description="Update partner account approval status.",
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
             properties={
                 'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the partner'),
-                'session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the sales director (optional)'),
-                'account_status': openapi.Schema(type=openapi.TYPE_STRING, description='New account status of the partner'),
+                'session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the sales director (optional, used for approval)'),
+                'account_status': openapi.Schema(type=openapi.TYPE_STRING, description='Review decision for company profile', enum=['Active', 'Rejected']),
             },
             required=['partner_session_token', 'account_status'],
         ),
@@ -40,36 +40,61 @@ class ApprovedORRejectCompanyView(APIView):
     def put(self, request, *args, **kwargs):
         try:
             # Extract data from request
-            partner_session_token = request.data.get('partner_session_token')
-            session_token = request.data.get('session_token')
-            account_status = request.data.get('account_status')
+            partner_session_token = (request.data.get('partner_session_token') or '').strip()
+            session_token = (request.data.get('session_token') or '').strip()
+            account_status = (request.data.get('account_status') or '').strip()
 
             # Check for required parameters
             if not partner_session_token or not account_status:
                 return Response({"message": "Missing user or account status information."}, status=status.HTTP_400_BAD_REQUEST)
 
             if account_status not in self.ACCOUNT_STATUS_CHOICES:
-                return Response({"message": f"Invalid account status. Must be one of {', '.join(self.ACCOUNT_STATUS_CHOICES)}."}, status=status.HTTP_400_BAD_REQUEST)
+                return Response(
+                    {"message": f"Invalid review decision. Must be one of {', '.join(self.ACCOUNT_STATUS_CHOICES)}."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
             # Retrieve partner profile based on session token
             user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
             if not user:
                 return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
 
-            # Optionally link sales director to partner profile
-            if session_token:
+            if (user.account_status or "").strip().lower() == "underreview":
+                user.account_status = "Pending"
+                user.save(update_fields=['account_status'])
+
+            if user.partner_type != "Company":
+                return Response({"message": "Selected profile is not a company profile."}, status=status.HTTP_409_CONFLICT)
+
+            if user.account_status != "Pending":
+                return Response(
+                    {"message": "Only pending company profiles can be reviewed from this screen."},
+                    status=status.HTTP_409_CONFLICT
+                )
+
+            # Optionally link sales director to approved company profile
+            if account_status == "Active" and session_token:
                 sales_agent = UserProfile.objects.filter(user_type="sales_director", session_token=session_token).first()
                 if not sales_agent:
                     return Response({"message": "Sales Director not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
-                user.sales_agent_token = sales_agent
+                user.sales_agenet_token = sales_agent
 
             if account_status == "Active":
                 if user.account_status != "Active":
                     send_company_approval_email(user.email, user.name)
+
             # Update account status and save changes
             user.account_status = account_status
             user.save()
-            return Response({"message": "Company Profile has been updated."}, status=status.HTTP_200_OK)
+
+            decision_label = "approved" if account_status == "Active" else "rejected"
+            return Response(
+                {
+                    "message": f"Company profile {decision_label} successfully.",
+                    "account_status": user.account_status
+                },
+                status=status.HTTP_200_OK
+            )
 
         except Exception as e:
             # add in Logs file
@@ -91,8 +116,49 @@ class GetAllPendingApprovalsView(APIView):
     )
     def get(self, request):
         try:
-            # Fetch the pending profiles based on the status
-            pending_profiles = PartnerProfile.objects.filter(account_status="Pending")
+            # Normalize legacy status naming to keep a single pending state.
+            PartnerProfile.objects.filter(account_status__iexact="UnderReview").update(account_status="Pending")
+
+            # Fetch only actionable pending company profiles:
+            # - email verified
+            # - partner type selected as company
+            # - service selection exists
+            # - company detail exists
+            pending_profiles = PartnerProfile.objects.filter(
+                account_status="Pending",
+                is_email_verified=True,
+                partner_type="Company",
+                is_address_exist=True,
+                services_of_partner__isnull=False,
+                company_of_partner__isnull=False,
+                company_of_partner__company_name__isnull=False,
+                company_of_partner__contact_name__isnull=False,
+                company_of_partner__contact_number__isnull=False,
+                company_of_partner__total_experience__isnull=False,
+                company_of_partner__company_bio__isnull=False,
+                company_of_partner__license_type__isnull=False,
+                company_of_partner__license_number__isnull=False,
+                company_of_partner__license_certificate__isnull=False,
+                company_of_partner__company_logo__isnull=False,
+            ).exclude(
+                company_of_partner__company_name__exact=""
+            ).exclude(
+                company_of_partner__contact_name__exact=""
+            ).exclude(
+                company_of_partner__contact_number__exact=""
+            ).exclude(
+                company_of_partner__total_experience__exact=""
+            ).exclude(
+                company_of_partner__company_bio__exact=""
+            ).exclude(
+                company_of_partner__license_type__exact=""
+            ).exclude(
+                company_of_partner__license_number__exact=""
+            ).exclude(
+                company_of_partner__license_certificate__exact=""
+            ).exclude(
+                company_of_partner__company_logo__exact=""
+            ).distinct()
 
             if pending_profiles.exists():
                 serializer = PartnerProfileSerializer(pending_profiles, many=True)

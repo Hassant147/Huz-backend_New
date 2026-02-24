@@ -1,6 +1,6 @@
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAdminUser
+from rest_framework.permissions import IsAdminUser, AllowAny
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from .models import PartnerProfile, PasswordResetToken
@@ -11,10 +11,11 @@ from datetime import timedelta
 from rest_framework import status, serializers
 from common.logs_file import logger
 import re
+from django.conf import settings
 
 
 class ForgotEmail(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         operation_description="Send a password reset link to the partner's email if the email exists.",
@@ -40,7 +41,7 @@ class ForgotEmail(APIView):
     def post(self, request, *args, **kwargs):
         try:
             serializer = PartnerProfileSerializer(data=request.data)
-            email = request.data.get('email')  # Use .data to handle JSON in request body
+            email = (request.data.get('email') or '').strip().lower()  # Use .data to handle JSON in request body
             if not email:
                 return Response({"message": "Email is required."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -49,10 +50,11 @@ class ForgotEmail(APIView):
             except serializers.ValidationError as e:
                 return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
 
-            partner = PartnerProfile.objects.filter(email=email).first()
+            partner = PartnerProfile.objects.filter(email__iexact=email).first()
             if partner:
                 reset_token = PasswordResetToken.objects.create(partner=partner)
-                reset_url = f"https://operator.hajjumrah.co/reset-password/{reset_token.token}/"
+                base_url = settings.OPERATOR_PANEL_BASE_URL.rstrip('/')
+                reset_url = f"{base_url}/reset-password/{reset_token.token}"
                 forgot_password_email(partner.email, reset_url)  # Make sure email sending function works properly
                 return Response({"message": "Password reset link has been sent to your email."}, status=status.HTTP_200_OK)
             else:
@@ -60,11 +62,11 @@ class ForgotEmail(APIView):
         except Exception as e:
             # add in logs
             logger.error("ForgotEmail error: %s", str(e))
-            return Response({"message": "Internal server error. " + str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({"message": "Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class UpdatePassword(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         operation_description="Reset the password for the user using a valid token.",
@@ -108,8 +110,8 @@ class UpdatePassword(APIView):
             if not reset_token:
                 return Response({"message": "Invalid or expired token."}, status=status.HTTP_404_NOT_FOUND)
 
-            # Check if the token has expired (e.g., after 1 hour)
-            if reset_token.created_at < timezone.now() - timedelta(hours=1):
+            # Check if the token has expired.
+            if reset_token.created_at < timezone.now() - timedelta(minutes=settings.PASSWORD_RESET_EXPIRY_MINUTES):
                 return Response({"message": "This link has expired. Please request a new one."}, status=status.HTTP_400_BAD_REQUEST)
 
             try:
@@ -126,5 +128,5 @@ class UpdatePassword(APIView):
             reset_token.save()
             return Response({"message": "Your password has been successfully reset!"}, status=status.HTTP_200_OK)
         except Exception as e:
-            return Response({"message": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
+            logger.error("UpdatePassword error: %s", str(e))
+            return Response({"message": "Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

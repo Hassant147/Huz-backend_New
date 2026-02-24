@@ -1,5 +1,5 @@
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAdminUser
+from rest_framework.permissions import IsAdminUser, AllowAny
 from rest_framework.response import Response
 from rest_framework import status, serializers
 from .models import PartnerProfile, IndividualProfile, BusinessProfile, PartnerServices, PartnerMailingDetail, Wallet
@@ -8,16 +8,33 @@ from django.db import transaction
 import re
 from common.logs_file import logger
 from common.utility import generate_token, random_six_digits, send_verification_email, hash_password, check_password, validate_required_fields, check_photo_format_and_size, check_file_format_and_size, save_file_in_directory, delete_file_from_directory
-from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from datetime import datetime
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from django.utils import timezone
 from datetime import timedelta
+from django.conf import settings
+
+
+def build_unique_partner_session_token(email):
+    for _ in range(10):
+        raw_value = f"{email}{timezone.now().timestamp()}{random_six_digits()}"
+        token_candidate = generate_token(raw_value)
+        if not PartnerProfile.objects.filter(partner_session_token=token_candidate).exists():
+            return token_candidate
+    return ""
+
+
+def normalize_legacy_review_status(user):
+    if user and (user.account_status or "").strip().lower() == "underreview":
+        user.account_status = "Pending"
+        user.save(update_fields=['account_status'])
+    return user
 
 
 class PartnerLoginView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         operation_description="Authenticate Partner profile with email and password & update their web Firebase token.",
@@ -42,8 +59,8 @@ class PartnerLoginView(APIView):
         try:
             # Extract email, password, and web Firebase token from the request data
             data = request.data
-            email = data.get('email')
-            password = data.get('password')
+            email = (data.get('email') or '').strip().lower()
+            password = (data.get('password') or '').strip()
             web_firebase_token = data.get('web_firebase_token')
 
             # Check if email and password are provided
@@ -58,7 +75,8 @@ class PartnerLoginView(APIView):
                 return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
 
             # Retrieve the user based on the email provided
-            user = PartnerProfile.objects.get(email=email)
+            user = PartnerProfile.objects.get(email__iexact=email)
+            user = normalize_legacy_review_status(user)
 
             # Check if the provided password matches the stored password
             if not check_password(user.password, password):
@@ -81,7 +99,7 @@ class PartnerLoginView(APIView):
 
 
 class IsPartnerExistView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
     @swagger_auto_schema(
         operation_description="Check if a user exists by phone number.",
         request_body=openapi.Schema(
@@ -104,7 +122,7 @@ class IsPartnerExistView(APIView):
         serializer = PartnerProfileSerializer(data=request.data)
 
         # checking that phone_number is provided
-        email = request.data.get('email')
+        email = (request.data.get('email') or '').strip().lower()
         if not email:
             return Response({"message": "Email address is required."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -115,7 +133,8 @@ class IsPartnerExistView(APIView):
             return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            partner = PartnerProfile.objects.get(email=email)
+            partner = PartnerProfile.objects.get(email__iexact=email)
+            partner = normalize_legacy_review_status(partner)
             serializer = PartnerProfileSerializer(partner)
             return Response(serializer.data, status=status.HTTP_200_OK)
         except PartnerProfile.DoesNotExist:
@@ -128,6 +147,11 @@ class IsPartnerExistView(APIView):
 
 class CreatePartnerProfileView(APIView):
     permission_classes = [IsAdminUser]
+
+    def get_permissions(self):
+        if self.request.method == 'POST':
+            return [AllowAny()]
+        return [permission() for permission in self.permission_classes]
 
     @swagger_auto_schema(
         operation_description="Delete a partner profile based on the provided session token.",
@@ -189,14 +213,16 @@ class CreatePartnerProfileView(APIView):
     )
     def post(self, request, *args, **kwargs):
         try:
-            data = request.data
+            data = request.data.copy()
 
             # Check if email is provided
-            email = request.data.get('email')
-            phone_number = request.data.get('phone_number')
+            email = (request.data.get('email') or '').strip().lower()
+            phone_number = (request.data.get('phone_number') or '').strip().replace(" ", "")
             password = request.data.get('password')
+            if phone_number and not phone_number.startswith("+"):
+                phone_number = f"+{phone_number}"
             if not email or not phone_number:
-                return Response({"message": "Email address is required."}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"message": "Email and phone number are required."}, status=status.HTTP_400_BAD_REQUEST)
 
             # Validate the request data using the serializer
             serializer = PartnerProfileSerializer(data=data)
@@ -218,12 +244,18 @@ class CreatePartnerProfileView(APIView):
             except serializers.ValidationError as e:
                 return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
 
-            # Generate a unique session token for the partner
-            token_key = generate_token(email + str(52955917))
+            # Protect against race conditions and direct API duplicate requests.
+            if PartnerProfile.objects.filter(email__iexact=email).exists():
+                return Response({"message": "Email already exists."}, status=status.HTTP_409_CONFLICT)
 
-            # Check if a user with the same token already exists
-            if PartnerProfile.objects.filter(partner_session_token=token_key).exists():
-                return Response({"message": "This user already exists."}, status=status.HTTP_409_CONFLICT)
+            country_code, local_phone_number = phone_number[:-10], phone_number[-10:]
+            if PartnerProfile.objects.filter(country_code=country_code, phone_number=local_phone_number).exists():
+                return Response({"message": "Phone number already exists."}, status=status.HTTP_409_CONFLICT)
+
+            # Generate a unique session token for the partner
+            token_key = build_unique_partner_session_token(email)
+            if not token_key:
+                return Response({"message": "Unable to create a unique session token."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
             if data.get('sign_type') == "Email":
                 required_fields = ['name', 'phone_number', 'password']
@@ -237,7 +269,9 @@ class CreatePartnerProfileView(APIView):
                         otp = random_six_digits()
 
                         # Extract country code and phone number
-                        country_code, phone_number = phone_number[:-10], phone_number[-10:]
+                        country_code, phone_number = country_code, local_phone_number
+                        data['email'] = email
+                        data['name'] = (data.get('name') or '').strip()
                         data['partner_session_token'] = token_key
                         data['phone_number'] = phone_number
                         data['country_code'] = country_code
@@ -252,8 +286,10 @@ class CreatePartnerProfileView(APIView):
                         wallet_token = generate_token(f'wallet{datetime.now()}0.0')
                         Wallet.objects.create(wallet_code=wallet_token, wallet_session=user)
 
-                        # Send a verification email with the OTP
-                        send_verification_email(user.email, user.name, otp)
+                        # Send a verification email with the OTP and fail fast if SMTP delivery fails.
+                        is_sent = send_verification_email(user.email, user.name, otp, wait_for_result=True)
+                        if not is_sent:
+                            raise RuntimeError("Unable to send verification OTP email.")
 
                         # Serialize and return the user data
                         serialized_user = PartnerProfileSerializer(user)
@@ -269,8 +305,46 @@ class CreatePartnerProfileView(APIView):
             return Response({"message": "Failed to create user due to an internal error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+class GetPartnerProfileView(APIView):
+    permission_classes = [AllowAny]
+
+    @swagger_auto_schema(
+        operation_description="Get partner profile by partner session token.",
+        manual_parameters=[
+            openapi.Parameter(
+                'partner_session_token',
+                openapi.IN_QUERY,
+                type=openapi.TYPE_STRING,
+                required=True,
+                description='Session token of the partner'
+            ),
+        ],
+        responses={
+            200: openapi.Response("Success", PartnerProfileSerializer),
+            400: "Bad Request: Missing partner session token.",
+            404: "Not Found: User not found with the provided detail.",
+            500: "Server Error: Internal server error",
+        }
+    )
+    def get(self, request, *args, **kwargs):
+        try:
+            partner_session_token = request.GET.get('partner_session_token')
+            if not partner_session_token:
+                return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
+
+            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
+            if not user:
+                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
+            user = normalize_legacy_review_status(user)
+
+            return Response(PartnerProfileSerializer(user).data, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.error("GetPartnerProfileView error: %s", str(e))
+            return Response({"message": "Failed to fetch partner profile. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
 class SendEmailOTPView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         operation_description="Send or Resend OTP to the partner's email based on session token",
@@ -298,7 +372,9 @@ class SendEmailOTPView(APIView):
                 return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
 
             otp = random_six_digits()
-            send_verification_email(user.email, user.name, otp)
+            is_sent = send_verification_email(user.email, user.name, otp, wait_for_result=True)
+            if not is_sent:
+                return Response({"message": "Failed to send OTP email. Please try again."}, status=status.HTTP_502_BAD_GATEWAY)
             user.otp = otp
             user.save()
             return Response({"message": "OTP sent successfully."}, status=status.HTTP_200_OK)
@@ -309,7 +385,7 @@ class SendEmailOTPView(APIView):
 
 
 class MatchEmailOTPView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         request_body=openapi.Schema(
@@ -341,10 +417,11 @@ class MatchEmailOTPView(APIView):
             user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
             if not user:
                 return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
+            user = normalize_legacy_review_status(user)
 
-            # If OTP has expired (within 2 minute)
+            # Check OTP expiry window
             time_difference = timezone.now() - user.otp_time
-            if time_difference > timedelta(minutes=2):
+            if time_difference > timedelta(minutes=settings.EMAIL_OTP_EXPIRY_MINUTES):
                 return Response({"message": "OTP has expired. Please request a new OTP."}, status=status.HTTP_400_BAD_REQUEST)
 
             # Matching otp
@@ -353,7 +430,7 @@ class MatchEmailOTPView(APIView):
 
             with transaction.atomic():
                 user.is_email_verified = True
-                user.email_otp = ""
+                user.otp = ""
                 user.save()
 
             # Returning user profile
@@ -366,7 +443,7 @@ class MatchEmailOTPView(APIView):
 
 
 class PartnerServicesView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         operation_description="Create services for a partner based on the provided session token.",
@@ -454,7 +531,7 @@ class PartnerServicesView(APIView):
 
 
 class IndividualPartnerView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
     parser_classes = [MultiPartParser, FormParser]
 
     @swagger_auto_schema(
@@ -561,7 +638,7 @@ class IndividualPartnerView(APIView):
 
 
 class UpdatePartnerIndividualProfileView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         operation_description="Update the individual partner profile with new details.",
@@ -636,8 +713,8 @@ class UpdatePartnerIndividualProfileView(APIView):
 
 
 class BusinessPartnerView(APIView):
-    permission_classes = [IsAdminUser]
-    parser_classes = [MultiPartParser, FormParser]
+    permission_classes = [AllowAny]
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
 
     @swagger_auto_schema(
         operation_description="Create a business partner profile with company details and mailing address.",
@@ -772,7 +849,8 @@ class BusinessPartnerView(APIView):
 
 
 class UpdateBusinessProfileView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
+    parser_classes = [JSONParser, MultiPartParser, FormParser]
 
     @swagger_auto_schema(
         operation_description="Update the business partner profile with new details.",
@@ -800,75 +878,84 @@ class UpdateBusinessProfileView(APIView):
     )
     def put(self, request, *args, **kwargs):
         data = request.data
-        partner_session_token = request.data.get('partner_session_token')
-        user_name = request.data.get('user_name')
+        partner_session_token = data.get('partner_session_token')
+        user_name = data.get('user_name') or data.get('company_profile_url')
+        license_certificate = data.get('license_certificate')
 
-        # Check if the partner_session_token is provided
         if not partner_session_token:
             return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Validate required fields
-        required_fields = ['user_name', 'contact_name', 'contact_number', 'company_website', 'total_experience', 'company_bio']
-        error_response = validate_required_fields(required_fields, data)
-        if error_response:
-            return error_response
+        # Validate optional phone number if provided
+        contact_number = data.get('contact_number')
+        if contact_number:
+            serializer1 = PartnerProfileSerializer(data=data)
+            try:
+                serializer1.validate_phone_number(contact_number)
+            except serializers.ValidationError as e:
+                return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Validate the phone number using serializer validation
-        serializer1 = PartnerProfileSerializer(data=data)
-        try:
-            serializer1.validate_phone_number(data["contact_number"])
-        except serializers.ValidationError as e:
-            return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Validate the format of the user_name
-        if not re.match(r'^\w+$', user_name):
+        # Validate username format when provided
+        if user_name and not re.match(r'^\w+$', user_name):
             return Response({"message": "Invalid user name. Only alphanumeric characters and underscores are allowed."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            # Fetch the user based on the partner_session_token
             user = PartnerProfile.objects.get(partner_session_token=partner_session_token)
 
-            # Check if the user_name needs to be updated
-            if user.user_name != user_name.lower():
-                # Check if the new user_name is already taken
-                if PartnerProfile.objects.filter(user_name=user_name.lower()).exists():
-                    return Response({"message": "Sorry, this User name is already taken."}, status=status.HTTP_409_CONFLICT)
-                user.user_name = user_name.lower()
-                user.save()
+            if user.partner_type == "NA":
+                return Response({"message": "Sorry, update Service section first."}, status=status.HTTP_409_CONFLICT)
+            if user.partner_type == "Individual":
+                return Response({"message": "Sorry, you're enrolled as Individual."}, status=status.HTTP_409_CONFLICT)
 
-            try:
-                # Use transaction.atomic to ensure atomicity
-                with transaction.atomic():
-                    # Fetch the BusinessProfile associated with the user
-                    bus_profile = BusinessProfile.objects.get(company_of_partner=user)
-                    # Update the BusinessProfile fields with the new data
-                    bus_profile.contact_name = data.get('contact_name')
-                    bus_profile.contact_number = data.get('contact_number')
-                    bus_profile.company_website = data.get('company_website')
-                    bus_profile.total_experience = data.get('total_experience')
-                    bus_profile.company_bio = data.get('company_bio')
-                    bus_profile.save()
+            with transaction.atomic():
+                # Username is used as company profile URL alias in frontend flow.
+                if user_name and user.user_name != user_name.lower():
+                    if PartnerProfile.objects.filter(user_name=user_name.lower()).exclude(partner_id=user.partner_id).exists():
+                        return Response({"message": "Sorry, this User name is already taken."}, status=status.HTTP_409_CONFLICT)
+                    user.user_name = user_name.lower()
+                    user.save()
 
-                    # Serialize and return the updated PartnerProfile
-                    serialized_package = PartnerProfileSerializer(user)
-                    return Response(serialized_package.data, status=status.HTTP_200_OK)
+                # Upsert business profile so first-time setup can be done progressively across tabs.
+                bus_profile, _ = BusinessProfile.objects.get_or_create(company_of_partner=user)
 
-            # Handle case where the BusinessProfile does not exist
-            except BusinessProfile.DoesNotExist:
-                return Response({"message": "Company detail not exist."}, status=status.HTTP_404_NOT_FOUND)
+                updateable_fields = [
+                    'company_name',
+                    'contact_name',
+                    'contact_number',
+                    'company_website',
+                    'total_experience',
+                    'company_bio',
+                    'license_type',
+                    'license_number',
+                ]
+                for field in updateable_fields:
+                    if field in data:
+                        setattr(bus_profile, field, data.get(field))
 
-        # Handle case where the PartnerProfile does not exist
+                if license_certificate:
+                    if not check_file_format_and_size(license_certificate):
+                        return Response(
+                            {"message": "Invalid file format or size for certificate."},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                    if bus_profile.license_certificate:
+                        delete_file_from_directory(bus_profile.license_certificate.name)
+                    file_path = save_file_in_directory(license_certificate)
+                    bus_profile.license_certificate = file_path
+
+                bus_profile.save()
+
+            serialized_package = PartnerProfileSerializer(user)
+            return Response(serialized_package.data, status=status.HTTP_200_OK)
+
         except PartnerProfile.DoesNotExist:
             return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
-
-        # Handle any unexpected exceptions
         except Exception as e:
             logger.error(f"UpdatePartnerBusinessProfileView: {str(e)}")
             return Response({"message": "An internal server error occurred."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class CheckPartnerUsernameAvailabilityView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         operation_description="Check if a given username is available for a partner.",
@@ -923,7 +1010,7 @@ class CheckPartnerUsernameAvailabilityView(APIView):
 
 
 class GetPartnerAddressView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         manual_parameters=[
@@ -967,14 +1054,14 @@ class GetPartnerAddressView(APIView):
 
 
 class UpdatePartnerAddressView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
             properties={
                 'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the partner'),
-                'address_id': openapi.Schema(type=openapi.TYPE_INTEGER, description='ID of the address detail'),
+                'address_id': openapi.Schema(type=openapi.TYPE_STRING, description='ID of the address detail (optional for first-time create)'),
                 'street_address': openapi.Schema(type=openapi.TYPE_STRING, description='Street address'),
                 'address_line2': openapi.Schema(type=openapi.TYPE_STRING, description='Address line 2'),
                 'city': openapi.Schema(type=openapi.TYPE_STRING, description='City'),
@@ -982,16 +1069,17 @@ class UpdatePartnerAddressView(APIView):
                 'country': openapi.Schema(type=openapi.TYPE_STRING, description='Country'),
                 'postal_code': openapi.Schema(type=openapi.TYPE_STRING, description='Postal code')
             },
-            required=['session_token', 'address_id']
+            required=['partner_session_token', 'street_address', 'city', 'country']
         ),
         responses={
             200: openapi.Response("Success: Address details updated successfully", PartnerMailingDetailSerializer),
+            201: openapi.Response("Success: Address details created successfully", PartnerMailingDetailSerializer),
             400: "Bad Request: Missing required information or invalid data format",
             401: "Unauthorized: Admin permissions required",
             404: "Not Found: User not recognized or address detail not found",
             500: "Server Error: Internal server error"
         },
-        operation_description="Update address details for a user"
+        operation_description="Create or update address details for a user"
     )
     def put(self, request, *args, **kwargs):
         try:
@@ -999,12 +1087,12 @@ class UpdatePartnerAddressView(APIView):
             partner_session_token = request.data.get('partner_session_token')
             address_id = request.data.get('address_id')
 
-            # Validate session_token and address_id presence
-            if not partner_session_token or not address_id:
-                return Response({"message": "Missing user information or address ID."}, status=status.HTTP_400_BAD_REQUEST)
+            # Validate session token presence
+            if not partner_session_token:
+                return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
 
             # Validate required fields
-            required_fields = ['address_id', 'street_address', 'city', 'state', 'country', 'postal_code']
+            required_fields = ['street_address', 'city', 'country']
             error_response = validate_required_fields(required_fields, data)
             if error_response:
                 return error_response
@@ -1014,21 +1102,43 @@ class UpdatePartnerAddressView(APIView):
             if not user:
                 return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
 
-            # Retrieve address detail based on address_id and mailing_session (user)
-            address_detail = PartnerMailingDetail.objects.filter(mailing_of_partner=user, address_id=address_id).first()
-            if not address_detail:
-                return Response({"message": "Address detail not found."}, status=status.HTTP_404_NOT_FOUND)
+            with transaction.atomic():
+                # If address_id is provided, update that specific address.
+                # If not provided, update first existing address or create a new one.
+                if address_id:
+                    address_detail = PartnerMailingDetail.objects.filter(mailing_of_partner=user, address_id=address_id).first()
+                    if not address_detail:
+                        return Response({"message": "Address detail not found."}, status=status.HTTP_404_NOT_FOUND)
+                    serializer = PartnerMailingDetailSerializer(address_detail, data=data, partial=True)
+                    if serializer.is_valid():
+                        serializer.save()
+                        if not user.is_address_exist:
+                            user.is_address_exist = True
+                            user.save(update_fields=['is_address_exist'])
+                        return Response(serializer.data, status=status.HTTP_200_OK)
+                else:
+                    address_detail = PartnerMailingDetail.objects.filter(mailing_of_partner=user).first()
+                    if address_detail:
+                        serializer = PartnerMailingDetailSerializer(address_detail, data=data, partial=True)
+                        if serializer.is_valid():
+                            serializer.save()
+                            if not user.is_address_exist:
+                                user.is_address_exist = True
+                                user.save(update_fields=['is_address_exist'])
+                            return Response(serializer.data, status=status.HTTP_200_OK)
+                    else:
+                        serializer = PartnerMailingDetailSerializer(data=data)
+                        if serializer.is_valid():
+                            serializer.save(mailing_of_partner=user)
+                            if not user.is_address_exist:
+                                user.is_address_exist = True
+                                user.save(update_fields=['is_address_exist'])
+                            return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-            # Validate and update mailing detail
-            serializer = PartnerMailingDetailSerializer(address_detail, data=data, partial=True)
-            if serializer.is_valid():
-                serializer.save()
-                return Response(serializer.data, status=status.HTTP_200_OK)
-            else:
-                # Extracting first error message with field name
-                first_error_field = next(iter(serializer.errors))
-                first_error_message = f"{first_error_field}: {serializer.errors[first_error_field][0]}"
-                return Response({"message": first_error_message}, status=status.HTTP_400_BAD_REQUEST)
+            # Extracting first error message with field name
+            first_error_field = next(iter(serializer.errors))
+            first_error_message = f"{first_error_field}: {serializer.errors[first_error_field][0]}"
+            return Response({"message": first_error_message}, status=status.HTTP_400_BAD_REQUEST)
 
         except KeyError as e:
             # Handle missing key error
@@ -1042,7 +1152,7 @@ class UpdatePartnerAddressView(APIView):
 
 
 class UpdateCompanyLogoView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
     parser_classes = [MultiPartParser, FormParser]
 
     @swagger_auto_schema(
@@ -1101,6 +1211,8 @@ class UpdateCompanyLogoView(APIView):
             check_exist.company_logo = file_path
             check_exist.save()
 
+            user = normalize_legacy_review_status(user)
+
             # Serialize user data for response
             serialized_user = PartnerProfileSerializer(user)
             return Response(serialized_user.data, status=status.HTTP_200_OK)
@@ -1111,7 +1223,7 @@ class UpdateCompanyLogoView(APIView):
 
 
 class ChangePasswordView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         request_body=openapi.Schema(

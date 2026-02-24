@@ -86,7 +86,9 @@ class PartnerStatusCountView(APIView):
 
             # Map the counts to the response dictionary
             for statuss in status_counts:
-                result[statuss['account_status']] = statuss['count']
+                raw_status = (statuss.get('account_status') or "").strip()
+                normalized_status = "Pending" if raw_status.lower() in {"underreview", "pending"} else raw_status
+                result[normalized_status] = result.get(normalized_status, 0) + statuss['count']
 
             # Return the response with HTTP 200 OK status
             return Response(result, status=status.HTTP_200_OK)
@@ -1710,4 +1712,3 @@ class BookingStatsByPackageAPIView(APIView):
                 {"error": f"An unexpected error occurred: {str(e)}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-
