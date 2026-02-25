@@ -1,5 +1,12 @@
 from django.urls import path, re_path
-from . import forgot_password, partner_profile, package_management, partner_accounts_and_transactions, views
+from . import (
+    forgot_password,
+    package_management,
+    package_management_operator,
+    partner_accounts_and_transactions,
+    partner_profile,
+    views,
+)
 
 
 urlpatterns = [
@@ -24,15 +31,15 @@ urlpatterns = [
     path('change_partner_password/', partner_profile.ChangePasswordView.as_view()),
 
     # Package Management
-    path('enroll_package_basic_detail/', package_management.CreateHuzPackageView.as_view()),
-    path('enroll_package_airline_detail/', package_management.CreateHuzAirlineView.as_view()),
-    path('enroll_package_transport_detail/', package_management.CreateHuzTransportView.as_view()),
-    path('enroll_package_hotel_detail/', package_management.CreateHuzHotelView.as_view()),
-    path('enroll_package_ziyarah_detail/', package_management.CreateHuzZiyarahView.as_view()),
-    path('change_huz_package_status/', package_management.ManageHuzPackageStatusView.as_view()),
-    path('get_package_short_detail_by_partner_token/', package_management.GetHuzShortPackageByTokenView.as_view()),
-    path('get_package_detail_by_partner_token/', package_management.GetHuzPackageDetailByTokenView.as_view()),
-    path('get_partner_overall_package_statistics/', package_management.GetPartnersOverallPackagesStatisticsView.as_view()),
+    path('enroll_package_basic_detail/', package_management_operator.CreateHuzPackageView.as_view()),
+    path('enroll_package_airline_detail/', package_management_operator.CreateHuzAirlineView.as_view()),
+    path('enroll_package_transport_detail/', package_management_operator.CreateHuzTransportView.as_view()),
+    path('enroll_package_hotel_detail/', package_management_operator.CreateHuzHotelView.as_view()),
+    path('enroll_package_ziyarah_detail/', package_management_operator.CreateHuzZiyarahView.as_view()),
+    path('change_huz_package_status/', package_management_operator.ManageHuzPackageStatusView.as_view()),
+    path('get_package_short_detail_by_partner_token/', package_management_operator.GetHuzShortPackageByTokenView.as_view()),
+    path('get_package_detail_by_partner_token/', package_management_operator.GetHuzPackageDetailByTokenView.as_view()),
+    path('get_partner_overall_package_statistics/', package_management_operator.GetPartnersOverallPackagesStatisticsView.as_view()),
 
     # For Website only
     path('get_package_short_detail_for_web/', package_management.GetHuzShortPackageForWebsiteView.as_view()),
