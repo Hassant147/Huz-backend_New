@@ -4,6 +4,7 @@ from booking.models import BookingRatingAndReview
 import re
 from .models import (PartnerProfile, Wallet, PartnerServices, IndividualProfile, BusinessProfile, PartnerMailingDetail,
                      HuzBasicDetail, HuzAirlineDetail, HuzTransportDetail, HuzHotelDetail, HuzHotelImage, HuzZiyarahDetail,
+                     HuzPackageDateRange,
                      PartnerBankAccount, PartnerWithdraw, PartnerTransactionHistory)
 
 
@@ -264,7 +265,7 @@ class HuzBasicShortSerializer(serializers.ModelSerializer):
         fields = [
             'huz_token', 'package_type', 'package_name', 'package_base_cost', 'cost_for_child', 'cost_for_infants',
             'cost_for_sharing', 'cost_for_quad', 'cost_for_triple', 'cost_for_double', 'cost_for_single',
-            'mecca_nights', 'madinah_nights',
+            'discount_if_child_with_bed', 'mecca_nights', 'madinah_nights', 'jeddah_nights', 'taif_nights', 'riyadah_nights',
             'start_date', 'end_date', 'is_visa_included', 'is_airport_reception_included',
             'is_tour_guide_included', 'is_insurance_included', 'is_breakfast_included', 'is_lunch_included',
             'is_dinner_included', 'is_package_open_for_other_date', 'package_validity', 'package_status', 'package_stage',
@@ -295,7 +296,8 @@ class HuzBasicSerializer(serializers.ModelSerializer):
         fields = [
             'huz_token', 'package_type', 'package_name', 'package_base_cost', 'cost_for_child', 'cost_for_infants',
             'cost_for_sharing', 'cost_for_quad', 'cost_for_triple', 'cost_for_double', 'cost_for_single',
-            'mecca_nights', 'madinah_nights', 'start_date', 'end_date', 'description', 'is_visa_included',
+            'discount_if_child_with_bed', 'mecca_nights', 'madinah_nights', 'jeddah_nights', 'taif_nights',
+            'riyadah_nights', 'start_date', 'end_date', 'description', 'is_visa_included',
             'is_airport_reception_included', 'is_tour_guide_included', 'is_insurance_included', 'is_breakfast_included',
             'is_lunch_included', 'is_dinner_included', 'is_package_open_for_other_date', 'package_validity',
             'package_status', 'package_stage', 'created_time', 'partner_session_token', 'airline_detail',
@@ -319,6 +321,18 @@ class HuzBasicSerializer(serializers.ModelSerializer):
 
     def get_rating_count(self, obj):
         return get_rating_count(obj)
+
+
+class HuzPackageDateRangeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = HuzPackageDateRange
+        fields = [
+            "range_id",
+            "start_date",
+            "end_date",
+            "group_capacity",
+            "package_validity",
+        ]
 
 
 class HuzHotelSerializer(serializers.ModelSerializer):

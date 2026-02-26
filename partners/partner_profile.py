@@ -101,13 +101,14 @@ class PartnerLoginView(APIView):
 class IsPartnerExistView(APIView):
     permission_classes = [AllowAny]
     @swagger_auto_schema(
-        operation_description="Check if a user exists by phone number.",
+        operation_description="Check if a partner exists by email or phone number.",
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
             properties={
                 'email': openapi.Schema(type=openapi.TYPE_STRING),
+                'phone_number': openapi.Schema(type=openapi.TYPE_STRING),
             },
-            required=['email'],
+            required=[],
         ),
         responses={
             200: openapi.Response(description="Partner exists", schema=PartnerProfileSerializer),
@@ -118,27 +119,52 @@ class IsPartnerExistView(APIView):
         }
     )
     def post(self, request, *args, **kwargs):
-        # Deserialize request data using UserProfileSerializer
         serializer = PartnerProfileSerializer(data=request.data)
-
-        # checking that phone_number is provided
         email = (request.data.get('email') or '').strip().lower()
-        if not email:
-            return Response({"message": "Email address is required."}, status=status.HTTP_400_BAD_REQUEST)
+        phone_number = (request.data.get('phone_number') or '').strip().replace(" ", "")
+
+        if not email and not phone_number:
+            return Response(
+                {"message": "Email or phone number is required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         try:
-            # Validate the email format using serializer validation
-            serializer.validate_email(email)
-        except serializers.ValidationError as e:
-            return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
+            if email:
+                try:
+                    serializer.validate_email(email)
+                except serializers.ValidationError as e:
+                    return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
 
-        try:
-            partner = PartnerProfile.objects.get(email__iexact=email)
+                partner = PartnerProfile.objects.get(email__iexact=email)
+            else:
+                if phone_number and not phone_number.startswith("+"):
+                    phone_number = f"+{phone_number}"
+                try:
+                    serializer.validate_phone_number(phone_number)
+                except serializers.ValidationError as e:
+                    return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
+
+                country_code = phone_number[:-10]
+                local_phone = phone_number[-10:]
+                partner = PartnerProfile.objects.get(
+                    country_code=country_code,
+                    phone_number=local_phone
+                )
+
             partner = normalize_legacy_review_status(partner)
             serializer = PartnerProfileSerializer(partner)
             return Response(serializer.data, status=status.HTTP_200_OK)
         except PartnerProfile.DoesNotExist:
-            return Response({"message": "User with this email does not exist."}, status=status.HTTP_404_NOT_FOUND)
+            if email:
+                return Response(
+                    {"message": "User with this email does not exist."},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            return Response(
+                {"message": "User with this phone number does not exist."},
+                status=status.HTTP_404_NOT_FOUND
+            )
         except Exception as e:
             # add in Log
             logger.error("Partner-IsUserExistView: An unexpected error occurred: %s", str(e))

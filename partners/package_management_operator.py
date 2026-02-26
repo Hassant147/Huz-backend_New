@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta
 from uuid import UUID
+import json
 
+from django.db import transaction
 from django.db.models import Count, Q, Sum
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
@@ -20,6 +22,7 @@ from .models import (
     HuzAirlineDetail,
     HuzBasicDetail,
     HuzHotelDetail,
+    HuzPackageDateRange,
     HuzTransportDetail,
     HuzZiyarahDetail,
     PartnerProfile,
@@ -28,6 +31,7 @@ from .serializers import (
     HuzAirlineSerializer,
     HuzBasicSerializer,
     HuzHotelSerializer,
+    HuzPackageDateRangeSerializer,
     HuzTransportSerializer,
     HuzZiyarahSerializer,
     ShortBusinessSerializer,
@@ -42,6 +46,7 @@ PACKAGE_PREFETCH_RELATED = (
     "hotel_for_package__catalog_hotel",
     "hotel_for_package__catalog_hotel__hotel_images",
     "ziyarah_for_package",
+    "package_date_ranges",
     "package_provider__company_of_partner",
 )
 
@@ -54,11 +59,15 @@ BASIC_FLOAT_FIELDS = (
     "cost_for_triple",
     "cost_for_double",
     "cost_for_single",
+    "discount_if_child_with_bed",
 )
 
 BASIC_INT_FIELDS = (
     "mecca_nights",
     "madinah_nights",
+    "jeddah_nights",
+    "taif_nights",
+    "riyadah_nights",
 )
 
 BASIC_BOOL_FIELDS = (
@@ -84,6 +93,15 @@ HOTEL_BOOL_FIELDS = (
     "is_indian_toilet",
     "is_laundry",
 )
+
+HOTEL_CITY_NIGHT_FIELD_MAP = {
+    "makkah": "mecca_nights",
+    "madinah": "madinah_nights",
+    "jeddah": "jeddah_nights",
+    "taif": "taif_nights",
+    "riyadh": "riyadah_nights",
+    "riyadah": "riyadah_nights",
+}
 
 STATUS_NORMALIZER = {
     "initialize": "Initialize",
@@ -226,11 +244,6 @@ class OperatorHuzPackageSerializer(serializers.ModelSerializer):
     package_date_range = serializers.SerializerMethodField()
     company_detail = serializers.SerializerMethodField()
     rating_count = serializers.SerializerMethodField()
-
-    jeddah_nights = serializers.SerializerMethodField()
-    taif_nights = serializers.SerializerMethodField()
-    riyadah_nights = serializers.SerializerMethodField()
-    discount_if_child_with_bed = serializers.SerializerMethodField()
 
     class Meta:
         model = HuzBasicDetail
@@ -417,6 +430,17 @@ class OperatorHuzPackageSerializer(serializers.ModelSerializer):
         return result
 
     def get_package_date_range(self, obj):
+        range_items = self._prefetched_items(obj, "package_date_ranges")
+        if not range_items:
+            range_items = list(
+                HuzPackageDateRange.objects.filter(date_range_for_package=obj).order_by(
+                    "start_date", "end_date"
+                )
+            )
+
+        if range_items:
+            return HuzPackageDateRangeSerializer(range_items, many=True).data
+
         if not obj.start_date and not obj.end_date and not obj.package_validity:
             return []
 
@@ -429,18 +453,6 @@ class OperatorHuzPackageSerializer(serializers.ModelSerializer):
                 "package_validity": obj.package_validity,
             }
         ]
-
-    def get_jeddah_nights(self, _obj):
-        return 0
-
-    def get_taif_nights(self, _obj):
-        return 0
-
-    def get_riyadah_nights(self, _obj):
-        return 0
-
-    def get_discount_if_child_with_bed(self, _obj):
-        return 0
 
 
 class OperatorPackageBaseView(APIView):
@@ -511,6 +523,37 @@ class OperatorPackageBaseView(APIView):
         ).data
 
     @staticmethod
+    def _normalize_hotel_city_key(raw_city):
+        city_key = str(raw_city or "").strip().lower()
+        if city_key == "makkah":
+            return "makkah"
+        if city_key == "madinah":
+            return "madinah"
+        if city_key == "jeddah":
+            return "jeddah"
+        if city_key == "taif":
+            return "taif"
+        if city_key in {"riyadh", "riyadah"}:
+            return "riyadh"
+        return None
+
+    def _validate_hotel_city_nights(self, package, hotel_city):
+        city_key = self._normalize_hotel_city_key(hotel_city)
+        if not city_key:
+            return None
+
+        night_field = HOTEL_CITY_NIGHT_FIELD_MAP.get(city_key)
+        if not night_field:
+            return None
+
+        if _to_int(getattr(package, night_field, 0), 0) <= 0:
+            return (
+                f"Cannot add hotel for {hotel_city}. "
+                f"{city_key.title()} nights are 0 in package basic details."
+            )
+        return None
+
+    @staticmethod
     def _normalize_basic_payload(payload, create=False):
         normalized = {}
 
@@ -565,8 +608,7 @@ class OperatorPackageBaseView(APIView):
                 normalized["start_date"] = timezone.now() + timedelta(days=10)
 
             nights_total = max(
-                _to_int(normalized.get("mecca_nights"), 0)
-                + _to_int(normalized.get("madinah_nights"), 0),
+                sum(_to_int(normalized.get(field), 0) for field in BASIC_INT_FIELDS),
                 1,
             )
             if "end_date" not in normalized:
@@ -582,6 +624,172 @@ class OperatorPackageBaseView(APIView):
                 )
 
         return normalized, None
+
+    @staticmethod
+    def _compute_total_nights(basic_payload):
+        source = basic_payload or {}
+        return max(sum(_to_int(source.get(field), 0) for field in BASIC_INT_FIELDS), 1)
+
+    @staticmethod
+    def _normalize_package_date_range_payload(payload, basic_payload=None):
+        raw_ranges = payload.get("package_date_range")
+        if raw_ranges is None:
+            raw_ranges = payload.get("package_date_ranges")
+        if raw_ranges is None:
+            raw_ranges = payload.get("date_ranges")
+
+        if raw_ranges is None:
+            return None, None
+
+        if isinstance(raw_ranges, str):
+            raw_text = raw_ranges.strip()
+            if raw_text == "":
+                return None, "At least one date range is required."
+            try:
+                raw_ranges = json.loads(raw_text)
+            except json.JSONDecodeError:
+                return None, "package_date_range: Invalid JSON list."
+
+        if isinstance(raw_ranges, dict):
+            raw_ranges = [raw_ranges]
+
+        if not isinstance(raw_ranges, (list, tuple)):
+            return None, "package_date_range must be an array."
+        if len(raw_ranges) == 0:
+            return None, "At least one date range is required."
+
+        total_nights = OperatorPackageBaseView._compute_total_nights(basic_payload)
+        normalized_ranges = []
+        seen_start_dates = set()
+
+        for index, raw_item in enumerate(raw_ranges):
+            item = _to_mutable_dict(raw_item)
+
+            range_id = item.get("range_id") or item.get("rangeId")
+            if range_id in ("", None):
+                range_id = None
+
+            if range_id is not None:
+                try:
+                    range_id = str(UUID(str(range_id)))
+                except (TypeError, ValueError):
+                    return None, f"package_date_range[{index}].range_id: Invalid UUID."
+
+            start_raw = item.get("start_date") or item.get("startDate")
+            if start_raw in (None, ""):
+                return None, f"package_date_range[{index}].start_date is required."
+            start_date = _parse_datetime_value(start_raw)
+            if not start_date:
+                return None, f"package_date_range[{index}].start_date: Invalid datetime value."
+
+            end_raw = item.get("end_date") or item.get("endDate")
+            end_date = _parse_datetime_value(end_raw) if end_raw not in (None, "") else None
+            if end_date is None:
+                end_date = start_date + timedelta(days=total_nights)
+            if end_date < start_date:
+                return None, f"package_date_range[{index}].end_date must be after start_date."
+
+            validity_raw = item.get("package_validity") or item.get("packageValidity")
+            package_validity = (
+                _parse_datetime_value(validity_raw)
+                if validity_raw not in (None, "")
+                else end_date
+            )
+            if validity_raw not in (None, "") and package_validity is None:
+                return None, f"package_date_range[{index}].package_validity: Invalid datetime value."
+
+            group_raw = item.get("group_capacity")
+            if group_raw is None:
+                group_raw = item.get("groupCapacity")
+            if group_raw in (None, ""):
+                group_capacity = None
+            else:
+                group_capacity = _to_int(group_raw, 0)
+                if group_capacity <= 0:
+                    return None, f"package_date_range[{index}].group_capacity must be greater than 0."
+
+            start_key = start_date.date().isoformat()
+            if start_key in seen_start_dates:
+                return None, "Each date range must have a unique start_date."
+            seen_start_dates.add(start_key)
+
+            normalized_ranges.append(
+                {
+                    "range_id": range_id,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "group_capacity": group_capacity,
+                    "package_validity": package_validity,
+                }
+            )
+
+        return normalized_ranges, None
+
+    @staticmethod
+    def _sync_package_date_ranges(package, normalized_ranges):
+        if normalized_ranges is None:
+            return
+
+        existing = {
+            str(item.range_id): item
+            for item in HuzPackageDateRange.objects.filter(date_range_for_package=package)
+        }
+        retained_ids = []
+
+        for item in normalized_ranges:
+            existing_item = None
+            item_range_id = item.get("range_id")
+            if item_range_id:
+                existing_item = existing.get(str(item_range_id))
+
+            if existing_item:
+                existing_item.start_date = item["start_date"]
+                existing_item.end_date = item["end_date"]
+                existing_item.group_capacity = item["group_capacity"]
+                existing_item.package_validity = item["package_validity"]
+                existing_item.save(
+                    update_fields=[
+                        "start_date",
+                        "end_date",
+                        "group_capacity",
+                        "package_validity",
+                    ]
+                )
+                retained_ids.append(existing_item.range_id)
+                continue
+
+            created = HuzPackageDateRange.objects.create(
+                date_range_for_package=package,
+                start_date=item["start_date"],
+                end_date=item["end_date"],
+                group_capacity=item["group_capacity"],
+                package_validity=item["package_validity"],
+            )
+            retained_ids.append(created.range_id)
+
+        if retained_ids:
+            HuzPackageDateRange.objects.filter(date_range_for_package=package).exclude(
+                range_id__in=retained_ids
+            ).delete()
+        else:
+            HuzPackageDateRange.objects.filter(date_range_for_package=package).delete()
+
+        ranges = list(
+            HuzPackageDateRange.objects.filter(date_range_for_package=package).order_by(
+                "start_date",
+                "end_date",
+            )
+        )
+        if not ranges:
+            return
+
+        package.start_date = ranges[0].start_date
+        package.end_date = max(item.end_date for item in ranges)
+        package.package_validity = max(
+            (item.package_validity or item.end_date for item in ranges),
+            default=package.end_date,
+        )
+        package.save(update_fields=["start_date", "end_date", "package_validity"])
 
     @staticmethod
     def _normalize_airline_payload(payload, create=False):
@@ -720,6 +928,13 @@ class CreateHuzPackageView(OperatorPackageBaseView):
             if error_message:
                 return Response({"message": error_message}, status=status.HTTP_400_BAD_REQUEST)
 
+            normalized_ranges, range_error = self._normalize_package_date_range_payload(
+                payload,
+                basic_payload=normalized,
+            )
+            if range_error:
+                return Response({"message": range_error}, status=status.HTTP_400_BAD_REQUEST)
+
             random_key = random_six_digits()
             normalized["package_provider"] = partner.partner_id
             normalized["huz_token"] = generate_token(f"{random_key}{datetime.now()}")
@@ -733,7 +948,22 @@ class CreateHuzPackageView(OperatorPackageBaseView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            package = serializer.save()
+            with transaction.atomic():
+                package = serializer.save()
+
+                if normalized_ranges is None:
+                    normalized_ranges = [
+                        {
+                            "range_id": None,
+                            "start_date": package.start_date,
+                            "end_date": package.end_date,
+                            "group_capacity": None,
+                            "package_validity": package.package_validity or package.end_date,
+                        }
+                    ]
+
+                self._sync_package_date_ranges(package, normalized_ranges)
+
             return Response(self._serialize_package(package), status=status.HTTP_201_CREATED)
         except Exception as exc:
             logger.error(f"CreateHuzPackageView - Post: {exc}", exc_info=True)
@@ -768,20 +998,36 @@ class CreateHuzPackageView(OperatorPackageBaseView):
             if error_message:
                 return Response({"message": error_message}, status=status.HTTP_400_BAD_REQUEST)
 
+            range_night_source = {
+                field: normalized.get(field, getattr(package, field, 0))
+                for field in BASIC_INT_FIELDS
+            }
+            normalized_ranges, range_error = self._normalize_package_date_range_payload(
+                payload,
+                basic_payload=range_night_source,
+            )
+            if range_error:
+                return Response({"message": range_error}, status=status.HTTP_400_BAD_REQUEST)
+
             if not normalized:
-                return Response(
-                    {"message": "No package fields were provided for update."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+                if normalized_ranges is None:
+                    return Response(
+                        {"message": "No package fields were provided for update."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
 
-            serializer = HuzBasicSerializer(package, data=normalized, partial=True)
-            if not serializer.is_valid():
-                return Response(
-                    {"message": _first_error_message(serializer)},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+            with transaction.atomic():
+                if normalized:
+                    serializer = HuzBasicSerializer(package, data=normalized, partial=True)
+                    if not serializer.is_valid():
+                        return Response(
+                            {"message": _first_error_message(serializer)},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                    package = serializer.save()
+                if normalized_ranges is not None:
+                    self._sync_package_date_ranges(package, normalized_ranges)
 
-            package = serializer.save()
             return Response(self._serialize_package(package), status=status.HTTP_200_OK)
         except Exception as exc:
             logger.error(f"CreateHuzPackageView - Put: {exc}", exc_info=True)
@@ -1148,6 +1394,16 @@ class CreateHuzHotelView(OperatorPackageBaseView):
             if error_message:
                 return Response({"message": error_message}, status=status.HTTP_400_BAD_REQUEST)
 
+            city_validation_error = self._validate_hotel_city_nights(
+                package,
+                normalized.get("hotel_city"),
+            )
+            if city_validation_error:
+                return Response(
+                    {"message": city_validation_error},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
             if not existing_hotel and normalized.get("hotel_city"):
                 existing_hotel = HuzHotelDetail.objects.filter(
                     hotel_for_package=package,
@@ -1186,16 +1442,6 @@ class CreateHuzHotelView(OperatorPackageBaseView):
             if package.package_stage < 4:
                 package.package_stage = 4
                 package_updates.append("package_stage")
-
-            city_name = str(normalized.get("hotel_city", "")).strip().lower()
-            if city_name == "madinah" and package.package_status not in {
-                "Active",
-                "Deactivated",
-                "Block",
-                "Completed",
-            }:
-                package.package_status = "Completed"
-                package_updates.append("package_status")
 
             if package_updates:
                 package.save(update_fields=package_updates)
@@ -1264,6 +1510,14 @@ class CreateHuzHotelView(OperatorPackageBaseView):
             if error_message:
                 return Response({"message": error_message}, status=status.HTTP_400_BAD_REQUEST)
 
+            effective_city = normalized.get("hotel_city") or existing_hotel.hotel_city
+            city_validation_error = self._validate_hotel_city_nights(package, effective_city)
+            if city_validation_error:
+                return Response(
+                    {"message": city_validation_error},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
             serializer = HuzHotelSerializer(existing_hotel, data=normalized, partial=True)
             if not serializer.is_valid():
                 return Response(
@@ -1276,21 +1530,10 @@ class CreateHuzHotelView(OperatorPackageBaseView):
                 existing_hotel.catalog_hotel = template_hotel
                 existing_hotel.save(update_fields=["catalog_hotel"])
 
-            city_name = str(
-                normalized.get("hotel_city") or existing_hotel.hotel_city or ""
-            ).strip().lower()
             package_updates = []
             if package.package_stage < 4:
                 package.package_stage = 4
                 package_updates.append("package_stage")
-            if city_name == "madinah" and package.package_status not in {
-                "Active",
-                "Deactivated",
-                "Block",
-                "Completed",
-            }:
-                package.package_status = "Completed"
-                package_updates.append("package_status")
             if package_updates:
                 package.save(update_fields=package_updates)
 

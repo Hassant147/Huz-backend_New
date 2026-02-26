@@ -271,10 +271,14 @@ class HuzBasicDetail(models.Model):
     cost_for_triple = models.FloatField(default=0.0)
     cost_for_double = models.FloatField(default=0.0)
     cost_for_single = models.FloatField(default=0.0)
+    discount_if_child_with_bed = models.FloatField(default=0.0)
 
     # Number of nights in Mecca and Madinah
     mecca_nights = models.IntegerField(default=0)
     madinah_nights = models.IntegerField(default=0)
+    jeddah_nights = models.IntegerField(default=0)
+    taif_nights = models.IntegerField(default=0)
+    riyadah_nights = models.IntegerField(default=0)
 
     # Start date of the package
     start_date = models.DateTimeField()
@@ -311,6 +315,22 @@ class HuzBasicDetail(models.Model):
 
     def __str__(self):
         return f"{self.huz_token} - {self.package_provider}"
+
+
+class HuzPackageDateRange(models.Model):
+    range_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    start_date = models.DateTimeField()
+    end_date = models.DateTimeField()
+    group_capacity = models.IntegerField(null=True, blank=True)
+    package_validity = models.DateTimeField(null=True, blank=True)
+    date_range_for_package = models.ForeignKey(
+        HuzBasicDetail,
+        related_name="package_date_ranges",
+        on_delete=models.CASCADE,
+    )
+
+    def __str__(self):
+        return f"{self.date_range_for_package.huz_token} ({self.start_date} - {self.end_date})"
 
 
 class HuzAirlineDetail(models.Model):
