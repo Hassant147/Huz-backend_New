@@ -389,10 +389,35 @@ class HuzHotelDetail(models.Model):
 
     # Foreign key to link the hotel detail to a specific HuzBasicDetail package
     hotel_for_package = models.ForeignKey(HuzBasicDetail, related_name='hotel_for_package', on_delete=models.CASCADE)
+    catalog_hotel = models.ForeignKey(
+        "self",
+        related_name="derived_hotels",
+        on_delete=models.SET_NULL,
+        blank=True,
+        null=True,
+    )
 
     def __str__(self):
         # Return a string representation of the hotel detail
         return f"{self.hotel_name} - {self.hotel_for_package}"
+
+
+class HuzHotelImage(models.Model):
+    image_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    hotel_image = models.ImageField(upload_to="hotel_images")
+    sort_order = models.PositiveIntegerField(default=0)
+    created_time = models.DateTimeField(default=timezone.now)
+    image_for_hotel = models.ForeignKey(
+        HuzHotelDetail,
+        related_name="hotel_images",
+        on_delete=models.CASCADE,
+    )
+
+    class Meta:
+        ordering = ["sort_order", "created_time"]
+
+    def __str__(self):
+        return f"{self.image_id} - {self.image_for_hotel_id}"
 
 
 class HuzZiyarahDetail(models.Model):

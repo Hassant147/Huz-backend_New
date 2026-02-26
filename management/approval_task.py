@@ -5,20 +5,23 @@ from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from rest_framework.permissions import IsAdminUser
 from django.db import transaction
-from django.db.models import Prefetch
+from django.db.models import Max, Prefetch, Q
 from django.core.cache import cache
+from datetime import timedelta
 from common.models import UserProfile
 from common.serializers import UserProfileSerializer
 from partners.models import (
     PartnerProfile,
     HuzBasicDetail,
+    HuzHotelDetail,
+    HuzHotelImage,
     Wallet,
     PartnerTransactionHistory,
     BusinessProfile,
     PartnerServices,
     PartnerMailingDetail,
 )
-from partners.serializers import PartnerProfileSerializer, HuzBasicSerializer
+from partners.serializers import PartnerProfileSerializer, HuzBasicSerializer, HuzHotelSerializer
 from common.logs_file import logger
 from common.utility import send_company_approval_email, send_payment_verification_email, preparation_email
 from booking.models import Booking, PartnersBookingPayment, Payment, PassportValidity
@@ -30,13 +33,34 @@ CACHE_KEY_PENDING_COMPANIES = "management:pending_companies:v1"
 CACHE_KEY_APPROVED_COMPANIES = "management:approved_companies:v1"
 CACHE_KEY_PAID_BOOKINGS = "management:paid_bookings:v1"
 CACHE_KEY_PARTNER_RECEIVABLES = "management:partner_receivables:v1"
+CACHE_KEY_MASTER_HOTELS = "management:master_hotels:v1"
 MANAGEMENT_CACHE_TIMEOUT_SECONDS = 30
 MANAGEMENT_CACHE_KEYS = [
     CACHE_KEY_PENDING_COMPANIES,
     CACHE_KEY_APPROVED_COMPANIES,
     CACHE_KEY_PAID_BOOKINGS,
     CACHE_KEY_PARTNER_RECEIVABLES,
+    CACHE_KEY_MASTER_HOTELS,
 ]
+
+MASTER_HOTEL_PROVIDER_SESSION_TOKEN = "__system_master_hotel_provider__"
+MASTER_HOTEL_PROVIDER_USERNAME = "__system_master_hotel_provider__"
+MASTER_HOTEL_PACKAGE_TOKEN = "__system_master_hotel_package__"
+MASTER_HOTEL_PACKAGE_NAME = "System Master Hotel Catalog"
+HOTEL_AMENITY_FIELDS = (
+    "is_shuttle_services_included",
+    "is_air_condition",
+    "is_television",
+    "is_wifi",
+    "is_elevator",
+    "is_attach_bathroom",
+    "is_washroom_amenities",
+    "is_english_toilet",
+    "is_indian_toilet",
+    "is_laundry",
+)
+MAX_MASTER_HOTEL_IMAGES = 6
+MAX_MASTER_HOTEL_IMAGE_SIZE_BYTES = 5 * 1024 * 1024
 
 
 def _invalidate_management_cache():
@@ -53,6 +77,469 @@ def _coerce_bool(value):
         if normalized in {"false", "0", "no"}:
             return False
     return None
+
+
+def _serialize_master_hotel(hotel):
+    serialized = HuzHotelSerializer(hotel).data
+    for field_name in HOTEL_AMENITY_FIELDS:
+        serialized.pop(field_name, None)
+    serialized.setdefault("hotel_images", [])
+    serialized.setdefault("images", [])
+    return serialized
+
+
+def _contains_admin_managed_amenities(payload):
+    for field_name in HOTEL_AMENITY_FIELDS:
+        if field_name in payload:
+            return True
+    return False
+
+
+def _extract_list_values(data, key):
+    values = []
+    if hasattr(data, "getlist"):
+        values.extend(data.getlist(key))
+
+    raw_value = data.get(key)
+    if raw_value not in (None, "") and not isinstance(raw_value, (list, tuple)):
+        values.append(raw_value)
+    elif isinstance(raw_value, (list, tuple)):
+        values.extend(raw_value)
+
+    normalized = []
+    for value in values:
+        if value in (None, ""):
+            continue
+        if isinstance(value, str) and "," in value:
+            normalized.extend([item.strip() for item in value.split(",") if item.strip()])
+        else:
+            normalized.append(str(value).strip())
+
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys([item for item in normalized if item]))
+
+
+def _extract_uploaded_hotel_images(request):
+    uploaded_files = []
+    if hasattr(request, "FILES"):
+        for key in ("images", "hotel_images", "new_images"):
+            uploaded_files.extend(request.FILES.getlist(key))
+
+        for key, uploaded_file in request.FILES.items():
+            if key.startswith("image_"):
+                uploaded_files.append(uploaded_file)
+
+    deduplicated = []
+    seen_file_ids = set()
+    for uploaded_file in uploaded_files:
+        object_id = id(uploaded_file)
+        if object_id in seen_file_ids:
+            continue
+        seen_file_ids.add(object_id)
+        deduplicated.append(uploaded_file)
+
+    if len(deduplicated) > MAX_MASTER_HOTEL_IMAGES:
+        return [], f"You can upload up to {MAX_MASTER_HOTEL_IMAGES} images at once."
+
+    for uploaded_file in deduplicated:
+        if not str(getattr(uploaded_file, "content_type", "")).startswith("image/"):
+            return [], "Only image files are allowed."
+        if getattr(uploaded_file, "size", 0) > MAX_MASTER_HOTEL_IMAGE_SIZE_BYTES:
+            return [], "Each image must be 5 MB or smaller."
+
+    return deduplicated, None
+
+
+def _sync_master_hotel_images(hotel, add_files=None, delete_image_ids=None):
+    add_files = add_files or []
+    delete_image_ids = delete_image_ids or []
+
+    if delete_image_ids:
+        HuzHotelImage.objects.filter(
+            image_for_hotel=hotel,
+            image_id__in=delete_image_ids,
+        ).delete()
+
+    existing_count = HuzHotelImage.objects.filter(image_for_hotel=hotel).count()
+    if existing_count + len(add_files) > MAX_MASTER_HOTEL_IMAGES:
+        return f"Total images per hotel cannot exceed {MAX_MASTER_HOTEL_IMAGES}."
+
+    if not add_files:
+        return None
+
+    max_sort_order = (
+        HuzHotelImage.objects.filter(image_for_hotel=hotel).aggregate(max_order=Max("sort_order"))[
+            "max_order"
+        ]
+        or 0
+    )
+
+    for index, uploaded_file in enumerate(add_files, start=1):
+        HuzHotelImage.objects.create(
+            image_for_hotel=hotel,
+            hotel_image=uploaded_file,
+            sort_order=max_sort_order + index,
+        )
+
+    return None
+
+
+def _get_or_create_master_hotel_package():
+    partner = PartnerProfile.objects.filter(
+        partner_session_token=MASTER_HOTEL_PROVIDER_SESSION_TOKEN
+    ).first()
+    if not partner:
+        partner = PartnerProfile.objects.filter(user_name=MASTER_HOTEL_PROVIDER_USERNAME).first()
+
+    if not partner:
+        partner = PartnerProfile.objects.create(
+            partner_session_token=MASTER_HOTEL_PROVIDER_SESSION_TOKEN,
+            user_name=MASTER_HOTEL_PROVIDER_USERNAME,
+            name="System Hotel Catalog",
+            partner_type="Company",
+            account_status="Active",
+            is_email_verified=True,
+            is_address_exist=True,
+        )
+    else:
+        update_fields = []
+        if partner.partner_session_token != MASTER_HOTEL_PROVIDER_SESSION_TOKEN:
+            partner.partner_session_token = MASTER_HOTEL_PROVIDER_SESSION_TOKEN
+            update_fields.append("partner_session_token")
+        if partner.user_name != MASTER_HOTEL_PROVIDER_USERNAME:
+            partner.user_name = MASTER_HOTEL_PROVIDER_USERNAME
+            update_fields.append("user_name")
+        if partner.partner_type != "Company":
+            partner.partner_type = "Company"
+            update_fields.append("partner_type")
+        if partner.account_status != "Active":
+            partner.account_status = "Active"
+            update_fields.append("account_status")
+        if not partner.is_email_verified:
+            partner.is_email_verified = True
+            update_fields.append("is_email_verified")
+        if update_fields:
+            partner.save(update_fields=update_fields)
+
+    package = HuzBasicDetail.objects.filter(huz_token=MASTER_HOTEL_PACKAGE_TOKEN).first()
+    if package:
+        if package.package_provider_id != partner.partner_id:
+            package.package_provider = partner
+            package.save(update_fields=["package_provider"])
+        return package
+
+    now = timezone.now()
+    return HuzBasicDetail.objects.create(
+        huz_token=MASTER_HOTEL_PACKAGE_TOKEN,
+        package_type="Umrah",
+        package_name=MASTER_HOTEL_PACKAGE_NAME,
+        package_base_cost=0.0,
+        cost_for_child=0.0,
+        cost_for_infants=0.0,
+        cost_for_sharing=0.0,
+        cost_for_quad=0.0,
+        cost_for_triple=0.0,
+        cost_for_double=0.0,
+        cost_for_single=0.0,
+        mecca_nights=1,
+        madinah_nights=1,
+        start_date=now,
+        end_date=now + timedelta(days=1),
+        description="System package used for the hotel master catalog.",
+        package_validity=now + timedelta(days=3650),
+        package_status="Completed",
+        package_stage=5,
+        package_provider=partner,
+    )
+
+
+def _normalize_master_hotel_payload(payload, *, create=False):
+    payload = payload or {}
+    normalized = {}
+
+    required_fields = ("hotel_city", "hotel_name", "hotel_rating", "room_sharing_type")
+    for field_name in required_fields:
+        raw_value = payload.get(field_name)
+        if raw_value in (None, ""):
+            if create:
+                return None, f"{field_name} is required."
+            continue
+        normalized[field_name] = str(raw_value).strip()
+
+    optional_text_fields = ("hotel_distance", "distance_type")
+    for field_name in optional_text_fields:
+        if field_name in payload and payload.get(field_name) not in (None, ""):
+            normalized[field_name] = str(payload.get(field_name)).strip()
+
+    return normalized, None
+
+
+class ManageMasterHotelsCatalogView(APIView):
+    permission_classes = [IsAdminUser]
+
+    @swagger_auto_schema(
+        operation_description="Create, list, update, and delete master hotels for package templates.",
+        manual_parameters=[
+            openapi.Parameter(
+                "city",
+                openapi.IN_QUERY,
+                description="Optional city filter",
+                type=openapi.TYPE_STRING,
+            ),
+            openapi.Parameter(
+                "search",
+                openapi.IN_QUERY,
+                description="Optional keyword filter",
+                type=openapi.TYPE_STRING,
+            ),
+            openapi.Parameter(
+                "hotel_id",
+                openapi.IN_QUERY,
+                description="Required for DELETE if omitted from payload",
+                type=openapi.TYPE_STRING,
+            ),
+        ],
+    )
+    def get(self, request, *args, **kwargs):
+        try:
+            city = (request.GET.get("city") or "").strip()
+            search = (request.GET.get("search") or "").strip()
+            use_cache = not city and not search
+
+            if use_cache:
+                cached_results = cache.get(CACHE_KEY_MASTER_HOTELS)
+                if cached_results is not None:
+                    return Response(
+                        {"count": len(cached_results), "results": cached_results},
+                        status=status.HTTP_200_OK,
+                    )
+
+            package = _get_or_create_master_hotel_package()
+            queryset = (
+                HuzHotelDetail.objects.filter(hotel_for_package=package)
+                .prefetch_related("hotel_images", "catalog_hotel__hotel_images")
+                .order_by("hotel_city", "hotel_name")
+            )
+
+            if city:
+                queryset = queryset.filter(hotel_city__iexact=city)
+
+            if search:
+                queryset = queryset.filter(
+                    Q(hotel_city__icontains=search)
+                    | Q(hotel_name__icontains=search)
+                    | Q(hotel_rating__icontains=search)
+                    | Q(room_sharing_type__icontains=search)
+                )
+
+            serialized_results = [_serialize_master_hotel(hotel) for hotel in queryset]
+            if use_cache:
+                cache.set(
+                    CACHE_KEY_MASTER_HOTELS,
+                    serialized_results,
+                    MANAGEMENT_CACHE_TIMEOUT_SECONDS,
+                )
+
+            return Response(
+                {"count": len(serialized_results), "results": serialized_results},
+                status=status.HTTP_200_OK,
+            )
+        except Exception as exc:
+            logger.error("ManageMasterHotelsCatalogView - Get: %s", exc, exc_info=True)
+            return Response(
+                {"message": "Failed to fetch master hotels. Internal server error."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    def post(self, request, *args, **kwargs):
+        try:
+            if _contains_admin_managed_amenities(request.data):
+                return Response(
+                    {
+                        "message": (
+                            "Amenities are partner-managed and cannot be set from the super admin catalog."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            package = _get_or_create_master_hotel_package()
+            normalized_payload, error_message = _normalize_master_hotel_payload(
+                request.data,
+                create=True,
+            )
+            if error_message:
+                return Response({"message": error_message}, status=status.HTTP_400_BAD_REQUEST)
+
+            uploaded_images, image_error = _extract_uploaded_hotel_images(request)
+            if image_error:
+                return Response({"message": image_error}, status=status.HTTP_400_BAD_REQUEST)
+
+            with transaction.atomic():
+                duplicate = HuzHotelDetail.objects.filter(
+                    hotel_for_package=package,
+                    hotel_city__iexact=normalized_payload.get("hotel_city"),
+                    hotel_name__iexact=normalized_payload.get("hotel_name"),
+                ).first()
+                if duplicate:
+                    return Response(
+                        {
+                            "message": (
+                                "Hotel already exists in the master catalog for this city."
+                            )
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                serializer = HuzHotelSerializer(data=normalized_payload)
+                if not serializer.is_valid():
+                    first_error_field = next(iter(serializer.errors))
+                    first_error_message = serializer.errors[first_error_field][0]
+                    return Response(
+                        {"message": f"{first_error_field}: {first_error_message}"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                hotel = serializer.save(hotel_for_package=package)
+                sync_error = _sync_master_hotel_images(hotel, add_files=uploaded_images)
+                if sync_error:
+                    transaction.set_rollback(True)
+                    return Response({"message": sync_error}, status=status.HTTP_400_BAD_REQUEST)
+
+            _invalidate_management_cache()
+            return Response(
+                {
+                    "message": "Master hotel created successfully.",
+                    "hotel": _serialize_master_hotel(hotel),
+                },
+                status=status.HTTP_201_CREATED,
+            )
+        except Exception as exc:
+            logger.error("ManageMasterHotelsCatalogView - Post: %s", exc, exc_info=True)
+            return Response(
+                {"message": "Failed to create master hotel. Internal server error."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    def put(self, request, *args, **kwargs):
+        try:
+            if _contains_admin_managed_amenities(request.data):
+                return Response(
+                    {
+                        "message": (
+                            "Amenities are partner-managed and cannot be set from the super admin catalog."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            package = _get_or_create_master_hotel_package()
+            hotel_id = request.data.get("hotel_id")
+            if not hotel_id:
+                return Response(
+                    {"message": "hotel_id is required."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            hotel = HuzHotelDetail.objects.filter(
+                hotel_for_package=package,
+                hotel_id=hotel_id,
+            ).first()
+            if not hotel:
+                return Response(
+                    {"message": "Hotel not found in master catalog."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            normalized_payload, error_message = _normalize_master_hotel_payload(
+                request.data,
+                create=False,
+            )
+            if error_message:
+                return Response({"message": error_message}, status=status.HTTP_400_BAD_REQUEST)
+            uploaded_images, image_error = _extract_uploaded_hotel_images(request)
+            if image_error:
+                return Response({"message": image_error}, status=status.HTTP_400_BAD_REQUEST)
+
+            delete_image_ids = _extract_list_values(request.data, "delete_image_ids")
+            delete_image_ids.extend(_extract_list_values(request.data, "remove_image_ids"))
+            delete_image_ids = list(dict.fromkeys(delete_image_ids))
+
+            if not normalized_payload and not uploaded_images and not delete_image_ids:
+                return Response(
+                    {"message": "No hotel fields were provided for update."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            with transaction.atomic():
+                if normalized_payload:
+                    serializer = HuzHotelSerializer(hotel, data=normalized_payload, partial=True)
+                    if not serializer.is_valid():
+                        first_error_field = next(iter(serializer.errors))
+                        first_error_message = serializer.errors[first_error_field][0]
+                        return Response(
+                            {"message": f"{first_error_field}: {first_error_message}"},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+
+                    hotel = serializer.save()
+
+                sync_error = _sync_master_hotel_images(
+                    hotel,
+                    add_files=uploaded_images,
+                    delete_image_ids=delete_image_ids,
+                )
+                if sync_error:
+                    transaction.set_rollback(True)
+                    return Response({"message": sync_error}, status=status.HTTP_400_BAD_REQUEST)
+
+            _invalidate_management_cache()
+            return Response(
+                {
+                    "message": "Master hotel updated successfully.",
+                    "hotel": _serialize_master_hotel(hotel),
+                },
+                status=status.HTTP_200_OK,
+            )
+        except Exception as exc:
+            logger.error("ManageMasterHotelsCatalogView - Put: %s", exc, exc_info=True)
+            return Response(
+                {"message": "Failed to update master hotel. Internal server error."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    def delete(self, request, *args, **kwargs):
+        try:
+            package = _get_or_create_master_hotel_package()
+            hotel_id = request.data.get("hotel_id") or request.GET.get("hotel_id")
+            if not hotel_id:
+                return Response(
+                    {"message": "hotel_id is required."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            hotel = HuzHotelDetail.objects.filter(
+                hotel_for_package=package,
+                hotel_id=hotel_id,
+            ).first()
+            if not hotel:
+                return Response(
+                    {"message": "Hotel not found in master catalog."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            hotel.delete()
+            _invalidate_management_cache()
+            return Response(
+                {"message": "Master hotel deleted successfully."},
+                status=status.HTTP_200_OK,
+            )
+        except Exception as exc:
+            logger.error("ManageMasterHotelsCatalogView - Delete: %s", exc, exc_info=True)
+            return Response(
+                {"message": "Failed to delete master hotel. Internal server error."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 class ApprovedORRejectCompanyView(APIView):

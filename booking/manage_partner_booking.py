@@ -1,12 +1,11 @@
 from django.db.models import Sum, Count
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAdminUser
+from rest_framework.permissions import BasePermission
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
 from common.utility import CustomPagination, validate_required_fields, check_file_format_and_size, save_file_in_directory, delete_file_from_directory, send_objection_email, send_booking_documents_email
 from common.logs_file import logger
-from common.models import UserProfile
 from partners.models import PartnerProfile, HuzBasicDetail
 from .models import Booking, BookingObjections, PassportValidity, DocumentsStatus, BookingDocuments, PartnersBookingPayment, BookingRatingAndReview, BookingComplaints, BookingAirlineDetail, BookingHotelAndTransport
 from .serializers import ShortBookingSerializer, DetailBookingSerializer, PartnersBookingPaymentSerializer, BookingComplaintsSerializer, PartnerRatingSerializer
@@ -14,8 +13,104 @@ from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 
 
+def extract_partner_session_token(request):
+    token = request.query_params.get("partner_session_token")
+    if token:
+        return str(token).strip()
+
+    try:
+        payload = request.data
+    except Exception:
+        payload = None
+
+    if hasattr(payload, "get"):
+        token = payload.get("partner_session_token")
+        if token:
+            return str(token).strip()
+
+    return ""
+
+
+class IsAdminOrPartnerSessionToken(BasePermission):
+    """
+    Booking partner endpoints are session-token based in this backend.
+    Keep staff access for admin workflows, and allow partner requests that
+    include partner_session_token in query/body.
+    """
+
+    message = "Authentication credentials were not provided."
+
+    def has_permission(self, request, view):
+        user = getattr(request, "user", None)
+        if user and user.is_authenticated and getattr(user, "is_staff", False):
+            return True
+        return bool(extract_partner_session_token(request))
+
+
+VALID_BOOKING_STATUSES = (
+    "Pending",
+    "Active",
+    "Completed",
+    "Closed",
+    "Objection",
+    "Report",
+    "Rejected",
+)
+
+BOOKING_STATUS_NORMALIZER = {
+    status_name.lower(): status_name for status_name in VALID_BOOKING_STATUSES
+}
+
+BOOKING_LIST_SELECT_RELATED = ("order_by", "order_to", "package_token")
+BOOKING_LIST_PREFETCH_RELATED = (
+    "order_by__mailing_session",
+    "passport_for_booking_number",
+    "booking_token",
+)
+
+BOOKING_DETAIL_SELECT_RELATED = (
+    "order_by",
+    "order_to",
+    "package_token",
+    "package_token__package_provider",
+)
+BOOKING_DETAIL_PREFETCH_RELATED = (
+    "order_by__mailing_session",
+    "order_to__company_of_partner",
+    "order_to__mailing_of_partner",
+    "package_token__airline_for_package",
+    "objection_for_booking",
+    "passport_for_booking_number",
+    "booking_token",
+    "status_for_booking",
+    "document_for_booking_token",
+    "user_document_for_booking_token",
+    "airline_for_booking",
+    "hotel_or_transport_for_booking",
+    "rating_for_booking",
+)
+
+
+def get_partner_bookings_queryset(include_detail_relations=False):
+    if include_detail_relations:
+        return Booking.objects.select_related(*BOOKING_DETAIL_SELECT_RELATED).prefetch_related(
+            *BOOKING_DETAIL_PREFETCH_RELATED
+        )
+    return Booking.objects.select_related(*BOOKING_LIST_SELECT_RELATED).prefetch_related(
+        *BOOKING_LIST_PREFETCH_RELATED
+    )
+
+
+def get_partner_booking_detail(partner, booking_number):
+    return (
+        get_partner_bookings_queryset(include_detail_relations=True)
+        .filter(order_to=partner, booking_number=booking_number)
+        .first()
+    )
+
+
 class GetBookingShortDetailForPartnersView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
 
     @swagger_auto_schema(
         manual_parameters=[
@@ -41,35 +136,35 @@ class GetBookingShortDetailForPartnersView(APIView):
                 return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
 
             # Validate booking status
-            valid_statuses = ['Pending', 'Active', 'Completed', 'Closed', 'Objection', 'Report', 'Rejected']
-            if booking_status not in valid_statuses:
+            normalized_booking_status = BOOKING_STATUS_NORMALIZER.get(str(booking_status).strip().lower())
+            if not normalized_booking_status:
                 return Response(
-                    {"message": f"Invalid booking_status. Must be one of: {', '.join(valid_statuses)}."}, status=status.HTTP_400_BAD_REQUEST)
+                    {"message": f"Invalid booking_status. Must be one of: {', '.join(VALID_BOOKING_STATUSES)}."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
 
             # Find the partner user with the provided session token
             user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
             if not user:
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            bookings = Booking.objects.filter(order_to=user, booking_status=booking_status).order_by('-order_time')
+            bookings = (
+                get_partner_bookings_queryset(include_detail_relations=False)
+                .filter(order_to=user, booking_status=normalized_booking_status)
+                .order_by('-order_time')
+            )
 
-            # Check if any bookings were found
-            if bookings.exists():
-                # Paginate the booking results
-                paginator = CustomPagination()
-                paginated_packages = paginator.paginate_queryset(bookings, request)
-                serialized_package = ShortBookingSerializer(paginated_packages, many=True)
-                return paginator.get_paginated_response(serialized_package.data)
-
-            # If no bookings were found, return a 404 response
-            return Response({"message": "No bookings found."}, status=status.HTTP_404_NOT_FOUND)
+            paginator = CustomPagination()
+            paginated_packages = paginator.paginate_queryset(bookings, request)
+            serialized_package = ShortBookingSerializer(paginated_packages, many=True)
+            return paginator.get_paginated_response(serialized_package.data)
         except Exception as e:
             logger.error(f"GetBookingShortDetailForPartnersView: {str(e)}")
             return Response({"message": "Failed to fetch booking list. Internal server error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class GetBookingDetailByBookingNumberForPartnerView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
 
     @swagger_auto_schema(
         operation_description="Retrieve booking details by user session token and booking number.",
@@ -100,7 +195,7 @@ class GetBookingDetailByBookingNumberForPartnerView(APIView):
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Retrieve booking by user and booking number
-            booking = Booking.objects.filter(order_to=user, booking_number=booking_number).first()
+            booking = get_partner_booking_detail(user, booking_number)
             if not booking:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -115,7 +210,7 @@ class GetBookingDetailByBookingNumberForPartnerView(APIView):
 
 
 class TakeActionView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
 
     @swagger_auto_schema(
         request_body=openapi.Schema(
@@ -153,30 +248,33 @@ class TakeActionView(APIView):
                 return Response({"message": "Partner profile not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Find the booking detail associated with the user and booking number
-            booking_detail = Booking.objects.filter(order_to=partner, booking_number=data.get('booking_number')).first()
+            booking_detail = get_partner_booking_detail(partner, data.get('booking_number'))
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Check if the provided booking status is valid
-            valid_statuses = ["Active", "Objection"]
-            if data.get('booking_status') not in valid_statuses:
+            requested_status = str(data.get('booking_status', '')).strip()
+            normalized_status = {
+                'active': 'Active',
+                'objection': 'Objection',
+            }.get(requested_status.lower())
+            if not normalized_status:
                 return Response({"message": "Invalid booking status. Booking status should be 'Active' or 'Objection'."}, status=status.HTTP_400_BAD_REQUEST)
 
             # Only allow updates to bookings with 'Pending' status
             if booking_detail.booking_status == "Pending":
-                if request.data.get('booking_status') == "Objection":
+                if normalized_status == "Objection":
                     BookingObjections.objects.create(
                         remarks_or_reason=request.data.get('partner_remarks'),
                         objection_for_booking=booking_detail
                     )
-                booking_detail.booking_status = request.data.get('booking_status')
-                booking_detail.save()
+                    user = booking_detail.order_by
+                    if user:
+                        send_objection_email(user.email, user.name, booking_detail.booking_number, request.data.get('partner_remarks'))
 
-                # Send Objection Email to User
-                user = UserProfile.objects.filter(session_token=booking_detail.order_by).first()
-                if not user:
-                    return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
-                send_objection_email(user.email, user.name, booking_detail.booking_number, request.data.get('partner_remarks'))
+                booking_detail.booking_status = normalized_status
+                booking_detail.partner_remarks = request.data.get('partner_remarks')
+                booking_detail.save(update_fields=['booking_status', 'partner_remarks'])
 
                 serialized_package = DetailBookingSerializer(booking_detail)
                 return Response(serialized_package.data, status=status.HTTP_201_CREATED)
@@ -189,7 +287,7 @@ class TakeActionView(APIView):
 
 
 class ManageBookingDocumentsView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
     parser_classes = [MultiPartParser, FormParser]
 
     @swagger_auto_schema(
@@ -231,7 +329,7 @@ class ManageBookingDocumentsView(APIView):
             return Response({"message": "Partner agency detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
         # Retrieve booking detail
-        booking_detail = Booking.objects.filter(order_to=partner, booking_number=booking_number).first()
+        booking_detail = get_partner_booking_detail(partner, booking_number)
         if not booking_detail:
             return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -240,12 +338,12 @@ class ManageBookingDocumentsView(APIView):
             return Response({"message": "only bookings with 'Active' or 'Completed' statuses can perform this task."}, status=status.HTTP_409_CONFLICT)
 
         # Retrieve package detail
-        package_detail = HuzBasicDetail.objects.filter(huz_id=booking_detail.package_token.huz_id).first()
+        package_detail = booking_detail.package_token
         if not package_detail:
             return Response({"message": "Package detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
         # Retrieve user profile
-        user = UserProfile.objects.filter(session_token=booking_detail.order_by).first()
+        user = booking_detail.order_by
         if not user:
             return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -260,7 +358,7 @@ class ManageBookingDocumentsView(APIView):
                     document_for=document_for
                 )
 
-            doc = DocumentsStatus.objects.filter(status_for_booking=booking_detail).first()
+            doc, _ = DocumentsStatus.objects.get_or_create(status_for_booking=booking_detail)
 
             if document_for == "eVisa":
                 doc.is_visa_completed = True
@@ -289,7 +387,7 @@ class ManageBookingDocumentsView(APIView):
 
 
 class DeleteBookingDocumentsView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
 
     @swagger_auto_schema(
         manual_parameters=[
@@ -321,7 +419,7 @@ class DeleteBookingDocumentsView(APIView):
             return Response({"message": "Partner agency not found."}, status=status.HTTP_404_NOT_FOUND)
 
         # Retrieve booking detail
-        booking_detail = Booking.objects.filter(order_to=partner, booking_number=booking_number).first()
+        booking_detail = get_partner_booking_detail(partner, booking_number)
         if not booking_detail:
             return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -346,7 +444,7 @@ class DeleteBookingDocumentsView(APIView):
 
 
 class BookingAirlineDetailsView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
 
     @swagger_auto_schema(
         operation_description="Create airline details for a booking.",
@@ -388,17 +486,17 @@ class BookingAirlineDetailsView(APIView):
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Retrieve booking details using partner and booking number
-            booking_detail = Booking.objects.filter(order_to=partner, booking_number=request.data.get('booking_number')).first()
+            booking_detail = get_partner_booking_detail(partner, request.data.get('booking_number'))
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            # # Retrieve client details using session token from booking details
-            # client_detail = UserProfile.objects.filter(session_token=booking_detail.order_by).first()
+            # # Retrieve client details from booking details
+            # client_detail = booking_detail.order_by
             # if not client_detail:
             #     return Response({"message": "Client detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Retrieve package details using package token from booking details
-            package_detail = HuzBasicDetail.objects.filter(huz_id=booking_detail.package_token.huz_id).first()
+            package_detail = booking_detail.package_token
             if not package_detail:
                 return Response({"message": "Package detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -410,7 +508,7 @@ class BookingAirlineDetailsView(APIView):
             # Check if the booking status allows for adding airline details
             if booking_detail.booking_status in ["Active", "Completed"]:
                 # Retrieve document status for the booking
-                doc = DocumentsStatus.objects.filter(status_for_booking=booking_detail).first()
+                doc, _ = DocumentsStatus.objects.get_or_create(status_for_booking=booking_detail)
 
                 # Create new airline detail entry
                 BookingAirlineDetail.objects.create(
@@ -484,7 +582,7 @@ class BookingAirlineDetailsView(APIView):
             if not partner:
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            booking_detail = Booking.objects.filter(order_to=partner, booking_number=data.get('booking_number')).first()
+            booking_detail = get_partner_booking_detail(partner, data.get('booking_number'))
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -512,7 +610,7 @@ class BookingAirlineDetailsView(APIView):
 
 
 class BookingHotelAndTransportDetailsView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
 
     @swagger_auto_schema(
         operation_description="Add hotel and transport details for a booking.",
@@ -557,12 +655,12 @@ class BookingHotelAndTransportDetailsView(APIView):
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Retrieve booking details using the user and booking number
-            booking_detail = Booking.objects.filter(order_to=partner, booking_number=data.get('booking_number')).first()
+            booking_detail = get_partner_booking_detail(partner, data.get('booking_number'))
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Retrieve client details using the session token from booking details
-            client_detail = UserProfile.objects.filter(session_token=booking_detail.order_by).first()
+            client_detail = booking_detail.order_by
             if not client_detail:
                 return Response({"message": "Client detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -572,14 +670,14 @@ class BookingHotelAndTransportDetailsView(APIView):
                 return Response({"message": "Record already exists."}, status=status.HTTP_409_CONFLICT)
 
             # Retrieve package details using the package token from booking details
-            package_detail = HuzBasicDetail.objects.filter(huz_id=booking_detail.package_token.huz_id).first()
+            package_detail = booking_detail.package_token
             if not package_detail:
                 return Response({"message": "Package detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Check if the booking status allows for adding hotel or transport details
             if booking_detail.booking_status in ["Active", "Completed"]:
                 # Retrieve the document status for the booking
-                doc = DocumentsStatus.objects.filter(status_for_booking=booking_detail).first()
+                doc, _ = DocumentsStatus.objects.get_or_create(status_for_booking=booking_detail)
                 BookingHotelAndTransport.objects.create(
                     jeddah_name=data.get('jeddah_name'),
                     jeddah_number=data.get('jeddah_number'),
@@ -673,7 +771,7 @@ class BookingHotelAndTransportDetailsView(APIView):
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Retrieve booking details using partner and booking number
-            booking_detail = Booking.objects.filter(order_to=partner, booking_number=data.get('booking_number')).first()
+            booking_detail = get_partner_booking_detail(partner, data.get('booking_number'))
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -744,7 +842,7 @@ def send_email_notification(user, booking_number, document_type):
 
 
 class GetOverallRatingView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
 
     @swagger_auto_schema(
         manual_parameters=[
@@ -791,7 +889,7 @@ class GetOverallRatingView(APIView):
 
 
 class GetRatingPackageWiseView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
 
     @swagger_auto_schema(
         operation_description="Retrieve ratings for a specific package",
@@ -841,7 +939,7 @@ class GetRatingPackageWiseView(APIView):
 
 
 class GetPackageOverallRatingView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
 
     @swagger_auto_schema(
         manual_parameters=[
@@ -895,7 +993,7 @@ class GetPackageOverallRatingView(APIView):
 
 
 class GetOverallPartnerComplaintsView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
 
     @swagger_auto_schema(
         manual_parameters=[
@@ -945,7 +1043,7 @@ class GetOverallPartnerComplaintsView(APIView):
 
 
 class GetPartnerComplaintsView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
 
     @swagger_auto_schema(
         manual_parameters=[
@@ -995,7 +1093,7 @@ class GetPartnerComplaintsView(APIView):
 
 
 class GiveUpdateOnComplaintsView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
 
     @swagger_auto_schema(
         request_body=openapi.Schema(
@@ -1060,7 +1158,7 @@ class GiveUpdateOnComplaintsView(APIView):
 
 
 class GetPartnersOverallBookingStatisticsView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
 
     @swagger_auto_schema(
         manual_parameters=[
@@ -1113,7 +1211,7 @@ class GetPartnersOverallBookingStatisticsView(APIView):
 
 
 class GetYearlyBookingStatisticsView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
 
     @swagger_auto_schema(
         manual_parameters=[
@@ -1153,7 +1251,7 @@ class GetYearlyBookingStatisticsView(APIView):
 
 
 class PartnersBookingPaymentView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
 
     @swagger_auto_schema(
         manual_parameters=[
@@ -1201,7 +1299,7 @@ class PartnersBookingPaymentView(APIView):
 
 
 class CloseBookingView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
     @swagger_auto_schema(
         operation_description="Update the booking status to 'Closed' for a given booking number.",
         request_body=openapi.Schema(
@@ -1237,7 +1335,7 @@ class CloseBookingView(APIView):
                 return Response({"message": "Package provider detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Retrieve booking details associated with the provided booking number
-            booking_detail = Booking.objects.filter(booking_number=data.get('booking_number')).first()
+            booking_detail = get_partner_booking_detail(partner_detail, data.get('booking_number'))
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -1266,7 +1364,7 @@ class CloseBookingView(APIView):
 
 
 class ReportBookingView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrPartnerSessionToken]
 
     @swagger_auto_schema(
         operation_description="Update the booking status to 'Report' for the associated passport.",
@@ -1310,7 +1408,7 @@ class ReportBookingView(APIView):
                 return Response({"message": "Partner not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Retrieve the booking associated with the booking_number
-            booking = Booking.objects.filter(booking_number=booking_number).first()
+            booking = get_partner_booking_detail(partner, booking_number)
             if not booking:
                 return Response({"message": "Booking not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -1321,9 +1419,12 @@ class ReportBookingView(APIView):
                     status=status.HTTP_409_CONFLICT
                 )
 
-            passport = PassportValidity.objects.filter(passport_id=passport_id).first()
+            passport = PassportValidity.objects.filter(
+                passport_id=passport_id,
+                passport_for_booking_number=booking
+            ).first()
             if not passport:
-                return Response({"message": "Passport not found for the provided passport_id."},
+                return Response({"message": "Passport not found for the provided booking."},
                                 status=status.HTTP_404_NOT_FOUND)
 
             # Update the report_rabbit field to True

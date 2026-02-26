@@ -3,7 +3,7 @@ from django.db.models import Sum, Count
 from booking.models import BookingRatingAndReview
 import re
 from .models import (PartnerProfile, Wallet, PartnerServices, IndividualProfile, BusinessProfile, PartnerMailingDetail,
-                     HuzBasicDetail, HuzAirlineDetail, HuzTransportDetail, HuzHotelDetail, HuzZiyarahDetail,
+                     HuzBasicDetail, HuzAirlineDetail, HuzTransportDetail, HuzHotelDetail, HuzHotelImage, HuzZiyarahDetail,
                      PartnerBankAccount, PartnerWithdraw, PartnerTransactionHistory)
 
 
@@ -18,6 +18,31 @@ def _get_prefetched_items(instance, relation_name):
 
     try:
         return list(relation.all())
+    except Exception:
+        return []
+
+
+def _collect_hotel_images(instance):
+    hotel_images = _get_prefetched_items(instance, "hotel_images")
+    if not hotel_images:
+        try:
+            hotel_images = list(instance.hotel_images.all())
+        except Exception:
+            hotel_images = []
+
+    if hotel_images:
+        return hotel_images
+
+    catalog_hotel = getattr(instance, "catalog_hotel", None)
+    if not catalog_hotel:
+        return []
+
+    inherited_images = _get_prefetched_items(catalog_hotel, "hotel_images")
+    if inherited_images:
+        return inherited_images
+
+    try:
+        return list(catalog_hotel.hotel_images.all())
     except Exception:
         return []
 
@@ -58,7 +83,9 @@ def get_company_detail(obj):
 
 def get_hotel_info_detail(obj):
     try:
-        hotel = HuzHotelDetail.objects.filter(hotel_for_package=obj)
+        hotel = HuzHotelDetail.objects.filter(hotel_for_package=obj).select_related(
+            "catalog_hotel"
+        ).prefetch_related("hotel_images", "catalog_hotel__hotel_images")
         return HuzHotelSerializer(hotel, many=True).data
     except HuzHotelDetail.DoesNotExist:
         return None
@@ -295,14 +322,55 @@ class HuzBasicSerializer(serializers.ModelSerializer):
 
 
 class HuzHotelSerializer(serializers.ModelSerializer):
+    images = serializers.SerializerMethodField()
+    hotel_images = serializers.SerializerMethodField()
+    primary_image = serializers.SerializerMethodField()
+
+    def _serialized_images(self, instance):
+        if not hasattr(self, "_image_cache"):
+            self._image_cache = {}
+
+        cache_key = str(instance.hotel_id)
+        if cache_key not in self._image_cache:
+            self._image_cache[cache_key] = HuzHotelImageSerializer(
+                _collect_hotel_images(instance),
+                many=True,
+                context=self.context,
+            ).data
+
+        return self._image_cache[cache_key]
+
+    def get_images(self, obj):
+        return self._serialized_images(obj)
+
+    def get_hotel_images(self, obj):
+        return self._serialized_images(obj)
+
+    def get_primary_image(self, obj):
+        images = self._serialized_images(obj)
+        if not images:
+            return None
+        return images[0].get("hotel_image")
+
     class Meta:
         model = HuzHotelDetail
         fields = [
             'hotel_id', 'hotel_city', 'hotel_name', 'hotel_rating', 'room_sharing_type', 'hotel_distance',
             'distance_type', 'is_shuttle_services_included', 'is_air_condition', 'is_television', 'is_wifi',
             'is_elevator', 'is_attach_bathroom', 'is_washroom_amenities', 'is_english_toilet',
-            'is_indian_toilet', 'is_laundry'
+            'is_indian_toilet', 'is_laundry', 'catalog_hotel', 'images', 'hotel_images', 'primary_image'
         ]
+        read_only_fields = ('images', 'hotel_images', 'primary_image')
+
+
+class HuzHotelImageSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = HuzHotelImage
+        fields = ['image_id', 'hotel_image', 'image_for_hotel', 'sort_order']
+        extra_kwargs = {
+            "image_for_hotel": {"required": False},
+        }
 
 
 class HuzAirlineSerializer(serializers.ModelSerializer):
@@ -310,6 +378,9 @@ class HuzAirlineSerializer(serializers.ModelSerializer):
     class Meta:
         model = HuzAirlineDetail
         fields = ['airline_id', 'airline_name', 'ticket_type', 'flight_from', 'flight_to', 'return_flight_from', 'return_flight_to', 'is_return_flight_included', 'airline_for_package']
+        extra_kwargs = {
+            "airline_for_package": {"required": False},
+        }
 
 
 class HuzTransportSerializer(serializers.ModelSerializer):

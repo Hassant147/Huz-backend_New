@@ -38,6 +38,9 @@ PACKAGE_PREFETCH_RELATED = (
     "airline_for_package",
     "transport_for_package",
     "hotel_for_package",
+    "hotel_for_package__hotel_images",
+    "hotel_for_package__catalog_hotel",
+    "hotel_for_package__catalog_hotel__hotel_images",
     "ziyarah_for_package",
     "package_provider__company_of_partner",
 )
@@ -90,6 +93,7 @@ STATUS_NORMALIZER = {
     "deactivate": "Deactivated",
     "pending": "Pending",
 }
+MASTER_HOTEL_PACKAGE_TOKEN = "__system_master_hotel_package__"
 
 
 def _to_mutable_dict(data):
@@ -196,6 +200,13 @@ def _normalize_package_type(raw_value):
     if lower == "ziyarah":
         return "Ziyarah"
     return None
+
+
+def _serialize_catalog_hotel(hotel):
+    payload = HuzHotelSerializer(hotel).data
+    payload.setdefault("hotel_images", [])
+    payload.setdefault("images", [])
+    return payload
 
 
 class OperatorHuzPackageSerializer(serializers.ModelSerializer):
@@ -311,7 +322,11 @@ class OperatorHuzPackageSerializer(serializers.ModelSerializer):
         items = self._prefetched_items(obj, "hotel_for_package")
         if items:
             return items
-        return list(HuzHotelDetail.objects.filter(hotel_for_package=obj))
+        return list(
+            HuzHotelDetail.objects.filter(hotel_for_package=obj)
+            .select_related("catalog_hotel")
+            .prefetch_related("hotel_images", "catalog_hotel__hotel_images")
+        )
 
     def get_airline_detail_list(self, obj):
         items = self._get_airline_items(obj)
@@ -628,7 +643,18 @@ class OperatorPackageBaseView(APIView):
     def _resolve_hotel_template(hotel_id):
         if not hotel_id:
             return None
-        return HuzHotelDetail.objects.filter(hotel_id=hotel_id).first()
+        hotel_template = (
+            HuzHotelDetail.objects.filter(hotel_id=hotel_id)
+            .select_related("hotel_for_package")
+            .prefetch_related("hotel_images")
+            .first()
+        )
+        if not hotel_template:
+            return None
+        package = getattr(hotel_template, "hotel_for_package", None)
+        if not package or package.huz_token != MASTER_HOTEL_PACKAGE_TOKEN:
+            return None
+        return hotel_template
 
     @staticmethod
     def _normalize_hotel_payload(payload, create=False, template_hotel=None):
@@ -1135,7 +1161,13 @@ class CreateHuzHotelView(OperatorPackageBaseView):
                         {"message": _first_error_message(serializer)},
                         status=status.HTTP_400_BAD_REQUEST,
                     )
-                serializer.save()
+                existing_hotel = serializer.save()
+                if (
+                    template_hotel
+                    and existing_hotel.catalog_hotel_id != template_hotel.hotel_id
+                ):
+                    existing_hotel.catalog_hotel = template_hotel
+                    existing_hotel.save(update_fields=["catalog_hotel"])
                 created = False
             else:
                 serializer = HuzHotelSerializer(data=normalized)
@@ -1144,7 +1176,10 @@ class CreateHuzHotelView(OperatorPackageBaseView):
                         {"message": _first_error_message(serializer)},
                         status=status.HTTP_400_BAD_REQUEST,
                     )
-                serializer.save(hotel_for_package=package)
+                serializer.save(
+                    hotel_for_package=package,
+                    catalog_hotel=template_hotel,
+                )
                 created = True
 
             package_updates = []
@@ -1236,7 +1271,10 @@ class CreateHuzHotelView(OperatorPackageBaseView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            serializer.save()
+            existing_hotel = serializer.save()
+            if template_hotel and existing_hotel.catalog_hotel_id != template_hotel.hotel_id:
+                existing_hotel.catalog_hotel = template_hotel
+                existing_hotel.save(update_fields=["catalog_hotel"])
 
             city_name = str(
                 normalized.get("hotel_city") or existing_hotel.hotel_city or ""
@@ -1261,6 +1299,98 @@ class CreateHuzHotelView(OperatorPackageBaseView):
             logger.error(f"CreateHuzHotelView - Put: {exc}", exc_info=True)
             return Response(
                 {"message": "Failed to update hotel detail. Internal server error."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class GetAllHotelsWithImagesView(OperatorPackageBaseView):
+    @swagger_auto_schema(
+        operation_description=(
+            "Get all master hotels for package creation dropdowns. "
+            "Returns hotel list with lightweight image placeholders."
+        ),
+        manual_parameters=[
+            openapi.Parameter(
+                "partner_session_token",
+                openapi.IN_QUERY,
+                description="Partner session token",
+                type=openapi.TYPE_STRING,
+                required=True,
+            ),
+            openapi.Parameter(
+                "city",
+                openapi.IN_QUERY,
+                description="Optional city filter",
+                type=openapi.TYPE_STRING,
+            ),
+            openapi.Parameter(
+                "search",
+                openapi.IN_QUERY,
+                description="Optional search filter",
+                type=openapi.TYPE_STRING,
+            ),
+        ],
+    )
+    def get(self, request, *args, **kwargs):
+        try:
+            partner, error = self._get_partner(request, require_active=False)
+            if error:
+                return error
+
+            city_filter = (request.GET.get("city") or "").strip()
+            search_filter = (request.GET.get("search") or "").strip()
+
+            catalog_package = HuzBasicDetail.objects.filter(
+                huz_token=MASTER_HOTEL_PACKAGE_TOKEN
+            ).first()
+
+            if catalog_package:
+                queryset = HuzHotelDetail.objects.filter(hotel_for_package=catalog_package)
+            else:
+                queryset = HuzHotelDetail.objects.all()
+
+            queryset = queryset.select_related("catalog_hotel").prefetch_related(
+                "hotel_images",
+                "catalog_hotel__hotel_images",
+            )
+
+            if city_filter:
+                queryset = queryset.filter(hotel_city__iexact=city_filter)
+            if search_filter:
+                queryset = queryset.filter(
+                    Q(hotel_city__icontains=search_filter)
+                    | Q(hotel_name__icontains=search_filter)
+                    | Q(hotel_rating__icontains=search_filter)
+                    | Q(room_sharing_type__icontains=search_filter)
+                )
+
+            hotel_list = list(queryset.order_by("hotel_city", "hotel_name"))
+            if not catalog_package:
+                unique_map = {}
+                for hotel in hotel_list:
+                    dedupe_key = (
+                        f"{(hotel.hotel_city or '').strip().lower()}::"
+                        f"{(hotel.hotel_name or '').strip().lower()}::"
+                        f"{(hotel.hotel_rating or '').strip().lower()}"
+                    )
+                    if dedupe_key not in unique_map:
+                        unique_map[dedupe_key] = hotel
+                hotel_list = list(unique_map.values())
+
+            results = [_serialize_catalog_hotel(hotel) for hotel in hotel_list]
+            return Response(
+                {
+                    "message": "Hotels fetched successfully.",
+                    "count": len(results),
+                    "results": results,
+                    "requested_by": partner.partner_session_token,
+                },
+                status=status.HTTP_200_OK,
+            )
+        except Exception as exc:
+            logger.error(f"GetAllHotelsWithImagesView - Get: {exc}", exc_info=True)
+            return Response(
+                {"message": "Failed to fetch hotels list. Internal server error."},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
@@ -1432,18 +1562,21 @@ class GetHuzPackageDetailByTokenView(OperatorPackageBaseView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            queryset = self._package_queryset().filter(package_provider=partner).filter(
-                _build_package_token_query(huz_token)
+            package = (
+                self._package_queryset()
+                .filter(package_provider=partner)
+                .filter(_build_package_token_query(huz_token))
+                .first()
             )
 
-            if not queryset.exists():
+            if not package:
                 return Response(
                     {"message": "Package do not exist."},
                     status=status.HTTP_404_NOT_FOUND,
                 )
 
             serializer = OperatorHuzPackageSerializer(
-                queryset,
+                [package],
                 many=True,
                 context={"partner_rating_cache": {}},
             )

@@ -40,6 +40,7 @@ urlpatterns = [
     path('get_package_short_detail_by_partner_token/', package_management_operator.GetHuzShortPackageByTokenView.as_view()),
     path('get_package_detail_by_partner_token/', package_management_operator.GetHuzPackageDetailByTokenView.as_view()),
     path('get_partner_overall_package_statistics/', package_management_operator.GetPartnersOverallPackagesStatisticsView.as_view()),
+    path('get_all_hotels_with_images/', package_management_operator.GetAllHotelsWithImagesView.as_view()),
 
     # For Website only
     path('get_package_short_detail_for_web/', package_management.GetHuzShortPackageForWebsiteView.as_view()),
