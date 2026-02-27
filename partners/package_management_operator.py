@@ -1867,7 +1867,7 @@ class GetPartnersOverallPackagesStatisticsView(OperatorPackageBaseView):
             if error:
                 return error
 
-            requested_statuses = ["Initialize", "Completed", "Active", "Deactivated"]
+            requested_statuses = [status_name for status_name, _ in HuzBasicDetail.PACKAGE_STATUS_CHOICES]
             counts = {status_name: 0 for status_name in requested_statuses}
 
             package_count = (
@@ -1878,7 +1878,7 @@ class GetPartnersOverallPackagesStatisticsView(OperatorPackageBaseView):
 
             for item in package_count:
                 status_name = item.get("package_status")
-                if status_name in counts:
+                if status_name:
                     counts[status_name] = item.get("total_count", 0)
 
             return Response(counts, status=status.HTTP_200_OK)

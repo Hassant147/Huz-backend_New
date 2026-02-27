@@ -13,17 +13,23 @@ from common.models import UserProfile
 from partners.models import HuzBasicDetail, PartnerProfile
 
 from .manage_partner_booking import (
+    GetOverallPartnerComplaintsView,
+    GetPackageOverallRatingView,
+    GetOverallRatingView,
     BookingAirlineDetailsView,
     BookingHotelAndTransportDetailsView,
     CloseBookingView,
     GetPartnerComplaintsView,
+    GetPartnersOverallBookingStatisticsView,
     GetBookingShortDetailForPartnersView,
+    GetYearlyBookingStatisticsView,
     GiveUpdateOnComplaintsView,
     ManageBookingDocumentsView,
     ReportBookingView,
     TakeActionView,
 )
-from .models import Booking, BookingAirlineDetail, BookingComplaints, BookingObjections, PassportValidity
+from .manage_bookings import BookingRatingAndReviewView, BookingComplaintsView
+from .models import Booking, BookingAirlineDetail, BookingComplaints, BookingObjections, PassportValidity, BookingRatingAndReview
 
 
 def ensure_tables_for_apps(app_labels):
@@ -714,3 +720,228 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
                 objection_for_booking=pending_booking_objection
             ).exists()
         )
+
+    def test_overall_complaints_counts_merge_legacy_close_and_closed(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-CMP-OVERALL-001",
+            booking_status="Active",
+        )
+        self._create_complaint(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking=booking,
+            status_value="Close",
+            ticket="CMP-CLOSE-001",
+        )
+        self._create_complaint(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking=booking,
+            status_value="Closed",
+            ticket="CMP-CLOSED-001",
+        )
+
+        request = self._authenticated_request(
+            self.factory.get(
+                "/bookings/get_overall_complaints_counts/",
+                {"partner_session_token": self.partner_a.partner_session_token},
+            )
+        )
+
+        response = GetOverallPartnerComplaintsView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("Close"), 2)
+        self.assertEqual(response.data.get("Open"), 0)
+        self.assertEqual(response.data.get("InProgress"), 0)
+        self.assertEqual(response.data.get("Solved"), 0)
+
+    def test_yearly_earning_statistics_rejects_invalid_year(self):
+        request = self._authenticated_request(
+            self.factory.get(
+                "/bookings/get_yearly_earning_statistics/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "year": "not-a-year",
+                },
+            )
+        )
+
+        response = GetYearlyBookingStatisticsView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Invalid year", response.data.get("message", ""))
+
+    def test_overall_booking_statistics_include_all_booking_status_choices(self):
+        self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-STATS-PASSPORT-001",
+            booking_status="Passport_Validation",
+        )
+        self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-STATS-CANCEL-001",
+            booking_status="Cancel",
+        )
+
+        request = self._authenticated_request(
+            self.factory.get(
+                "/bookings/get_overall_booking_statistics/",
+                {"partner_session_token": self.partner_a.partner_session_token},
+            )
+        )
+
+        response = GetPartnersOverallBookingStatisticsView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("Passport_Validation", response.data)
+        self.assertIn("Cancel", response.data)
+        self.assertEqual(response.data.get("Passport_Validation"), 1)
+        self.assertEqual(response.data.get("Cancel"), 1)
+
+    def test_overall_rating_distribution_normalizes_decimal_ratings(self):
+        booking_one = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-RATING-001",
+            booking_status="Completed",
+        )
+        booking_two = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-RATING-002",
+            booking_status="Completed",
+        )
+        booking_three = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-RATING-003",
+            booking_status="Completed",
+        )
+
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=4.6,
+            partner_comment="Great service",
+            rating_for_partner=self.partner_a,
+            rating_for_package=self.package_a,
+            rating_for_booking=booking_one,
+            rating_by_user=self.customer,
+        )
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=4.4,
+            partner_comment="Good service",
+            rating_for_partner=self.partner_a,
+            rating_for_package=self.package_a,
+            rating_for_booking=booking_two,
+            rating_by_user=self.customer,
+        )
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=5.8,
+            partner_comment="Invalid legacy value",
+            rating_for_partner=self.partner_a,
+            rating_for_package=self.package_a,
+            rating_for_booking=booking_three,
+            rating_by_user=self.customer,
+        )
+
+        overall_request = self._authenticated_request(
+            self.factory.get(
+                "/bookings/get_overall_partner_rating/",
+                {"partner_session_token": self.partner_a.partner_session_token},
+            )
+        )
+        overall_response = GetOverallRatingView.as_view()(overall_request)
+        self.assertEqual(overall_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(overall_response.data.get("total_star_5"), 1)
+        self.assertEqual(overall_response.data.get("total_star_4"), 1)
+        self.assertEqual(overall_response.data.get("total_star_3"), 0)
+
+        package_request = self._authenticated_request(
+            self.factory.get(
+                "/bookings/get_overall_rating_package_wise/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "huz_token": self.package_a.huz_token,
+                },
+            )
+        )
+        package_response = GetPackageOverallRatingView.as_view()(package_request)
+        self.assertEqual(package_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(package_response.data.get("total_package_star_5"), 1)
+        self.assertEqual(package_response.data.get("total_package_star_4"), 1)
+        self.assertEqual(package_response.data.get("total_package_star_3"), 0)
+
+    def test_rating_submission_supports_closed_booking_and_validates_stars(self):
+        closed_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-RATING-CLOSED-001",
+            booking_status="Closed",
+        )
+
+        invalid_request = self._authenticated_request(
+            self.factory.post(
+                "/bookings/rating_and_review/",
+                {
+                    "session_token": self.customer.session_token,
+                    "booking_number": closed_booking.booking_number,
+                    "huz_concierge": 5,
+                    "huz_support": 5,
+                    "huz_platform": 5,
+                    "huz_service_quality": 5,
+                    "huz_response_time": 5,
+                    "huz_comment": "All good",
+                    "partner_total_stars": 4.5,
+                    "partner_comment": "Great",
+                },
+                format="json",
+            )
+        )
+        invalid_response = BookingRatingAndReviewView.as_view()(invalid_request)
+        self.assertEqual(invalid_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        valid_request = self._authenticated_request(
+            self.factory.post(
+                "/bookings/rating_and_review/",
+                {
+                    "session_token": self.customer.session_token,
+                    "booking_number": closed_booking.booking_number,
+                    "huz_concierge": 5,
+                    "huz_support": 5,
+                    "huz_platform": 5,
+                    "huz_service_quality": 5,
+                    "huz_response_time": 5,
+                    "huz_comment": "All good",
+                    "partner_total_stars": 5,
+                    "partner_comment": "Great",
+                },
+                format="json",
+            )
+        )
+        valid_response = BookingRatingAndReviewView.as_view()(valid_request)
+        self.assertEqual(valid_response.status_code, status.HTTP_201_CREATED)
+
+    def test_complaint_submission_supports_closed_booking_status(self):
+        closed_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-COMPLAINT-CLOSED-001",
+            booking_status="Closed",
+        )
+
+        request = self._authenticated_request(
+            self.factory.post(
+                "/bookings/raise_complaint_booking_wise/",
+                {
+                    "session_token": self.customer.session_token,
+                    "booking_number": closed_booking.booking_number,
+                    "complaint_title": "Need follow-up",
+                    "complaint_message": "Issue details",
+                },
+                format="multipart",
+            )
+        )
+
+        response = BookingComplaintsView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)

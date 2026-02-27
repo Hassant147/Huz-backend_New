@@ -12,6 +12,7 @@ from .partner_accounts_and_transactions import (
     GetPartnerTransactionOverallSummaryView,
 )
 from .package_management_operator import (
+    GetPartnersOverallPackagesStatisticsView,
     GetHuzPackageDetailByTokenView,
     GetHuzShortPackageByTokenView,
 )
@@ -179,6 +180,53 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
         results = response.data.get("results") or []
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].get("huz_token"), self.completed_package.huz_token)
+
+    def test_overall_package_statistics_include_all_supported_statuses(self):
+        start_date = timezone.now() + timedelta(days=20)
+        end_date = start_date + timedelta(days=7)
+        HuzBasicDetail.objects.create(
+            huz_token="package-huz-token-004",
+            package_type="Hajj",
+            package_name="Blocked package",
+            start_date=start_date,
+            end_date=end_date,
+            description="Blocked status package",
+            package_status="Block",
+            package_provider=self.partner,
+        )
+        HuzBasicDetail.objects.create(
+            huz_token="package-huz-token-005",
+            package_type="Hajj",
+            package_name="Pending package",
+            start_date=start_date,
+            end_date=end_date,
+            description="Pending status package",
+            package_status="Pending",
+            package_provider=self.partner,
+        )
+        HuzBasicDetail.objects.create(
+            huz_token="package-huz-token-006",
+            package_type="Hajj",
+            package_name="Not active package",
+            start_date=start_date,
+            end_date=end_date,
+            description="NotActive status package",
+            package_status="NotActive",
+            package_provider=self.partner,
+        )
+
+        request = self.factory.get(
+            "/partner/get_partner_overall_package_statistics/",
+            {"partner_session_token": self.partner.partner_session_token},
+        )
+        response = GetPartnersOverallPackagesStatisticsView.as_view()(request)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("Active"), 1)
+        self.assertEqual(response.data.get("Completed"), 1)
+        self.assertEqual(response.data.get("Block"), 1)
+        self.assertEqual(response.data.get("Pending"), 1)
+        self.assertEqual(response.data.get("NotActive"), 1)
 
 
 class PartnerWalletEndpointAccessTests(APITransactionTestCase):

@@ -15,6 +15,23 @@ from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from datetime import datetime, timedelta
 from django.utils.dateparse import parse_date
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
+
+def normalize_partner_star_rating(value):
+    try:
+        parsed_value = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+    if parsed_value < Decimal("1") or parsed_value > Decimal("5"):
+        return None
+
+    rounded = parsed_value.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    if rounded != parsed_value:
+        return None
+
+    return int(rounded)
 
 
 class ManageBookingsView(APIView):
@@ -1318,7 +1335,14 @@ class BookingRatingAndReviewView(APIView):
             if not package_detail:
                 return Response({"message": "Package detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            statuss = ["Completed", "Close"]
+            normalized_partner_stars = normalize_partner_star_rating(data.get('partner_total_stars'))
+            if normalized_partner_stars is None:
+                return Response(
+                    {"message": "partner_total_stars must be a whole number between 1 and 5."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            statuss = ["Completed", "Closed", "Close"]
             # Check if the booking status allows for submitting reviews
             if booking_detail.booking_status not in statuss:
                 return Response({"message": "Reviews and ratings can only be submitted after your booking is completed or closed."}, status=status.HTTP_409_CONFLICT)
@@ -1332,7 +1356,7 @@ class BookingRatingAndReviewView(APIView):
                     huz_service_quality=data.get('huz_service_quality'),
                     huz_response_time=data.get('huz_response_time'),
                     huz_comment=data.get('huz_comment'),
-                    partner_total_stars=data.get('partner_total_stars'),
+                    partner_total_stars=normalized_partner_stars,
                     partner_comment=data.get('partner_comment'),
                     rating_for_booking=booking_detail,
                     rating_for_partner=partner_detail,
@@ -1370,7 +1394,7 @@ class BookingComplaintsView(APIView):
             400: 'Bad Request: Missing required data fields, invalid file format, or size limit exceeded.',
             401: 'Unauthorized: Admin permissions required',
             404: 'Not Found:User, booking detail, package provider, or package detail not found.',
-            409: 'Conflict: Complaint can only be raised when the booking status is Pending, Complete, Active, or Close.',
+            409: 'Conflict: Complaint can only be raised when the booking status is Pending, Complete, Active, or Closed.',
             500: 'Server error: Internal server error.'
         },
     )
@@ -1415,9 +1439,9 @@ class BookingComplaintsView(APIView):
                 return Response({"message": "Package detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Check if the booking status allows for raising a complaint
-            if booking_detail.booking_status not in ["Pending", "Completed", "Active", "Close"]:
+            if booking_detail.booking_status not in ["Pending", "Completed", "Active", "Closed", "Close"]:
                 return Response({
-                                    "message": "Complaint can only be raised when the booking status is Pending, Complete, Active, or Close."},
+                                    "message": "Complaint can only be raised when the booking status is Pending, Complete, Active, or Closed."},
                                 status=status.HTTP_409_CONFLICT)
 
             with transaction.atomic():
@@ -1823,5 +1847,4 @@ class GetUserRequestsView(APIView):
             # Log the exception with traceback
             logger.error(f"Error in GetUserRequestsView: {str(e)}", exc_info=True)
             return Response({"message": "An unexpected error occurred."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
 

@@ -5,6 +5,7 @@ from rest_framework.permissions import BasePermission
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from common.utility import CustomPagination, validate_required_fields, check_file_format_and_size, save_file_in_directory, delete_file_from_directory, send_objection_email, send_booking_documents_email
 from common.logs_file import logger
 from partners.models import PartnerProfile, HuzBasicDetail
@@ -172,6 +173,31 @@ def normalize_complaint_status(value):
     if not normalized:
         return ""
     return COMPLAINT_STATUS_NORMALIZER.get(normalized, "")
+
+
+def normalize_star_bucket(value):
+    try:
+        parsed_value = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+    if parsed_value < Decimal("1") or parsed_value > Decimal("5"):
+        return None
+
+    rounded = int(parsed_value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    return max(1, min(5, rounded))
+
+
+def build_star_distribution(queryset, key_prefix):
+    distribution = {f"{key_prefix}_{star}": 0 for star in range(5, 0, -1)}
+
+    for raw_star in queryset.values_list("partner_total_stars", flat=True):
+        normalized_star = normalize_star_bucket(raw_star)
+        if not normalized_star:
+            continue
+        distribution[f"{key_prefix}_{normalized_star}"] += 1
+
+    return distribution
 
 
 def finalize_booking_if_all_documents_completed(booking_detail, doc, package_detail, partner):
@@ -981,17 +1007,8 @@ class GetOverallRatingView(APIView):
             if not user:
                 return Response({"message": "Partner not found for the given session token."}, status=status.HTTP_404_NOT_FOUND)
 
-            # Initialize dictionary to hold star rating counts
-            total_star_counts = {}
-
-            # Retrieve the count of ratings for each star level (5 to 1)
-            for star in range(5, 0, -1):
-                star_count = BookingRatingAndReview.objects.filter(
-                    rating_for_partner=user,
-                    partner_total_stars=star
-                ).aggregate(total_count=Count('rating_id'))
-
-                total_star_counts[f'total_star_{star}'] = star_count['total_count'] if star_count['total_count'] is not None else 0
+            partner_ratings = BookingRatingAndReview.objects.filter(rating_for_partner=user)
+            total_star_counts = build_star_distribution(partner_ratings, "total_star")
 
             return Response(total_star_counts, status=status.HTTP_200_OK)
 
@@ -1086,16 +1103,11 @@ class GetPackageOverallRatingView(APIView):
             if not package_detail:
                 return Response({"message": "Package detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            # Calculate the total star counts for each rating (1 to 5 stars)
-            total_star_counts = {}
-            for star in range(5, 0, -1):
-                star_count = BookingRatingAndReview.objects.filter(
-                    rating_for_partner=user,
-                    rating_for_package=package_detail,
-                    partner_total_stars=star
-                ).aggregate(total_count=Count('rating_id'))
-
-                total_star_counts[f'total_package_star_{star}'] = star_count['total_count'] if star_count['total_count'] is not None else 0
+            package_ratings = BookingRatingAndReview.objects.filter(
+                rating_for_partner=user,
+                rating_for_package=package_detail,
+            )
+            total_star_counts = build_star_distribution(package_ratings, "total_package_star")
 
             return Response(total_star_counts, status=status.HTTP_200_OK)
 
@@ -1148,7 +1160,7 @@ class GetOverallPartnerComplaintsView(APIView):
             for item in complaint_counts:
                 raw_status = normalize_complaint_status(item.get('complaint_status'))
                 if raw_status:
-                    complaint_status_counts[raw_status] = item['total_count']
+                    complaint_status_counts[raw_status] += item['total_count']
 
             return Response(complaint_status_counts, status=status.HTTP_200_OK)
 
@@ -1364,13 +1376,16 @@ class GetPartnersOverallBookingStatisticsView(APIView):
                 type=openapi.TYPE_OBJECT,
                 properties={
                     'Initialize': openapi.Schema(type=openapi.TYPE_INTEGER),
+                    'Passport_Validation': openapi.Schema(type=openapi.TYPE_INTEGER),
                     'Paid': openapi.Schema(type=openapi.TYPE_INTEGER),
                     'Confirm': openapi.Schema(type=openapi.TYPE_INTEGER),
-                    'Documents': openapi.Schema(type=openapi.TYPE_INTEGER),
                     'Pending': openapi.Schema(type=openapi.TYPE_INTEGER),
                     'Active': openapi.Schema(type=openapi.TYPE_INTEGER),
                     'Completed': openapi.Schema(type=openapi.TYPE_INTEGER),
                     'Closed': openapi.Schema(type=openapi.TYPE_INTEGER),
+                    'Objection': openapi.Schema(type=openapi.TYPE_INTEGER),
+                    'Report': openapi.Schema(type=openapi.TYPE_INTEGER),
+                    'Cancel': openapi.Schema(type=openapi.TYPE_INTEGER),
                     'Rejected': openapi.Schema(type=openapi.TYPE_INTEGER),
                 },
             ),
@@ -1390,13 +1405,15 @@ class GetPartnersOverallBookingStatisticsView(APIView):
             if not user:
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            booking_status = ['Initialize', 'Paid', 'Confirm', 'Objection', 'Pending', 'Active', 'Completed', 'Closed', 'Report', 'Rejected']
+            booking_status = [status_name for status_name, _ in Booking.BOOKING_TYPE]
             bookings_count = Booking.objects.filter(order_to=user).values(
                 'booking_status').annotate(total_count=Count('booking_id')).order_by('booking_status')
 
             booking_status_counts = {statuses: 0 for statuses in booking_status}
             for item in bookings_count:
-                booking_status_counts[item['booking_status']] = item['total_count']
+                status_name = item.get('booking_status')
+                if status_name:
+                    booking_status_counts[status_name] = item.get('total_count', 0)
 
             return Response(booking_status_counts, status=status.HTTP_200_OK)
 
@@ -1427,9 +1444,17 @@ class GetYearlyBookingStatisticsView(APIView):
     def get(self, request):
         try:
             partner_session_token = request.GET.get('partner_session_token')
-            year = request.GET.get('year')
-            if not partner_session_token or not year:
+            year_raw = str(request.GET.get('year') or '').strip()
+            if not partner_session_token or not year_raw:
                 return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
+
+            try:
+                year = int(year_raw)
+            except (TypeError, ValueError):
+                return Response(
+                    {"message": "Invalid year. Expected a numeric year like 2026."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
             user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
             if not user:
@@ -1465,7 +1490,7 @@ class PartnersBookingPaymentView(APIView):
             ),
             400: "Missing required data fields.",
             401: "Unauthorized: Admin permissions required.",
-            404: "User not found for the provided session token or no payment records found.",
+            404: "User not found for the provided session token.",
             500: "An unexpected error occurred."
         }
     )
@@ -1482,8 +1507,6 @@ class PartnersBookingPaymentView(APIView):
                                 status=status.HTTP_404_NOT_FOUND)
 
             partner_payments = PartnersBookingPayment.objects.filter(payment_for_partner=user)
-            if not partner_payments:
-                return Response({"message": "No payment records found for the user."}, status=status.HTTP_404_NOT_FOUND)
 
             serialized_payments = PartnersBookingPaymentSerializer(partner_payments, many=True)
             return Response(serialized_payments.data, status=status.HTTP_200_OK)
