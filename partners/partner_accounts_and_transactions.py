@@ -1,5 +1,5 @@
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAdminUser
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework import status
 from .models import PartnerProfile, PartnerWithdraw, PartnerBankAccount, Wallet, PartnerTransactionHistory
@@ -13,7 +13,7 @@ from django.db.models import Sum, Count
 
 
 class ManagePartnerBankAccountView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         manual_parameters=[
@@ -21,7 +21,6 @@ class ManagePartnerBankAccountView(APIView):
         ],
         responses={
             200: openapi.Response('Successfully retrieved bank accounts', PartnerBankAccountSerializer(many=True)),
-            401: "Unauthorized: Admin permissions required",
             404: "Not Found: User or bank details not found",
             400: "Bad Request: Missing user information or user not recognized",
             500: "Server Error: Internal server error"
@@ -64,7 +63,6 @@ class ManagePartnerBankAccountView(APIView):
         ),
         responses={
             201: openapi.Response("Bank account details added successfully", PartnerBankAccountSerializer),
-            401: "Unauthorized: Admin permissions required",
             404: "Not Found: User not found",
             400: "Bad Request: Missing user information or user not recognized or invalid input data",
             409: "Conflict: Bank account details already exist",
@@ -126,7 +124,6 @@ class ManagePartnerBankAccountView(APIView):
         responses={
             200: "Bank account has been removed successfully.",
             400: "Bad Request: Missing required information.",
-            401: "Unauthorized: Admin permissions required",
             404: "Not Found: User or account details not found",
             500: "Server Error: Internal server error"
         }
@@ -155,7 +152,7 @@ class ManagePartnerBankAccountView(APIView):
 
 
 class ManagePartnerWithdrawView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         manual_parameters=[
@@ -163,7 +160,6 @@ class ManagePartnerWithdrawView(APIView):
         ],
         responses={
             200: openapi.Response("Successful retrieval of withdrawal requests", PartnerWithdrawSerializer),
-            401: "Unauthorized: Admin permissions required",
             404: "Not Found: User or withdrawal requests not found",
             400: "Bad Request: Invalid input data",
             500: "Server Error: Internal server error"
@@ -283,7 +279,7 @@ class ManagePartnerWithdrawView(APIView):
 
 
 class GetPartnerAllTransactionHistoryView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         operation_summary="Get Partner Transaction History",
@@ -291,7 +287,6 @@ class GetPartnerAllTransactionHistoryView(APIView):
         manual_parameters=[openapi.Parameter('partner_session_token', openapi.IN_QUERY, type=openapi.TYPE_STRING, required=True, description='Session token of the user')],
         responses={
             200: openapi.Response("Successful retrieval of transaction history", PartnerTransactionSerializer(many=True)),
-            401: "Unauthorized: Admin permissions required",
             404: "Not Found: User or transaction history not found",
             400: "Bad Request: Invalid input data",
             500: "Server Error: Internal server error"
@@ -327,7 +322,7 @@ class GetPartnerAllTransactionHistoryView(APIView):
 
 
 class GetPartnerTransactionOverallSummaryView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         operation_summary="Get Partner Transaction Counts and Amounts Summary",
@@ -335,7 +330,6 @@ class GetPartnerTransactionOverallSummaryView(APIView):
         manual_parameters=[openapi.Parameter('partner_session_token', openapi.IN_QUERY, description="Session token of the partner", type=openapi.TYPE_STRING, required=True)],
         responses={
             200: openapi.Response("Successful retrieval of transaction amount summary"),
-            401: "Unauthorized: Admin permissions required",
             404: "Not Found: User or transaction records not found",
             400: "Bad Request: Invalid input data",
             500: "Server Error: Internal server error"

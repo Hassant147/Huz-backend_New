@@ -1,4 +1,5 @@
-from django.db.models import Sum, Count
+from django.db.models import Sum, Count, Q
+from django.utils.dateparse import parse_date
 from rest_framework.views import APIView
 from rest_framework.permissions import BasePermission
 from rest_framework.response import Response
@@ -63,6 +64,24 @@ BOOKING_STATUS_NORMALIZER = {
 VALID_BOOKING_UPDATE_STATUSES = ("Active", "Completed")
 VALID_BOOKING_DOCUMENT_TYPES = ("eVisa", "airline", "hotel", "transport")
 VALID_ARRANGEMENT_DETAIL_TYPES = ("Hotel", "Transport")
+VALID_COMPLAINT_STATUSES = ("Open", "InProgress", "Solved", "Close")
+
+COMPLAINT_STATUS_NORMALIZER = {
+    "open": "Open",
+    "inprogress": "InProgress",
+    "in_progress": "InProgress",
+    "in progress": "InProgress",
+    "solved": "Solved",
+    "close": "Close",
+    "closed": "Close",
+}
+
+COMPLAINT_STATUS_NEXT_TRANSITIONS = {
+    "Open": "InProgress",
+    "InProgress": "Solved",
+    "Solved": "Close",
+    "Close": None,
+}
 
 BOOKING_DOCUMENT_TYPE_NORMALIZER = {
     "evisa": "eVisa",
@@ -146,6 +165,13 @@ def normalize_arrangement_detail_type(detail_for):
 
 def can_update_booking_documents(booking_detail):
     return booking_detail.booking_status in VALID_BOOKING_UPDATE_STATUSES
+
+
+def normalize_complaint_status(value):
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return ""
+    return COMPLAINT_STATUS_NORMALIZER.get(normalized, "")
 
 
 def finalize_booking_if_all_documents_completed(booking_detail, doc, package_detail, partner):
@@ -1108,7 +1134,7 @@ class GetOverallPartnerComplaintsView(APIView):
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Define the possible complaint statuses
-            complaint_statuses = ["Open", "InProgress", "Solved", "Close"]
+            complaint_statuses = list(VALID_COMPLAINT_STATUSES)
 
             # Query the complaint counts grouped by status for the partner
             complaint_counts = BookingComplaints.objects.filter(
@@ -1120,7 +1146,9 @@ class GetOverallPartnerComplaintsView(APIView):
 
             # Populate the dictionary with actual counts from the query results
             for item in complaint_counts:
-                complaint_status_counts[item['complaint_status']] = item['total_count']
+                raw_status = normalize_complaint_status(item.get('complaint_status'))
+                if raw_status:
+                    complaint_status_counts[raw_status] = item['total_count']
 
             return Response(complaint_status_counts, status=status.HTTP_200_OK)
 
@@ -1135,7 +1163,11 @@ class GetPartnerComplaintsView(APIView):
     @swagger_auto_schema(
         manual_parameters=[
             openapi.Parameter('partner_session_token', openapi.IN_QUERY, description="Session token of the partner",type=openapi.TYPE_STRING, required=True),
-            openapi.Parameter('complaint_status', openapi.IN_QUERY, description="Status of the complaint",type=openapi.TYPE_STRING, required=True),
+            openapi.Parameter('complaint_status', openapi.IN_QUERY, description="Status of the complaint",type=openapi.TYPE_STRING, required=False),
+            openapi.Parameter('complaint_id', openapi.IN_QUERY, description="Complaint ID (exact match)", type=openapi.TYPE_STRING, required=False),
+            openapi.Parameter('search', openapi.IN_QUERY, description="Search by ticket/title/message/booking/user name", type=openapi.TYPE_STRING, required=False),
+            openapi.Parameter('from_date', openapi.IN_QUERY, description="Filter complaint date from YYYY-MM-DD", type=openapi.TYPE_STRING, required=False),
+            openapi.Parameter('to_date', openapi.IN_QUERY, description="Filter complaint date to YYYY-MM-DD", type=openapi.TYPE_STRING, required=False),
             openapi.Parameter('page', openapi.IN_QUERY, description="Page number", type=openapi.TYPE_INTEGER),
             openapi.Parameter('page_size', openapi.IN_QUERY, description="Page size", type=openapi.TYPE_INTEGER)
         ],
@@ -1143,7 +1175,7 @@ class GetPartnerComplaintsView(APIView):
             200: "Paginated list of complaints for the partner",
             400: "Missing required data fields",
             401: "Unauthorized: Admin permissions required.",
-            404: "User or complaints not found",
+            404: "User not found",
             500: "An unexpected error occurred"
         }
     )
@@ -1151,27 +1183,83 @@ class GetPartnerComplaintsView(APIView):
         try:
             partner_session_token = request.GET.get('partner_session_token')
             complaint_status = request.GET.get('complaint_status')
+            complaint_id = str(request.GET.get('complaint_id') or "").strip()
+            search = str(request.GET.get('search') or "").strip()
+            from_date_raw = str(request.GET.get('from_date') or "").strip()
+            to_date_raw = str(request.GET.get('to_date') or "").strip()
 
             # Check if the required parameters are provided
-            if not partner_session_token or not complaint_status:
+            if not partner_session_token:
                 return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
+
+            normalized_complaint_status = ""
+            if complaint_status:
+                normalized_complaint_status = normalize_complaint_status(complaint_status)
+                if not normalized_complaint_status:
+                    return Response(
+                        {"message": f"Invalid complaint_status. Must be one of: {', '.join(VALID_COMPLAINT_STATUSES)}."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+            from_date = None
+            if from_date_raw:
+                from_date = parse_date(from_date_raw)
+                if not from_date:
+                    return Response(
+                        {"message": "Invalid from_date. Expected YYYY-MM-DD."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+            to_date = None
+            if to_date_raw:
+                to_date = parse_date(to_date_raw)
+                if not to_date:
+                    return Response(
+                        {"message": "Invalid to_date. Expected YYYY-MM-DD."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
 
             # Retrieve the partner user using the session token
             user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
             if not user:
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            # Query complaints for the partner with the specified status
-            complaints = BookingComplaints.objects.filter(complaint_for_partner=user, complaint_status=complaint_status)
+            complaints = (
+                BookingComplaints.objects.select_related(
+                    'complaint_by_user',
+                    'complaint_for_booking',
+                    'complaint_for_package',
+                    'complaint_for_partner',
+                )
+                .filter(complaint_for_partner=user)
+                .order_by('-complaint_time')
+            )
 
-            # Check if any complaints exist
-            if complaints.exists():
+            if normalized_complaint_status:
+                complaints = complaints.filter(complaint_status=normalized_complaint_status)
 
-                paginator = CustomPagination()
-                paginated_packages = paginator.paginate_queryset(complaints, request)
-                serialized_package = BookingComplaintsSerializer(paginated_packages, many=True)
-                return paginator.get_paginated_response(serialized_package.data)
-            return Response({"message": "No complaints found."}, status=status.HTTP_404_NOT_FOUND)
+            if complaint_id:
+                complaints = complaints.filter(complaint_id=complaint_id)
+
+            if search:
+                complaints = complaints.filter(
+                    Q(complaint_ticket__icontains=search)
+                    | Q(complaint_title__icontains=search)
+                    | Q(complaint_message__icontains=search)
+                    | Q(complaint_for_booking__booking_number__icontains=search)
+                    | Q(complaint_by_user__name__icontains=search)
+                )
+
+            if from_date:
+                complaints = complaints.filter(complaint_time__date__gte=from_date)
+
+            if to_date:
+                complaints = complaints.filter(complaint_time__date__lte=to_date)
+
+            paginator = CustomPagination()
+            paginated_packages = paginator.paginate_queryset(complaints, request)
+            serialized_package = BookingComplaintsSerializer(paginated_packages, many=True)
+            return paginator.get_paginated_response(serialized_package.data)
 
         except Exception as e:
             # Log the error with exception information
@@ -1212,11 +1300,10 @@ class GiveUpdateOnComplaintsView(APIView):
                 return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
 
             # Validate complaint status
-            valid_statuses = ["Open", "InProgress", "Solved", "Close"]
-            complaint_status = data.get("complaint_status")
-            if complaint_status not in valid_statuses:
+            complaint_status = normalize_complaint_status(data.get("complaint_status"))
+            if not complaint_status:
                 return Response(
-                    {"message": f"Invalid complaint status. Status should be one of: {', '.join(valid_statuses)}."},
+                    {"message": f"Invalid complaint status. Status should be one of: {', '.join(VALID_COMPLAINT_STATUSES)}."},
                     status=status.HTTP_409_CONFLICT)
 
             # Retrieve the partner user using the session token
@@ -1225,15 +1312,36 @@ class GiveUpdateOnComplaintsView(APIView):
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Retrieve the complaint for the partner using the complaint ID
-            complaint = BookingComplaints.objects.filter(complaint_for_partner=user, complaint_id=data.get('complaint_id')).first()
+            complaint = (
+                BookingComplaints.objects.select_related('complaint_for_partner')
+                .filter(complaint_for_partner=user, complaint_id=data.get('complaint_id'))
+                .first()
+            )
             if not complaint:
                 return Response({"message": "Complaint not found."}, status=status.HTTP_404_NOT_FOUND)
 
+            current_status = normalize_complaint_status(complaint.complaint_status)
+            if not current_status:
+                current_status = "Open"
+
+            if complaint_status != current_status:
+                allowed_next_status = COMPLAINT_STATUS_NEXT_TRANSITIONS.get(current_status)
+                if allowed_next_status != complaint_status:
+                    return Response(
+                        {
+                            "message": (
+                                f"Invalid complaint status transition from {current_status} to {complaint_status}. "
+                                f"Allowed next status: {allowed_next_status or 'None'}."
+                            )
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
             # Update the complaint status
-            complaint.complaint_status = data.get('complaint_status')
+            complaint.complaint_status = complaint_status
             response_message = request.data.get('response_message', None)
             complaint.response_message = response_message if response_message else None
-            complaint.save()
+            complaint.save(update_fields=['complaint_status', 'response_message'])
 
             # Serialize the updated complaint
             serialized_complaint = BookingComplaintsSerializer(complaint)

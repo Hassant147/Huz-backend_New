@@ -16,12 +16,14 @@ from .manage_partner_booking import (
     BookingAirlineDetailsView,
     BookingHotelAndTransportDetailsView,
     CloseBookingView,
+    GetPartnerComplaintsView,
     GetBookingShortDetailForPartnersView,
+    GiveUpdateOnComplaintsView,
     ManageBookingDocumentsView,
     ReportBookingView,
     TakeActionView,
 )
-from .models import Booking, BookingAirlineDetail, BookingObjections, PassportValidity
+from .models import Booking, BookingAirlineDetail, BookingComplaints, BookingObjections, PassportValidity
 
 
 def ensure_tables_for_apps(app_labels):
@@ -138,6 +140,28 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         force_authenticate(request, user=self.admin_user)
         return request
 
+    def _create_complaint(
+        self,
+        *,
+        partner,
+        package,
+        booking,
+        status_value="Open",
+        ticket="CMP-001",
+        title="Complaint title",
+        message="Complaint message",
+    ):
+        return BookingComplaints.objects.create(
+            complaint_ticket=ticket,
+            complaint_title=title,
+            complaint_message=message,
+            complaint_status=status_value,
+            complaint_by_user=self.customer,
+            complaint_for_partner=partner,
+            complaint_for_package=package,
+            complaint_for_booking=booking,
+        )
+
     def test_booking_list_returns_paginated_empty_payload(self):
         self._create_booking(
             partner=self.partner_a,
@@ -219,6 +243,215 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
             response.data.get("results")[0].get("booking_number"),
             matching_booking.booking_number,
         )
+
+    def test_complaints_list_returns_paginated_empty_payload(self):
+        request = self._authenticated_request(
+            self.factory.get(
+                "/bookings/get_all_complaints_for_partner/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "page": 1,
+                    "page_size": 10,
+                },
+            )
+        )
+
+        response = GetPartnerComplaintsView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 0)
+        self.assertEqual(response.data.get("results"), [])
+
+    def test_complaints_list_is_scoped_to_partner_without_status_filter(self):
+        booking_a = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-CMP-A-001",
+            booking_status="Active",
+        )
+        booking_b = self._create_booking(
+            partner=self.partner_b,
+            package=self.package_b,
+            booking_number="BK-CMP-B-001",
+            booking_status="Active",
+        )
+
+        own_complaint = self._create_complaint(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking=booking_a,
+            ticket="CMP-A-001",
+            title="Own complaint",
+            message="Issue for partner A",
+        )
+        self._create_complaint(
+            partner=self.partner_b,
+            package=self.package_b,
+            booking=booking_b,
+            ticket="CMP-B-001",
+            title="Other complaint",
+            message="Issue for partner B",
+        )
+
+        request = self._authenticated_request(
+            self.factory.get(
+                "/bookings/get_all_complaints_for_partner/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                },
+            )
+        )
+
+        response = GetPartnerComplaintsView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 1)
+        self.assertEqual(
+            response.data.get("results")[0].get("complaint_id"),
+            str(own_complaint.complaint_id),
+        )
+
+    def test_complaints_list_supports_status_and_search_filters(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-CMP-FILTER-001",
+            booking_status="Active",
+        )
+        matched_complaint = self._create_complaint(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking=booking,
+            status_value="Open",
+            ticket="CMP-FILTER-OPEN",
+            title="Delayed transport",
+            message="Transport reached late",
+        )
+        self._create_complaint(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking=booking,
+            status_value="Solved",
+            ticket="CMP-FILTER-SOLVED",
+            title="Solved issue",
+            message="Issue has been resolved",
+        )
+
+        request = self._authenticated_request(
+            self.factory.get(
+                "/bookings/get_all_complaints_for_partner/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "complaint_status": "Open",
+                    "search": "transport",
+                },
+            )
+        )
+
+        response = GetPartnerComplaintsView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 1)
+        first_result = response.data.get("results")[0]
+        self.assertEqual(first_result.get("complaint_id"), str(matched_complaint.complaint_id))
+        self.assertEqual(first_result.get("complaint_status"), "Open")
+
+    def test_complaint_status_update_rejects_invalid_transition(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-CMP-TRANSITION-001",
+            booking_status="Active",
+        )
+        complaint = self._create_complaint(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking=booking,
+            status_value="Open",
+            ticket="CMP-TRANSITION-OPEN",
+        )
+
+        request = self._authenticated_request(
+            self.factory.post(
+                "/bookings/give_feedback_on_complaints/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "complaint_id": str(complaint.complaint_id),
+                    "complaint_status": "Close",
+                    "response_message": "Closing directly",
+                },
+                format="json",
+            )
+        )
+
+        response = GiveUpdateOnComplaintsView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        complaint.refresh_from_db()
+        self.assertEqual(complaint.complaint_status, "Open")
+
+    def test_complaint_status_update_is_scoped_to_partner(self):
+        booking = self._create_booking(
+            partner=self.partner_b,
+            package=self.package_b,
+            booking_number="BK-CMP-SCOPE-001",
+            booking_status="Active",
+        )
+        complaint = self._create_complaint(
+            partner=self.partner_b,
+            package=self.package_b,
+            booking=booking,
+            status_value="Open",
+            ticket="CMP-SCOPE-OPEN",
+        )
+
+        request = self._authenticated_request(
+            self.factory.post(
+                "/bookings/give_feedback_on_complaints/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "complaint_id": str(complaint.complaint_id),
+                    "complaint_status": "InProgress",
+                    "response_message": "Attempting unauthorized update",
+                },
+                format="json",
+            )
+        )
+
+        response = GiveUpdateOnComplaintsView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        complaint.refresh_from_db()
+        self.assertEqual(complaint.complaint_status, "Open")
+
+    def test_complaint_status_update_allows_sequential_transition(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-CMP-SEQUENCE-001",
+            booking_status="Active",
+        )
+        complaint = self._create_complaint(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking=booking,
+            status_value="Open",
+            ticket="CMP-SEQUENCE-OPEN",
+        )
+
+        request = self._authenticated_request(
+            self.factory.post(
+                "/bookings/give_feedback_on_complaints/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "complaint_id": str(complaint.complaint_id),
+                    "complaint_status": "InProgress",
+                    "response_message": "Complaint is now under review.",
+                },
+                format="json",
+            )
+        )
+
+        response = GiveUpdateOnComplaintsView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        complaint.refresh_from_db()
+        self.assertEqual(complaint.complaint_status, "InProgress")
+        self.assertEqual(complaint.response_message, "Complaint is now under review.")
 
     @patch("booking.manage_partner_booking.send_booking_documents_email")
     def test_manage_booking_documents_rejects_invalid_document_type(

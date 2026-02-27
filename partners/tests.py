@@ -6,7 +6,11 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIRequestFactory, APITransactionTestCase
 
-from .models import HuzBasicDetail, PartnerProfile
+from .models import HuzBasicDetail, PartnerProfile, Wallet, PartnerTransactionHistory
+from .partner_accounts_and_transactions import (
+    GetPartnerAllTransactionHistoryView,
+    GetPartnerTransactionOverallSummaryView,
+)
 from .package_management_operator import (
     GetHuzPackageDetailByTokenView,
     GetHuzShortPackageByTokenView,
@@ -175,3 +179,68 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
         results = response.data.get("results") or []
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].get("huz_token"), self.completed_package.huz_token)
+
+
+class PartnerWalletEndpointAccessTests(APITransactionTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        ensure_tables_for_apps(["common", "partners", "booking"])
+
+    def setUp(self):
+        self.factory = APIRequestFactory()
+        self.partner = PartnerProfile.objects.create(
+            partner_session_token="partner-wallet-session-token",
+            user_name="partner-wallet-user",
+            name="Wallet Partner",
+            partner_type="Company",
+            account_status="Active",
+        )
+        self.wallet = Wallet.objects.create(
+            wallet_code="wallet-code-partner-wallet-tests",
+            wallet_session=self.partner,
+        )
+        PartnerTransactionHistory.objects.create(
+            transaction_code="credit-code-1",
+            transaction_amount=250.0,
+            transaction_type="Credit",
+            transaction_for_partner=self.partner,
+            transaction_wallet_token=self.wallet,
+        )
+        PartnerTransactionHistory.objects.create(
+            transaction_code="debit-code-1",
+            transaction_amount=80.0,
+            transaction_type="Debit",
+            transaction_for_partner=self.partner,
+            transaction_wallet_token=self.wallet,
+        )
+
+    def test_transaction_summary_endpoint_works_without_admin_auth(self):
+        request = self.factory.get(
+            "/partner/get_partner_over_transaction_amount/",
+            {"partner_session_token": self.partner.partner_session_token},
+        )
+
+        response = GetPartnerTransactionOverallSummaryView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("credit_transaction_amount"), 250.0)
+        self.assertEqual(response.data.get("debit_transaction_amount"), 80.0)
+        self.assertEqual(response.data.get("credit_number_transactions"), 1)
+        self.assertEqual(response.data.get("debit_number_transactions"), 1)
+
+    def test_transaction_history_endpoint_works_without_admin_auth(self):
+        request = self.factory.get(
+            "/partner/get_partner_all_transaction_history/",
+            {"partner_session_token": self.partner.partner_session_token},
+        )
+
+        response = GetPartnerAllTransactionHistoryView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 2)
+
+    def test_transaction_summary_requires_partner_session_token(self):
+        request = self.factory.get("/partner/get_partner_over_transaction_amount/")
+
+        response = GetPartnerTransactionOverallSummaryView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data.get("message"), "Missing user information.")
