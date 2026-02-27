@@ -7,7 +7,10 @@ from rest_framework import status
 from rest_framework.test import APIRequestFactory, APITransactionTestCase
 
 from .models import HuzBasicDetail, PartnerProfile
-from .package_management_operator import GetHuzPackageDetailByTokenView
+from .package_management_operator import (
+    GetHuzPackageDetailByTokenView,
+    GetHuzShortPackageByTokenView,
+)
 
 
 def ensure_tables_for_apps(app_labels):
@@ -59,6 +62,13 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
             partner_type="Company",
             account_status="Active",
         )
+        self.other_partner = PartnerProfile.objects.create(
+            partner_session_token="partner-package-session-token-2",
+            user_name="partner-package-user-2",
+            name="Package Partner 2",
+            partner_type="Company",
+            account_status="Active",
+        )
 
         start_date = timezone.now() + timedelta(days=10)
         end_date = start_date + timedelta(days=7)
@@ -72,6 +82,33 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
             package_status="Active",
             package_provider=self.partner,
         )
+        self.completed_package = HuzBasicDetail.objects.create(
+            huz_token="package-huz-token-002",
+            package_type="Hajj",
+            package_name="Sacred Journey Package",
+            start_date=start_date + timedelta(days=3),
+            end_date=end_date + timedelta(days=3),
+            description="Premium sacred package",
+            package_status="Completed",
+            package_provider=self.partner,
+        )
+        self.other_partner_package = HuzBasicDetail.objects.create(
+            huz_token="package-huz-token-003",
+            package_type="Hajj",
+            package_name="Other Partner Package",
+            start_date=start_date,
+            end_date=end_date,
+            description="Should never appear in partner 1 queries",
+            package_status="Active",
+            package_provider=self.other_partner,
+        )
+
+    def _request_short_packages(self, **query_params):
+        request = self.factory.get(
+            "/partner/get_package_short_detail_by_partner_token/",
+            query_params,
+        )
+        return GetHuzShortPackageByTokenView.as_view()(request)
 
     def test_get_package_detail_returns_single_item_list(self):
         request = self.factory.get(
@@ -100,3 +137,41 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
         response = GetHuzPackageDetailByTokenView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
         self.assertEqual(response.data.get("message"), "Package do not exist.")
+
+    def test_get_short_packages_are_scoped_to_partner(self):
+        response = self._request_short_packages(
+            partner_session_token=self.partner.partner_session_token,
+            package_type="Hajj",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.data.get("results") or []
+        returned_tokens = {item.get("huz_token") for item in results}
+
+        self.assertIn(self.package.huz_token, returned_tokens)
+        self.assertIn(self.completed_package.huz_token, returned_tokens)
+        self.assertNotIn(self.other_partner_package.huz_token, returned_tokens)
+
+    def test_get_short_packages_supports_text_search(self):
+        response = self._request_short_packages(
+            partner_session_token=self.partner.partner_session_token,
+            package_type="Hajj",
+            search="sacred",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.data.get("results") or []
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].get("huz_token"), self.completed_package.huz_token)
+
+    def test_get_short_packages_normalize_status_filter(self):
+        response = self._request_short_packages(
+            partner_session_token=self.partner.partner_session_token,
+            package_type="Hajj",
+            package_status="completed",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.data.get("results") or []
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].get("huz_token"), self.completed_package.huz_token)

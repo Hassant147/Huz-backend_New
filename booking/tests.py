@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from django.apps import apps
 from django.contrib.auth import get_user_model
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection
 from django.utils import timezone
 from rest_framework import status
@@ -12,12 +13,15 @@ from common.models import UserProfile
 from partners.models import HuzBasicDetail, PartnerProfile
 
 from .manage_partner_booking import (
+    BookingAirlineDetailsView,
+    BookingHotelAndTransportDetailsView,
     CloseBookingView,
     GetBookingShortDetailForPartnersView,
+    ManageBookingDocumentsView,
     ReportBookingView,
     TakeActionView,
 )
-from .models import Booking, BookingObjections, PassportValidity
+from .models import Booking, BookingAirlineDetail, BookingObjections, PassportValidity
 
 
 def ensure_tables_for_apps(app_labels):
@@ -180,6 +184,184 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         response = GetBookingShortDetailForPartnersView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data.get("count"), 1)
+
+    def test_booking_list_filters_by_booking_number(self):
+        matching_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-FILTER-001",
+            booking_status="Active",
+        )
+        self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-FILTER-999",
+            booking_status="Active",
+        )
+
+        request = self._authenticated_request(
+            self.factory.get(
+                "/bookings/get_all_booking_detail_for_partner/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "booking_status": "Active",
+                    "booking_number": "001",
+                    "page": 1,
+                    "page_size": 10,
+                },
+            )
+        )
+
+        response = GetBookingShortDetailForPartnersView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 1)
+        self.assertEqual(
+            response.data.get("results")[0].get("booking_number"),
+            matching_booking.booking_number,
+        )
+
+    @patch("booking.manage_partner_booking.send_booking_documents_email")
+    def test_manage_booking_documents_rejects_invalid_document_type(
+        self, mocked_send_booking_documents
+    ):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-DOC-INVALID-001",
+            booking_status="Active",
+        )
+        upload_file = SimpleUploadedFile(
+            "sample.pdf",
+            b"%PDF-1.4 test payload",
+            content_type="application/pdf",
+        )
+
+        request = self._authenticated_request(
+            self.factory.post(
+                "/bookings/manage_booking_documents/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "booking_number": booking.booking_number,
+                    "document_for": "passport",
+                    "document_link": upload_file,
+                },
+                format="multipart",
+            )
+        )
+
+        response = ManageBookingDocumentsView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Invalid document_for", response.data.get("message", ""))
+        mocked_send_booking_documents.assert_not_called()
+
+    def test_hotel_transport_post_requires_booking_number(self):
+        request = self._authenticated_request(
+            self.factory.post(
+                "/bookings/manage_booking_hotel_or_transport_details/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "jeddah_name": "J Name",
+                    "jeddah_number": "+123",
+                    "mecca_name": "M Name",
+                    "mecca_number": "+456",
+                    "madinah_name": "Md Name",
+                    "madinah_number": "+789",
+                    "comment_1": "note 1",
+                    "comment_2": "note 2",
+                    "detail_for": "Hotel",
+                },
+                format="json",
+            )
+        )
+
+        response = BookingHotelAndTransportDetailsView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Booking number", response.data.get("message", ""))
+
+    def test_hotel_transport_post_rejects_invalid_detail_for(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-DETAIL-INVALID-001",
+            booking_status="Active",
+        )
+
+        request = self._authenticated_request(
+            self.factory.post(
+                "/bookings/manage_booking_hotel_or_transport_details/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "booking_number": booking.booking_number,
+                    "jeddah_name": "J Name",
+                    "jeddah_number": "+123",
+                    "mecca_name": "M Name",
+                    "mecca_number": "+456",
+                    "madinah_name": "Md Name",
+                    "madinah_number": "+789",
+                    "comment_1": "note 1",
+                    "comment_2": "note 2",
+                    "detail_for": "Bus",
+                },
+                format="json",
+            )
+        )
+
+        response = BookingHotelAndTransportDetailsView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Invalid detail_for", response.data.get("message", ""))
+
+    def test_airline_put_is_scoped_to_booking_airline_id(self):
+        booking_a = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-AIRLINE-A-001",
+            booking_status="Active",
+        )
+        booking_b = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-AIRLINE-B-001",
+            booking_status="Active",
+        )
+
+        own_airline = BookingAirlineDetail.objects.create(
+            flight_date=timezone.now(),
+            flight_time="10:00:00",
+            flight_from="From-A",
+            flight_to="To-A",
+            airline_for_booking=booking_a,
+        )
+        other_airline = BookingAirlineDetail.objects.create(
+            flight_date=timezone.now(),
+            flight_time="11:00:00",
+            flight_from="From-B",
+            flight_to="To-B",
+            airline_for_booking=booking_b,
+        )
+
+        request = self._authenticated_request(
+            self.factory.put(
+                "/bookings/manage_booking_airline_details/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "booking_airline_id": str(other_airline.booking_airline_id),
+                    "booking_number": booking_a.booking_number,
+                    "flight_date": timezone.now().isoformat(),
+                    "flight_time": "15:30:00",
+                    "flight_from": "Updated-From",
+                    "flight_to": "Updated-To",
+                },
+                format="json",
+            )
+        )
+
+        response = BookingAirlineDetailsView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(response.data.get("message"), "Airline details not found.")
+
+        own_airline.refresh_from_db()
+        self.assertEqual(own_airline.flight_from, "From-A")
+        self.assertEqual(own_airline.flight_to, "To-A")
 
     def test_close_booking_is_scoped_to_partner(self):
         other_partner_booking = self._create_booking(

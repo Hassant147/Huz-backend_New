@@ -1717,6 +1717,12 @@ class GetHuzShortPackageByTokenView(OperatorPackageBaseView):
                 description="Optional status filter",
                 type=openapi.TYPE_STRING,
             ),
+            openapi.Parameter(
+                "search",
+                openapi.IN_QUERY,
+                description="Optional text search against package name, token, and description",
+                type=openapi.TYPE_STRING,
+            ),
             openapi.Parameter("page", openapi.IN_QUERY, type=openapi.TYPE_INTEGER),
             openapi.Parameter("page_size", openapi.IN_QUERY, type=openapi.TYPE_INTEGER),
         ],
@@ -1746,6 +1752,15 @@ class GetHuzShortPackageByTokenView(OperatorPackageBaseView):
                 package_type=normalized_package_type,
             ).order_by("-created_time")
 
+            search_query = (request.GET.get("search") or "").strip()
+            if search_query:
+                safe_query = search_query[:100]
+                queryset = queryset.filter(
+                    Q(package_name__icontains=safe_query)
+                    | Q(huz_token__icontains=safe_query)
+                    | Q(description__icontains=safe_query)
+                )
+
             package_status = request.GET.get("package_status")
             if package_status and str(package_status).strip().lower() != "all":
                 raw_statuses = [
@@ -1753,7 +1768,8 @@ class GetHuzShortPackageByTokenView(OperatorPackageBaseView):
                 ]
                 normalized_statuses = []
                 for item in raw_statuses:
-                    normalized_statuses.append(STATUS_NORMALIZER.get(item.lower(), item))
+                    normalized_status = STATUS_NORMALIZER.get(item.lower())
+                    normalized_statuses.append(normalized_status or item)
                 queryset = queryset.filter(package_status__in=normalized_statuses)
 
             paginator = CustomPagination()
