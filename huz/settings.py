@@ -13,6 +13,7 @@ https://docs.djangoproject.com/en/5.0/ref/settings/
 from pathlib import Path
 import os
 from decouple import config, Csv
+from corsheaders.defaults import default_headers
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -118,6 +119,16 @@ CORS_ALLOWED_ORIGIN_REGEXES = config(
     default=(
         r'^https://[a-z0-9-]+\.ngrok-free\.app$,'
         r'^https://[a-z0-9-]+\.ngrok\.io$'
+    )
+)
+extra_cors_allow_headers = config("CORS_ALLOW_HEADERS", cast=Csv(), default="")
+CORS_ALLOW_HEADERS = list(
+    dict.fromkeys(
+        [
+            *(str(header).strip().lower() for header in default_headers),
+            *(str(header).strip().lower() for header in extra_cors_allow_headers if str(header).strip()),
+            "x-partner-session",
+        ]
     )
 )
 

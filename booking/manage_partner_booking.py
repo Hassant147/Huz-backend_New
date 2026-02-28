@@ -1506,10 +1506,21 @@ class PartnersBookingPaymentView(APIView):
                 return Response({"message": "User not found for the provided session token."},
                                 status=status.HTTP_404_NOT_FOUND)
 
-            partner_payments = PartnersBookingPayment.objects.filter(payment_for_partner=user)
+            partner_payments = (
+                PartnersBookingPayment.objects.select_related(
+                    "payment_for_booking",
+                    "payment_for_package",
+                    "payment_for_partner",
+                )
+                .prefetch_related("payment_for_partner__company_of_partner")
+                .filter(payment_for_partner=user)
+                .order_by("-create_date")
+            )
 
-            serialized_payments = PartnersBookingPaymentSerializer(partner_payments, many=True)
-            return Response(serialized_payments.data, status=status.HTTP_200_OK)
+            paginator = CustomPagination()
+            paginated_payments = paginator.paginate_queryset(partner_payments, request)
+            serialized_payments = PartnersBookingPaymentSerializer(paginated_payments, many=True)
+            return paginator.get_paginated_response(serialized_payments.data)
 
         except Exception as e:
             logger.error(f"Error in PartnersBookingPaymentView: {str(e)}", exc_info=True)

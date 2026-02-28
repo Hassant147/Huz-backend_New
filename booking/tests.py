@@ -22,6 +22,7 @@ from .manage_partner_booking import (
     GetPartnerComplaintsView,
     GetPartnersOverallBookingStatisticsView,
     GetBookingShortDetailForPartnersView,
+    PartnersBookingPaymentView,
     GetYearlyBookingStatisticsView,
     GiveUpdateOnComplaintsView,
     ManageBookingDocumentsView,
@@ -29,7 +30,15 @@ from .manage_partner_booking import (
     TakeActionView,
 )
 from .manage_bookings import BookingRatingAndReviewView, BookingComplaintsView
-from .models import Booking, BookingAirlineDetail, BookingComplaints, BookingObjections, PassportValidity, BookingRatingAndReview
+from .models import (
+    Booking,
+    BookingAirlineDetail,
+    BookingComplaints,
+    BookingObjections,
+    PassportValidity,
+    BookingRatingAndReview,
+    PartnersBookingPayment,
+)
 
 
 def ensure_tables_for_apps(app_labels):
@@ -799,6 +808,77 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertIn("Cancel", response.data)
         self.assertEqual(response.data.get("Passport_Validation"), 1)
         self.assertEqual(response.data.get("Cancel"), 1)
+
+    def test_receivable_payment_statistics_returns_paginated_empty_payload(self):
+        request = self._authenticated_request(
+            self.factory.get(
+                "/bookings/get_receivable_payment_statistics/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "page": 1,
+                    "page_size": 10,
+                },
+            )
+        )
+
+        response = PartnersBookingPaymentView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 0)
+        self.assertEqual(response.data.get("results"), [])
+
+    def test_receivable_payment_statistics_are_scoped_to_partner(self):
+        partner_a_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-REC-A-001",
+            booking_status="Completed",
+        )
+        partner_b_booking = self._create_booking(
+            partner=self.partner_b,
+            package=self.package_b,
+            booking_number="BK-REC-B-001",
+            booking_status="Completed",
+        )
+
+        PartnersBookingPayment.objects.create(
+            receivable_amount=1000.0,
+            pending_amount=100.0,
+            processed_amount=0.0,
+            payment_status="NotPaid",
+            payment_for_partner=self.partner_a,
+            payment_for_package=self.package_a,
+            payment_for_booking=partner_a_booking,
+        )
+        PartnersBookingPayment.objects.create(
+            receivable_amount=500.0,
+            pending_amount=50.0,
+            processed_amount=0.0,
+            payment_status="NotPaid",
+            payment_for_partner=self.partner_b,
+            payment_for_package=self.package_b,
+            payment_for_booking=partner_b_booking,
+        )
+
+        request = self._authenticated_request(
+            self.factory.get(
+                "/bookings/get_receivable_payment_statistics/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "page": 1,
+                    "page_size": 10,
+                },
+            )
+        )
+
+        response = PartnersBookingPaymentView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 1)
+
+        results = response.data.get("results") or []
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].get("booking_number"), partner_a_booking.booking_number)
+        self.assertEqual(results[0].get("partner_session_token"), self.partner_a.partner_session_token)
+        self.assertEqual(float(results[0].get("receivable_amount")), 1000.0)
 
     def test_overall_rating_distribution_normalizes_decimal_ratings(self):
         booking_one = self._create_booking(
