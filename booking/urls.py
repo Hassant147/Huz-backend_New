@@ -1,14 +1,15 @@
 from django.urls import path
 from . import manage_bookings, manage_partner_booking, custom_request
+from .views import bookings as booking_views, passports as passport_views, payments as payment_views
 
 urlpatterns = [
     # User Section
-    path('create_booking_view/', manage_bookings.ManageBookingsView.as_view()),
-    path('check_passport_validity/', manage_bookings.ManagePassportValidityView.as_view()),
-    path('get_all_booking_short_detail_by_user/', manage_bookings.GetAllBookingsByUserView.as_view()),
-    path('pay_booking_amount_by_transaction_number/', manage_bookings.PaidAmountByTransactionNumberView.as_view()),
-    path('pay_booking_amount_by_transaction_photo/', manage_bookings.PaidAmountTransactionPhotoView.as_view()),
-    path('delete_payment_record/', manage_bookings.DeleteAmountTransactionPhotoView.as_view()),
+    path('create_booking_view/', booking_views.ManageBookingsView.as_view()),
+    path('check_passport_validity/', passport_views.ManagePassportValidityView.as_view()),
+    path('get_all_booking_short_detail_by_user/', booking_views.GetAllBookingsByUserView.as_view()),
+    path('pay_booking_amount_by_transaction_number/', payment_views.PaidAmountByTransactionNumberView.as_view()),
+    path('pay_booking_amount_by_transaction_photo/', payment_views.PaidAmountTransactionPhotoView.as_view()),
+    path('delete_payment_record/', payment_views.DeleteAmountTransactionPhotoView.as_view()),
     # path('manage_passport_and_photo/', manage_bookings.ManageUserRequiredDocumentsView.as_view()),
     path('manage_user_passport/', manage_bookings.ManageUserPassportView.as_view()),
     path('manage_user_passport_photo/', manage_bookings.ManageUserPassportPhotoView.as_view()),

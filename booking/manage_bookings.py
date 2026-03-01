@@ -1,15 +1,35 @@
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAdminUser
+from rest_framework.exceptions import APIException, AuthenticationFailed
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
 from django.db import transaction
+from common.auth_utils import require_user_profile
+from common.permissions import IsAdminOrAuthenticatedUserProfile
 from common.utility import user_new_booking_email, validate_required_fields, check_file_format_and_size, save_file_in_directory, delete_file_from_directory, send_new_order_email, send_complaint_email
 from common.logs_file import logger
 from common.models import UserProfile
 from partners.models import PartnerProfile, HuzBasicDetail
 from .models import BookingRequest, Booking, PassportValidity, BookingObjections, DocumentsStatus, Payment, UserRequiredDocuments, BookingRatingAndReview, BookingComplaints
-from .serializers import BookingRequestSerializer, ShortBookingSerializer, DetailBookingSerializer, PassportValiditySerializer, PaymentSerializer, BookingComplaintsSerializer
+from .serializers import BookingRequestSerializer, ShortBookingSerializer, DetailBookingSerializer, BookingComplaintsSerializer
+from .request_serializers import (
+    BookingCreateRequestSerializer,
+    BookingPaymentCreateRequestSerializer,
+    BookingPaymentUpdateRequestSerializer,
+    PassportValidityCreateRequestSerializer,
+    PassportValidityUpdateRequestSerializer,
+    validate_serializer_or_raise,
+)
+from .services import (
+    create_booking,
+    get_user_bookings_queryset,
+    record_booking_payment,
+    update_booking_payment,
+    validate_passport as create_passport_validation,
+    update_passport_validation,
+)
+from .manage_partner_booking import get_partner_bookings_queryset
 import random
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
@@ -73,63 +93,15 @@ class ManageBookingsView(APIView):
         }
     )
     def post(self, request, *args, **kwargs):
-
         try:
-            data = request.data
-            required_fields = ['session_token', 'partner_session_token', 'huz_token', 'adults', 'child', 'infants',
-                               'sharing', 'quad', 'triple', 'double', 'single', 'start_date', 'end_date', 'total_price',
-                               'special_request', 'payment_type']
+            input_serializer = BookingCreateRequestSerializer(data=request.data)
+            validated_data = validate_serializer_or_raise(input_serializer)
+            booking = create_booking(validated_data)
+            serialized_booking = DetailBookingSerializer(booking)
+            return Response(serialized_booking.data, status=status.HTTP_201_CREATED)
 
-            error_response = validate_required_fields(required_fields, data)
-            if error_response:
-                return error_response
-
-            # Retrieve user by session token
-            user = UserProfile.objects.filter(session_token=data.get('session_token')).first()
-            if not user:
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Retrieve partner by session token
-            partner_detail = PartnerProfile.objects.filter(partner_session_token=data.get('partner_session_token')).first()
-            if not partner_detail:
-                return Response({"message": "Package provider detail not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Retrieve package by huz token
-            package_detail = HuzBasicDetail.objects.filter(huz_token=data.get('huz_token')).first()
-            if not package_detail:
-                return Response({"message": "Package detail not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            # calculate total cost of package
-            # total_cost = self.calculate_total_cost(package_detail, data)
-
-            # Remove session tokens from data
-            for key in ['partner_session_token', 'session_token', 'huz_token']:
-                data.pop(key, None)
-
-            # Set default booking status and relations
-            data['booking_status'] = "Initialize"
-            data['total_price'] = data.get('total_price')
-            data['order_by'] = user.user_id
-            data['order_to'] = partner_detail.partner_id
-            data['package_token'] = package_detail.huz_id
-            data['booking_number'] = self.generate_unique_booking_number()
-
-            serializer = ShortBookingSerializer(data=data)
-            if not serializer.is_valid():
-                first_error_field = next(iter(serializer.errors))
-                first_error_message = f"{first_error_field}: {serializer.errors[first_error_field][0]}"
-                return Response({"message": first_error_message}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Create booking and related document status within an atomic transaction
-            with transaction.atomic():
-                booking = serializer.save()
-                DocumentsStatus.objects.create(status_for_booking=booking)
-                serialized_booking = DetailBookingSerializer(booking)
-                # user_new_booking_email(user.email, user.name, package_detail.package_type, package_detail.package_name,
-                #                        booking.booking_number, booking.adults, booking.child, booking.infants,
-                #                        booking.start_date, booking.total_amount)
-                return Response(serialized_booking.data, status=status.HTTP_201_CREATED)
-
+        except APIException:
+            raise
         except Exception as e:
             # Log the error and return a failure response
             logger.error(f"Post - ManageBookingsView: {str(e)}")
@@ -247,13 +219,6 @@ class ManageBookingsView(APIView):
             total_cost += calculate_individual_cost(room_type_costs[room_type], data.get('adults', 0))
 
         return total_cost
-
-    def generate_unique_booking_number(self):
-        while True:
-            booking_number = random.randint(1000000000, 9999999999)
-            if not Booking.objects.filter(booking_number=booking_number).exists():
-                return booking_number
-
 
     @swagger_auto_schema(
         operation_description="Retrieve booking details by user session token and booking number.",
@@ -377,57 +342,14 @@ class ManagePassportValidityView(APIView):
     )
     def post(self, request, *args, **kwargs):
         try:
-            data = request.data
-            required_fields = ['session_token', 'booking_number', 'passport_number', 'passport_country', 'first_name',  'last_name', 'date_of_birth', 'expiry_date']
+            input_serializer = PassportValidityCreateRequestSerializer(data=request.data)
+            validated_data = validate_serializer_or_raise(input_serializer)
+            booking_detail = create_passport_validation(validated_data)
+            serialized_booking = DetailBookingSerializer(booking_detail)
+            return Response(serialized_booking.data, status=status.HTTP_201_CREATED)
 
-            error_response = validate_required_fields(required_fields, data)
-            if error_response:
-                return error_response
-
-            # Find the user by session token
-            user = UserProfile.objects.filter(session_token=data.get('session_token')).first()
-            if not user:
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Find the booking detail by user and booking number
-            booking_detail = Booking.objects.filter(order_by=user, booking_number=data.get('booking_number')).first()
-            if not booking_detail:
-                return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Check if passport detail already exists
-            check_passport = PassportValidity.objects.filter(passport_for_booking_number=booking_detail, passport_number=data.get('passport_number')).first()
-            if check_passport:
-                return Response({"message": "Passport detail already exists."}, status=status.HTTP_409_CONFLICT)
-
-            # Remove session_token and booking_number from data
-            for key in ['session_token', 'booking_number']:
-                data.pop(key, None)
-
-            # Add booking token to data
-            data['passport_for_booking_number'] = booking_detail
-
-            # Validate and save the payment transaction
-            serializer = PassportValiditySerializer(data=data)
-            if not serializer.is_valid():
-                # Returning first error
-                first_error_field = next(iter(serializer.errors))
-                first_error_message = f"{first_error_field}: {serializer.errors[first_error_field][0]}"
-                return Response({"message": first_error_message}, status=status.HTTP_400_BAD_REQUEST)
-
-            try:
-                with transaction.atomic():
-                    # Create the payment and update booking status
-                    serializer.create(data)
-                    booking_detail.booking_status = "Passport_Validation"
-                    booking_detail.save()
-
-                    # Serialize the updated booking detail
-                    serialized_booking = DetailBookingSerializer(booking_detail)
-                    return Response(serialized_booking.data, status=status.HTTP_201_CREATED)
-            except Exception as e:
-                logger.error(f"ManagePassportValidityView encountered an error: {str(e)}")
-                return Response({"message": "Failed to create Passport validity request. Try again."}, status=status.HTTP_400_BAD_REQUEST)
-
+        except APIException:
+            raise
         except Exception as e:
             # Log the exception and return an error response
             logger.error(f"Error in ManagePassportValidityView: {str(e)}")
@@ -461,64 +383,21 @@ class ManagePassportValidityView(APIView):
     )
     def put(self, request, *args, **kwargs):
         try:
-            data = request.data
-            required_fields = ['session_token', 'booking_number',  'first_name',  'last_name', 'date_of_birth', 'passport_id', 'passport_number', 'passport_country', 'expiry_date']
-            error_response = validate_required_fields(required_fields, data)
-            if error_response:
-                return error_response
+            input_serializer = PassportValidityUpdateRequestSerializer(data=request.data)
+            validated_data = validate_serializer_or_raise(input_serializer)
+            booking_detail = update_passport_validation(validated_data)
+            serialized_booking = DetailBookingSerializer(booking_detail)
+            return Response(serialized_booking.data, status=status.HTTP_200_OK)
 
-            # Find the user by session token
-            user = UserProfile.objects.filter(session_token=data.get('session_token')).first()
-            if not user:
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Find the booking detail by user and booking number
-            booking_detail = Booking.objects.filter(order_by=user, booking_number=data.get('booking_number')).first()
-            if not booking_detail:
-                return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Check if passport detail already exists
-            check_passport = PassportValidity.objects.filter(passport_id=data.get('passport_id')).first()
-            if not check_passport:
-                return Response({"message": "Passport detail not exists."}, status=status.HTTP_409_CONFLICT)
-
-            # Update the passport detail
-            serializer = PassportValiditySerializer(check_passport, data=data, partial=True)
-            if not serializer.is_valid():
-                # Returning first error
-                first_error_field = next(iter(serializer.errors))
-                first_error_message = f"{first_error_field}: {serializer.errors[first_error_field][0]}"
-                return Response({"message": first_error_message}, status=status.HTTP_400_BAD_REQUEST)
-
-            try:
-                with transaction.atomic():
-                    # Update the passport validity entry
-                    serializer.save()
-                    traveller_status = PassportValidity.objects.filter(passport_for_booking_number=booking_detail)
-                    is_completed = True  # Start by assuming all records are filled
-                    for passport in traveller_status:
-                        if not passport.user_passport or not passport.user_photo or not passport.first_name or not passport.last_name or not passport.date_of_birth or not passport.passport_number or not passport.passport_country or not passport.expiry_date:
-                            is_completed = False
-                            break
-                    # Update the booking status if all documents are completed
-                    if is_completed:
-                        booking_detail.booking_status = "Pending"
-                        booking_detail.save()
-
-                    serialized_booking = DetailBookingSerializer(check_passport.passport_for_booking_number)
-                    return Response(serialized_booking.data, status=status.HTTP_200_OK)
-
-            except Exception as e:
-                logger.error(f"ManagePassportValidityView PUT encountered an error: {str(e)}")
-                return Response({"message": "Failed to update Passport validity request. Try again."}, status=status.HTTP_400_BAD_REQUEST)
-
+        except APIException:
+            raise
         except Exception as e:
             logger.error(f"Error in ManagePassportValidityView PUT: {str(e)}")
             return Response({"message": "Failed to update passport validity request. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class GetAllBookingsByUserView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrAuthenticatedUserProfile]
 
     @swagger_auto_schema(
         operation_description="Get all bookings detail for a user",
@@ -535,27 +414,23 @@ class GetAllBookingsByUserView(APIView):
     )
     def get(self, request):
         try:
-            # Retrieve the session token from the request
-            session_token = self.request.GET.get('session_token', None)
-
-            # Check if session token is provided
-            if not session_token:
-                return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Find the user by session token
-            user = UserProfile.objects.filter(session_token=session_token).first()
-            if not user:
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+            user = require_user_profile(request)
 
             # Retrieve all bookings for the user
-            bookings = Booking.objects.filter(order_by=user)
-            if not bookings:
+            bookings = get_user_bookings_queryset(user)
+            if not bookings.exists():
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Serialize the booking details
-            serialized_bookings = DetailBookingSerializer(bookings, many=True)
+            serialized_bookings = DetailBookingSerializer(
+                bookings,
+                many=True,
+                context={"request": request},
+            )
             return Response(serialized_bookings.data, status=status.HTTP_200_OK)
 
+        except APIException:
+            raise
         except Exception as e:
             # Log the error and return a generic error response
             logger.error(f"GetAllBookingsByUserView: {str(e)}")
@@ -589,68 +464,14 @@ class PaidAmountByTransactionNumberView(APIView):
     )
     def post(self, request, *args, **kwargs):
         try:
-            data = request.data
-            required_fields = ['session_token', 'booking_number', 'transaction_number', 'transaction_amount', 'transaction_type']
+            input_serializer = BookingPaymentCreateRequestSerializer(data=request.data)
+            validated_data = validate_serializer_or_raise(input_serializer)
+            booking_detail = record_booking_payment(validated_data)
+            serialized_booking = DetailBookingSerializer(booking_detail)
+            return Response(serialized_booking.data, status=status.HTTP_201_CREATED)
 
-            error_response = validate_required_fields(required_fields, data)
-            if error_response:
-                return error_response
-
-            # Find the user by session token
-            user = UserProfile.objects.filter(session_token=data.get('session_token')).first()
-            if not user:
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
-            min_start_date = datetime.now().date() + timedelta(days=10)
-            # Find the booking detail by user and booking number
-            booking_detail = Booking.objects.filter(order_by=user, start_date__gte=min_start_date, booking_number=data.get('booking_number')).first()
-            if not booking_detail:
-                return Response({"message": "Booking detail not found or expire."}, status=status.HTTP_404_NOT_FOUND)
-
-            package_detail = HuzBasicDetail.objects.filter(huz_id=booking_detail.package_token.huz_id).first()
-            if not package_detail:
-                return Response({"message": "Package detail not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Check if payment detail already exists
-            check_payment = Payment.objects.filter(booking_token=booking_detail).first()
-
-                # return Response({"message": "Payment detail already exists."}, status=status.HTTP_409_CONFLICT)
-
-            # Remove session_token and booking_number from data
-            for key in ['session_token', 'booking_number']:
-                data.pop(key, None)
-
-            # Add booking token to data
-            data['booking_token'] = booking_detail
-
-            # Validate and save the payment transaction
-            serializer = PaymentSerializer(data=data)
-            if not serializer.is_valid():
-                # Returning first error
-                first_error_field = next(iter(serializer.errors))
-                first_error_message = f"{first_error_field}: {serializer.errors[first_error_field][0]}"
-                return Response({"message": first_error_message}, status=status.HTTP_400_BAD_REQUEST)
-
-            try:
-                with transaction.atomic():
-                    # Create the payment and update booking status
-                    serializer.create(data)
-                    if not check_payment:
-                        booking_detail.booking_status = "Paid"
-                        booking_detail.save()
-
-                        user_new_booking_email(user.email, user.name, package_detail.package_type,
-                                               package_detail.package_name,
-                                               booking_detail.booking_number, booking_detail.adults, booking_detail.child,
-                                               booking_detail.infants,
-                                               booking_detail.start_date, booking_detail.total_price, data.get('transaction_amount'))
-
-                    # Serialize the updated booking detail
-                    serialized_booking = DetailBookingSerializer(booking_detail)
-                    return Response(serialized_booking.data, status=status.HTTP_201_CREATED)
-            except Exception as e:
-                logger.error(f"PaidAmountByTransactionNumberView encountered an error: {str(e)}")
-                return Response({"message": "Failed to create payment request. Try again."}, status=status.HTTP_400_BAD_REQUEST)
-
+        except APIException:
+            raise
         except Exception as e:
             # Log the exception and return an error response
             logger.error(f"Error in PaidAmountByTransactionNumberView: {str(e)}")
@@ -680,57 +501,14 @@ class PaidAmountByTransactionNumberView(APIView):
     )
     def put(self, request, *args, **kwargs):
         try:
-            data = request.data
-            required_fields = ['payment_id', 'session_token', 'booking_number', 'transaction_number', 'transaction_amount', 'transaction_type']
+            input_serializer = BookingPaymentUpdateRequestSerializer(data=request.data)
+            validated_data = validate_serializer_or_raise(input_serializer)
+            booking_detail = update_booking_payment(validated_data)
+            serialized_booking = DetailBookingSerializer(booking_detail)
+            return Response(serialized_booking.data, status=status.HTTP_200_OK)
 
-            error_response = validate_required_fields(required_fields, data)
-            if error_response:
-                return error_response
-
-            # Find the user by session token
-            user = UserProfile.objects.filter(session_token=data.get('session_token')).first()
-            if not user:
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Find the booking detail by user and booking number
-            booking_detail = Booking.objects.filter(order_by=user, booking_number=data.get('booking_number')).first()
-            if not booking_detail:
-                return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Find the payment record by payment ID
-            payment = Payment.objects.filter(payment_id=data.get('payment_id')).first()
-            if not payment:
-                return Response({"message": "Record not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Remove session_token and booking_number from data
-            for key in ['session_token', 'booking_number']:
-                data.pop(key, None)
-
-            # Add booking token to data
-            data['booking_token'] = booking_detail
-
-            # Validate and update the payment transaction
-            serializer = PaymentSerializer(payment, data=data, partial=True)
-            if not serializer.is_valid():
-                # Returning first error
-                first_error_field = next(iter(serializer.errors))
-                first_error_message = f"{first_error_field}: {serializer.errors[first_error_field][0]}"
-                return Response({"message": first_error_message}, status=status.HTTP_400_BAD_REQUEST)
-
-            try:
-                with transaction.atomic():
-                    # Update the payment and booking status
-                    serializer.save()
-                    # booking_detail.booking_status = "Paid"
-                    # booking_detail.save()
-
-                    # Serialize the updated booking detail
-                    serialized_booking = DetailBookingSerializer(booking_detail)
-                    return Response(serialized_booking.data, status=status.HTTP_200_OK)
-            except Exception as e:
-                logger.error(f"Put - PaidAmountTransactionView: {str(e)}")
-                return Response({"message": "Failed to update payment request. Try again."}, status=status.HTTP_400_BAD_REQUEST)
-
+        except APIException:
+            raise
         except Exception as e:
             # Log the exception and return an error response
             logger.error(f"Put - PaidAmountTransactionView: {str(e)}")
@@ -1501,7 +1279,7 @@ class BookingComplaintsView(APIView):
 
 
 class GetUserComplaintsView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrAuthenticatedUserProfile]
 
     @swagger_auto_schema(
         operation_description="Retrieve complaints submitted by a user.",
@@ -1519,14 +1297,7 @@ class GetUserComplaintsView(APIView):
     )
     def get(self, request):
         try:
-            session_token = request.GET.get('session_token')
-            if not session_token:
-                return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Find the user by session token
-            user = UserProfile.objects.filter(session_token=session_token).first()
-            if not user:
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+            user = require_user_profile(request)
 
             # Retrieve complaints submitted by the user
             check_complaint = BookingComplaints.objects.filter(complaint_by_user=user)
@@ -1536,6 +1307,8 @@ class GetUserComplaintsView(APIView):
                 return Response(serialized_complaints.data, status=status.HTTP_200_OK)
 
             return Response({"message": "No complaints found."}, status=status.HTTP_404_NOT_FOUND)
+        except AuthenticationFailed:
+            raise
         except Exception as e:
             # Log the exception with traceback
             logger.error(f"Error in GetUserComplaintsView: {str(e)}", exc_info=True)
@@ -1808,7 +1581,7 @@ class BookingRequestView(APIView):
 
 
 class GetUserRequestsView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrAuthenticatedUserProfile]
 
     @swagger_auto_schema(
         operation_description="Retrieve all request submitted by a user.",
@@ -1826,14 +1599,7 @@ class GetUserRequestsView(APIView):
     )
     def get(self, request):
         try:
-            session_token = request.GET.get('session_token')
-            if not session_token:
-                return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Find the user by session token
-            user = UserProfile.objects.filter(session_token=session_token).first()
-            if not user:
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+            user = require_user_profile(request)
 
             # Retrieve complaints submitted by the user
             check_requests = BookingRequest.objects.filter(request_by_user=user)
@@ -1843,8 +1609,9 @@ class GetUserRequestsView(APIView):
                 return Response(serialized_complaints.data, status=status.HTTP_200_OK)
 
             return Response({"message": "No Request found."}, status=status.HTTP_404_NOT_FOUND)
+        except AuthenticationFailed:
+            raise
         except Exception as e:
             # Log the exception with traceback
             logger.error(f"Error in GetUserRequestsView: {str(e)}", exc_info=True)
             return Response({"message": "An unexpected error occurred."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-

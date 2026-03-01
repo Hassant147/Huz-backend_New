@@ -7,6 +7,7 @@ from .serializers import UserProfileSerializer, UserOTPSerializer, MailingDetail
 import requests
 from .utility import random_six_digits, generate_token, save_notification, delete_file_from_directory, save_file_in_directory, check_photo_format_and_size, validate_required_fields, send_verification_email, new_user_welcome_email, user_subscribe_email
 from .logs_file import logger
+from .throttling import OTPAnonRateThrottle, OTPUserRateThrottle
 from datetime import datetime
 from django.db import transaction
 from rest_framework.parsers import MultiPartParser, FormParser
@@ -72,6 +73,7 @@ class SubscribeAPIView(APIView):
 
 class SendOTPSMSAPIView(APIView):
     permission_classes = [IsAdminUser]
+    throttle_classes = [OTPAnonRateThrottle, OTPUserRateThrottle]
     @swagger_auto_schema(
         operation_description="Send OTP SMS to User",
         request_body=UserOTPSerializer,

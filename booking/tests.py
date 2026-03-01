@@ -29,7 +29,14 @@ from .manage_partner_booking import (
     ReportBookingView,
     TakeActionView,
 )
-from .manage_bookings import BookingRatingAndReviewView, BookingComplaintsView
+from .manage_bookings import (
+    BookingRatingAndReviewView,
+    BookingComplaintsView,
+    GetAllBookingsByUserView,
+    ManageBookingsView,
+    ManagePassportValidityView,
+    PaidAmountByTransactionNumberView,
+)
 from .models import (
     Booking,
     BookingAirlineDetail,
@@ -37,6 +44,7 @@ from .models import (
     BookingObjections,
     PassportValidity,
     BookingRatingAndReview,
+    Payment,
     PartnersBookingPayment,
 )
 
@@ -73,6 +81,404 @@ def ensure_tables_for_apps(app_labels):
             )
 
         pending_models = remaining_models
+
+
+class ManageBookingsUserListViewTests(APITransactionTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        ensure_tables_for_apps(["common", "partners", "booking"])
+
+    def setUp(self):
+        self.factory = APIRequestFactory()
+        self.admin_user = get_user_model().objects.create_user(
+            username="booking-user-list-admin",
+            password="pass123",
+            is_staff=True,
+            is_superuser=True,
+        )
+        self.customer = UserProfile.objects.create(
+            session_token="booking-user-list-session-token",
+            name="Booking User",
+            country_code="+1",
+            phone_number="9991112222",
+            email="booking-user@example.com",
+            user_type="user",
+        )
+        self.empty_customer = UserProfile.objects.create(
+            session_token="booking-empty-session-token",
+            name="Empty Booking User",
+            country_code="+1",
+            phone_number="9993334444",
+            email="empty-booking-user@example.com",
+            user_type="user",
+        )
+        self.other_customer = UserProfile.objects.create(
+            session_token="booking-other-session-token",
+            name="Other Booking User",
+            country_code="+1",
+            phone_number="9995556666",
+            email="other-booking-user@example.com",
+            user_type="user",
+        )
+        self.partner = PartnerProfile.objects.create(
+            partner_session_token="booking-user-list-partner-token",
+            user_name="booking-user-list-partner",
+            name="Booking Partner",
+            partner_type="Company",
+            account_status="Active",
+        )
+        start_date = timezone.now() + timedelta(days=15)
+        end_date = start_date + timedelta(days=5)
+        self.package = HuzBasicDetail.objects.create(
+            huz_token="booking-user-list-package-token",
+            package_type="Hajj",
+            package_name="Booking User Package",
+            start_date=start_date,
+            end_date=end_date,
+            description="Booking list package",
+            package_status="Active",
+            package_provider=self.partner,
+        )
+        self.booking = Booking.objects.create(
+            booking_number="BOOKING-USER-LIST-001",
+            adults=2,
+            child=0,
+            infants=0,
+            sharing="Yes",
+            quad="0",
+            triple="0",
+            double="1",
+            single="0",
+            start_date=start_date,
+            end_date=end_date,
+            total_price=1800,
+            special_request="Window seat",
+            booking_status="Pending",
+            payment_type="Bank",
+            order_by=self.customer,
+            order_to=self.partner,
+            package_token=self.package,
+        )
+        Payment.objects.create(
+            transaction_number="PAY-BOOKING-USER-LIST-001",
+            transaction_type="Full",
+            transaction_amount=1800,
+            payment_status="Pending",
+            booking_token=self.booking,
+        )
+        self.other_booking = Booking.objects.create(
+            booking_number="BOOKING-USER-LIST-002",
+            adults=1,
+            child=0,
+            infants=0,
+            sharing="No",
+            quad="0",
+            triple="0",
+            double="0",
+            single="1",
+            start_date=start_date,
+            end_date=end_date,
+            total_price=900,
+            special_request="None",
+            booking_status="Pending",
+            payment_type="Bank",
+            order_by=self.other_customer,
+            order_to=self.partner,
+            package_token=self.package,
+        )
+
+    def test_get_all_bookings_by_user_returns_legacy_list_shape(self):
+        response = self.client.get(
+            "/bookings/get_all_booking_short_detail_by_user/",
+            {"session_token": self.customer.session_token},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsInstance(response.data, list)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0].get("booking_number"), self.booking.booking_number)
+        self.assertIsInstance(response.data[0].get("payment_detail"), list)
+
+    def test_get_all_bookings_by_user_returns_404_when_user_has_no_bookings(self):
+        response = self.client.get(
+            "/bookings/get_all_booking_short_detail_by_user/",
+            {"session_token": self.empty_customer.session_token},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(response.data.get("message"), "Booking detail not found.")
+
+    def test_get_all_bookings_by_user_accepts_bearer_authorization(self):
+        response = self.client.get(
+            "/bookings/get_all_booking_short_detail_by_user/",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsInstance(response.data, list)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0].get("booking_number"), self.booking.booking_number)
+        self.assertNotIn("X-Auth-Deprecated", response)
+
+    def test_get_all_bookings_by_user_legacy_query_token_sets_deprecation_header(self):
+        response = self.client.get(
+            "/bookings/get_all_booking_short_detail_by_user/",
+            {"session_token": self.customer.session_token},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response["X-Auth-Deprecated"], "session_token_in_query")
+
+    def test_get_all_bookings_by_user_header_auth_cannot_access_other_users_bookings(self):
+        response = self.client.get(
+            "/bookings/get_all_booking_short_detail_by_user/",
+            {"session_token": self.other_customer.session_token},
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsInstance(response.data, list)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0].get("booking_number"), self.booking.booking_number)
+        self.assertNotEqual(response.data[0].get("booking_number"), self.other_booking.booking_number)
+
+
+class BookingWorkflowServiceValidationTests(APITransactionTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        ensure_tables_for_apps(["common", "partners", "booking"])
+
+    def setUp(self):
+        self.factory = APIRequestFactory()
+        self.admin_user = get_user_model().objects.create_user(
+            username="booking-workflow-admin",
+            password="pass123",
+            is_staff=True,
+            is_superuser=True,
+        )
+        self.customer = UserProfile.objects.create(
+            session_token="booking-workflow-user-token",
+            name="Workflow User",
+            country_code="+1",
+            phone_number="1012023030",
+            email="workflow-user@example.com",
+            user_type="user",
+        )
+        self.partner = PartnerProfile.objects.create(
+            partner_session_token="booking-workflow-partner-token",
+            user_name="booking-workflow-partner",
+            name="Workflow Partner",
+            partner_type="Company",
+            account_status="Active",
+        )
+        self.start_date = timezone.now() + timedelta(days=20)
+        self.end_date = self.start_date + timedelta(days=5)
+        self.package = HuzBasicDetail.objects.create(
+            huz_token="booking-workflow-huz-token",
+            package_type="Hajj",
+            package_name="Workflow Package",
+            package_base_cost=1200,
+            cost_for_child=300,
+            cost_for_infants=100,
+            start_date=self.start_date,
+            end_date=self.end_date,
+            description="Workflow package",
+            package_status="Active",
+            package_provider=self.partner,
+        )
+        self.existing_booking = Booking.objects.create(
+            booking_number="BOOKING-WORKFLOW-001",
+            adults=2,
+            child=0,
+            infants=0,
+            sharing="Yes",
+            quad="0",
+            triple="0",
+            double="1",
+            single="0",
+            start_date=self.start_date,
+            end_date=self.end_date,
+            total_price=2400,
+            special_request="Wheelchair support",
+            booking_status="Initialize",
+            payment_type="Bank",
+            order_by=self.customer,
+            order_to=self.partner,
+            package_token=self.package,
+        )
+
+    def _authenticated_request(self, request):
+        force_authenticate(request, user=self.admin_user)
+        return request
+
+    def _booking_payload(self):
+        return {
+            "session_token": self.customer.session_token,
+            "partner_session_token": self.partner.partner_session_token,
+            "huz_token": self.package.huz_token,
+            "adults": 2,
+            "child": 1,
+            "infants": 0,
+            "sharing": "Yes",
+            "quad": "0",
+            "triple": "0",
+            "double": "1",
+            "single": "0",
+            "start_date": self.start_date.isoformat(),
+            "end_date": self.end_date.isoformat(),
+            "total_price": 2700,
+            "special_request": "Closer to Haram",
+            "payment_type": "Bank",
+        }
+
+    def test_create_booking_returns_drf_validation_error_for_missing_required_field(self):
+        payload = self._booking_payload()
+        payload.pop("single")
+        request = self._authenticated_request(
+            self.factory.post("/bookings/manage_booking/", payload, format="json")
+        )
+
+        response = ManageBookingsView.as_view()(request)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("message", response.data)
+        self.assertIn("single", response.data)
+
+    def test_create_booking_preserves_happy_path_response(self):
+        request = self._authenticated_request(
+            self.factory.post("/bookings/manage_booking/", self._booking_payload(), format="json")
+        )
+
+        response = ManageBookingsView.as_view()(request)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertIn("booking_number", response.data)
+        self.assertEqual(response.data.get("user_session_token"), self.customer.session_token)
+
+    def test_payment_validation_returns_400_with_useful_error_payload(self):
+        payload = {
+            "session_token": self.customer.session_token,
+            "booking_number": self.existing_booking.booking_number,
+            "transaction_number": "TRANS-001",
+            "transaction_amount": 2400,
+        }
+        request = self._authenticated_request(
+            self.factory.post(
+                "/bookings/paid_amount_by_transaction_number/",
+                payload,
+                format="json",
+            )
+        )
+
+        response = PaidAmountByTransactionNumberView.as_view()(request)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("message", response.data)
+        self.assertIn("transaction_type", response.data)
+
+    def test_passport_validation_accepts_legacy_date_only_payload(self):
+        payload = {
+            "session_token": self.customer.session_token,
+            "booking_number": self.existing_booking.booking_number,
+            "first_name": "Fatima",
+            "last_name": "Noor",
+            "date_of_birth": "1990-01-10",
+            "passport_number": "P1234567",
+            "passport_country": "US",
+            "expiry_date": "2030-06-01",
+        }
+        request = self._authenticated_request(
+            self.factory.post(
+                "/bookings/manage_passport_validity/",
+                payload,
+                format="json",
+            )
+        )
+
+        response = ManagePassportValidityView.as_view()(request)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.existing_booking.refresh_from_db()
+        self.assertEqual(self.existing_booking.booking_status, "Passport_Validation")
+        self.assertTrue(
+            PassportValidity.objects.filter(
+                passport_for_booking_number=self.existing_booking,
+                passport_number="P1234567",
+            ).exists()
+        )
+
+    def test_v1_users_me_bookings_accepts_bearer_auth(self):
+        response = self.client.get(
+            "/api/v1/users/me/bookings/",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsInstance(response.data, list)
+        self.assertEqual(len(response.data), 1)
+        self.assertEqual(response.data[0].get("booking_number"), self.existing_booking.booking_number)
+
+    def test_v1_create_booking_accepts_bearer_auth_without_legacy_session_token(self):
+        payload = self._booking_payload()
+        payload.pop("session_token")
+
+        response = self.client.post(
+            "/api/v1/bookings/",
+            payload,
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data.get("user_session_token"), self.customer.session_token)
+
+    def test_v1_payment_endpoint_accepts_path_booking_identifier(self):
+        with patch("booking.services.user_new_booking_email"):
+            response = self.client.post(
+                f"/api/v1/bookings/{self.existing_booking.booking_id}/payments/",
+                {
+                    "transaction_number": "V1-TRANS-001",
+                    "transaction_type": "Full",
+                    "transaction_amount": 2400,
+                },
+                format="json",
+                HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.existing_booking.refresh_from_db()
+        self.assertEqual(self.existing_booking.booking_status, "Paid")
+
+    def test_legacy_payment_photo_endpoint_accepts_valid_upload(self):
+        self.client.force_authenticate(user=self.admin_user)
+        payment_file = SimpleUploadedFile(
+            "payment-receipt.pdf",
+            b"legacy-payment-receipt",
+            content_type="application/pdf",
+        )
+
+        with patch("booking.services.user_new_booking_email"):
+            response = self.client.post(
+                "/bookings/pay_booking_amount_by_transaction_photo/",
+                {
+                    "session_token": self.customer.session_token,
+                    "booking_number": self.existing_booking.booking_number,
+                    "transaction_amount": "2400",
+                    "transaction_type": "Full",
+                    "transaction_photo": payment_file,
+                },
+                format="multipart",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            Payment.objects.filter(
+                booking_token=self.existing_booking,
+                transaction_photo__contains="payment_uploads/",
+            ).exists()
+        )
 
 
 class ManagePartnerBookingViewsTests(APITransactionTestCase):

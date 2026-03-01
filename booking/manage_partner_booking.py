@@ -1,12 +1,17 @@
 from django.db.models import Sum, Count, Q
 from django.utils.dateparse import parse_date
 from rest_framework.views import APIView
-from rest_framework.permissions import BasePermission
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from common.utility import CustomPagination, validate_required_fields, check_file_format_and_size, save_file_in_directory, delete_file_from_directory, send_objection_email, send_booking_documents_email
+from common.authentication import (
+    get_authenticated_partner_profile,
+    resolve_authenticated_partner_profile,
+)
+from common.pagination import CustomPagination
+from common.permissions import IsAdminOrAuthenticatedPartnerProfile
+from common.utility import validate_required_fields, check_file_format_and_size, save_file_in_directory, delete_file_from_directory, send_objection_email, send_booking_documents_email
 from common.logs_file import logger
 from partners.models import PartnerProfile, HuzBasicDetail
 from .models import Booking, BookingObjections, PassportValidity, DocumentsStatus, BookingDocuments, PartnersBookingPayment, BookingRatingAndReview, BookingComplaints, BookingAirlineDetail, BookingHotelAndTransport
@@ -16,6 +21,10 @@ from drf_yasg import openapi
 
 
 def extract_partner_session_token(request):
+    authenticated_partner = get_authenticated_partner_profile(request)
+    if authenticated_partner is not None:
+        return str(authenticated_partner.partner_session_token or "").strip()
+
     token = request.query_params.get("partner_session_token")
     if token:
         return str(token).strip()
@@ -33,20 +42,11 @@ def extract_partner_session_token(request):
     return ""
 
 
-class IsAdminOrPartnerSessionToken(BasePermission):
+class IsAdminOrPartnerSessionToken(IsAdminOrAuthenticatedPartnerProfile):
     """
-    Booking partner endpoints are session-token based in this backend.
-    Keep staff access for admin workflows, and allow partner requests that
-    include partner_session_token in query/body.
+    Backward-compatible alias while partner booking endpoints move from
+    raw token presence checks to authenticated partner principals.
     """
-
-    message = "Authentication credentials were not provided."
-
-    def has_permission(self, request, view):
-        user = getattr(request, "user", None)
-        if user and user.is_authenticated and getattr(user, "is_staff", False):
-            return True
-        return bool(extract_partner_session_token(request))
 
 
 VALID_BOOKING_STATUSES = (
@@ -239,8 +239,7 @@ class GetBookingShortDetailForPartnersView(APIView):
     )
     def get(self, request):
         try:
-            # Extract the session token from the query parameters
-            partner_session_token = request.GET.get('partner_session_token')
+            partner_session_token = extract_partner_session_token(request)
             booking_status = request.GET.get('booking_status')
             booking_number = str(request.GET.get('booking_number') or "").strip()
             if not partner_session_token or not booking_status:
@@ -254,8 +253,7 @@ class GetBookingShortDetailForPartnersView(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            # Find the partner user with the provided session token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
+            user = resolve_authenticated_partner_profile(request)
             if not user:
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -270,7 +268,11 @@ class GetBookingShortDetailForPartnersView(APIView):
 
             paginator = CustomPagination()
             paginated_packages = paginator.paginate_queryset(bookings, request)
-            serialized_package = ShortBookingSerializer(paginated_packages, many=True)
+            serialized_package = ShortBookingSerializer(
+                paginated_packages,
+                many=True,
+                context={"request": request},
+            )
             return paginator.get_paginated_response(serialized_package.data)
         except Exception as e:
             logger.error(f"GetBookingShortDetailForPartnersView: {str(e)}")
@@ -296,15 +298,14 @@ class GetBookingDetailByBookingNumberForPartnerView(APIView):
     )
     def get(self, request):
         try:
-            partner_session_token = request.GET.get('partner_session_token')
+            partner_session_token = extract_partner_session_token(request)
             booking_number = request.GET.get('booking_number')
 
             # Check for required parameters
             if not partner_session_token or not booking_number:
                 return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
 
-            # Retrieve user by session token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
+            user = resolve_authenticated_partner_profile(request)
             if not user:
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -1193,7 +1194,7 @@ class GetPartnerComplaintsView(APIView):
     )
     def get(self, request):
         try:
-            partner_session_token = request.GET.get('partner_session_token')
+            partner_session_token = extract_partner_session_token(request)
             complaint_status = request.GET.get('complaint_status')
             complaint_id = str(request.GET.get('complaint_id') or "").strip()
             search = str(request.GET.get('search') or "").strip()
@@ -1231,8 +1232,7 @@ class GetPartnerComplaintsView(APIView):
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-            # Retrieve the partner user using the session token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
+            user = resolve_authenticated_partner_profile(request)
             if not user:
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -1270,7 +1270,11 @@ class GetPartnerComplaintsView(APIView):
 
             paginator = CustomPagination()
             paginated_packages = paginator.paginate_queryset(complaints, request)
-            serialized_package = BookingComplaintsSerializer(paginated_packages, many=True)
+            serialized_package = BookingComplaintsSerializer(
+                paginated_packages,
+                many=True,
+                context={"request": request},
+            )
             return paginator.get_paginated_response(serialized_package.data)
 
         except Exception as e:
@@ -1397,11 +1401,11 @@ class GetPartnersOverallBookingStatisticsView(APIView):
     )
     def get(self, request):
         try:
-            partner_session_token = request.GET.get('partner_session_token')
+            partner_session_token = extract_partner_session_token(request)
             if not partner_session_token:
                 return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
 
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
+            user = resolve_authenticated_partner_profile(request)
             if not user:
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -1443,7 +1447,7 @@ class GetYearlyBookingStatisticsView(APIView):
     )
     def get(self, request):
         try:
-            partner_session_token = request.GET.get('partner_session_token')
+            partner_session_token = extract_partner_session_token(request)
             year_raw = str(request.GET.get('year') or '').strip()
             if not partner_session_token or not year_raw:
                 return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
@@ -1456,7 +1460,7 @@ class GetYearlyBookingStatisticsView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
+            user = resolve_authenticated_partner_profile(request)
             if not user:
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -1497,11 +1501,11 @@ class PartnersBookingPaymentView(APIView):
     def get(self, request):
 
         try:
-            partner_session_token = request.GET.get('partner_session_token')
+            partner_session_token = extract_partner_session_token(request)
             if not partner_session_token:
                 return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
 
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
+            user = resolve_authenticated_partner_profile(request)
             if not user:
                 return Response({"message": "User not found for the provided session token."},
                                 status=status.HTTP_404_NOT_FOUND)
@@ -1519,7 +1523,11 @@ class PartnersBookingPaymentView(APIView):
 
             paginator = CustomPagination()
             paginated_payments = paginator.paginate_queryset(partner_payments, request)
-            serialized_payments = PartnersBookingPaymentSerializer(paginated_payments, many=True)
+            serialized_payments = PartnersBookingPaymentSerializer(
+                paginated_payments,
+                many=True,
+                context={"request": request},
+            )
             return paginator.get_paginated_response(serialized_payments.data)
 
         except Exception as e:

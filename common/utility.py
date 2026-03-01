@@ -10,10 +10,10 @@ from rest_framework.response import Response
 from rest_framework import status
 from .models import ManageNotification, UserTransactionHistory
 from django.core.files.storage import FileSystemStorage
-from rest_framework.pagination import PageNumberPagination
 from django.template.loader import render_to_string
 import threading
 from common.logs_file import logger
+from .pagination import CustomPagination
 
 
 cred = credentials.Certificate("common/firebase.json")
@@ -281,13 +281,6 @@ def preparation_email(email, name, package_type):
     })
     _dispatch_email(email, subject, html_content)
     return "checklist email is being sent"
-
-
-class CustomPagination(PageNumberPagination):
-    page_size = 10  # Default page size
-    page_size_query_param = 'page_size'
-    max_page_size = 100
-
 
 # def CreatePartnerTransaction(transaction_code, transaction_amount, transaction_type, transaction_partner_token, transaction_wallet_token, transaction_description, transaction_for_package):
 #     ln = UserTransactionHistory.objects.create(

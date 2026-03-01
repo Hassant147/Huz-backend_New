@@ -72,9 +72,10 @@ REST_FRAMEWORK = {
        'rest_framework.parsers.MultiPartParser',
     ),
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework.authentication.TokenAuthentication',  # <-- And here
+        'common.authentication.SessionTokenHeaderAuthentication',
         'rest_framework.authentication.BasicAuthentication',
         'rest_framework.authentication.SessionAuthentication',
+        'common.authentication.LegacySessionTokenAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAdminUser',
@@ -84,6 +85,10 @@ REST_FRAMEWORK = {
     'PAGINATE_BY': 10,
 }
 
+# Keep pagination opt-in on legacy APIViews until plain-list ListAPIView
+# endpoints (for example chat inbox/message endpoints) are migrated.
+DEFAULT_API_PAGE_SIZE = 10
+
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -91,6 +96,7 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'common.middleware.LegacyAuthDeprecationHeaderMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',

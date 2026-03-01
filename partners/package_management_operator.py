@@ -3,11 +3,12 @@ from uuid import UUID
 import json
 
 from django.db import transaction
-from django.db.models import Count, Q, Sum
+from django.db.models import Count, FloatField, Q, Sum, Value
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 from rest_framework import serializers, status
-from rest_framework.permissions import AllowAny
+from rest_framework.exceptions import AuthenticationFailed
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -15,8 +16,11 @@ from drf_yasg import openapi
 from drf_yasg.utils import swagger_auto_schema
 
 from booking.models import BookingRatingAndReview
+from common.auth_utils import is_admin_request, require_partner_profile
 from common.logs_file import logger
-from common.utility import CustomPagination, generate_token, random_six_digits
+from common.pagination import CustomPagination
+from common.permissions import IsAdminOrAuthenticatedPartnerProfile
+from common.utility import generate_token, random_six_digits
 from .models import (
     BusinessProfile,
     HuzAirlineDetail,
@@ -413,6 +417,21 @@ class OperatorHuzPackageSerializer(serializers.ModelSerializer):
         if partner_id in rating_cache:
             return rating_cache[partner_id]
 
+        annotated_rating_count = getattr(obj, "partner_rating_total_count", None)
+        annotated_total_stars = getattr(obj, "partner_rating_total_stars", None)
+        if annotated_rating_count is not None or annotated_total_stars is not None:
+            total_stars = float(annotated_total_stars or 0)
+            rating_count = int(annotated_rating_count or 0)
+            average_stars = round(total_stars / rating_count, 1) if rating_count else 0
+
+            result = {
+                "total_stars": total_stars,
+                "rating_count": rating_count,
+                "average_stars": average_stars,
+            }
+            rating_cache[partner_id] = result
+            return result
+
         rating_data = BookingRatingAndReview.objects.filter(
             rating_for_partner=obj.package_provider
         ).aggregate(total_stars=Sum("partner_total_stars"), rating_count=Count("rating_id"))
@@ -456,19 +475,29 @@ class OperatorHuzPackageSerializer(serializers.ModelSerializer):
 
 
 class OperatorPackageBaseView(APIView):
-    permission_classes = [AllowAny]
+    permission_classes = [IsAdminOrAuthenticatedPartnerProfile]
 
     def _get_partner(self, request, require_active=False):
         partner_token = request.data.get("partner_session_token") or request.GET.get(
             "partner_session_token"
         )
-        if not partner_token:
+        partner = None
+        if not is_admin_request(request):
+            try:
+                partner = require_partner_profile(request)
+            except AuthenticationFailed as exc:
+                return None, Response(
+                    {"detail": str(exc)},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
+        elif not partner_token:
             return None, Response(
                 {"message": "Missing user information."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        partner = PartnerProfile.objects.filter(partner_session_token=partner_token).first()
+        if partner is None:
+            partner = PartnerProfile.objects.filter(partner_session_token=partner_token).first()
         if not partner:
             return None, Response(
                 {"message": "User not found with the provided detail."},
@@ -503,8 +532,20 @@ class OperatorPackageBaseView(APIView):
 
     @staticmethod
     def _package_queryset():
-        return HuzBasicDetail.objects.select_related("package_provider").prefetch_related(
-            *PACKAGE_PREFETCH_RELATED
+        return (
+            HuzBasicDetail.objects.select_related("package_provider")
+            .annotate(
+                partner_rating_total_stars=Coalesce(
+                    Sum("package_provider__rating_for_partner__partner_total_stars"),
+                    Value(0.0),
+                    output_field=FloatField(),
+                ),
+                partner_rating_total_count=Count(
+                    "package_provider__rating_for_partner__rating_id",
+                    distinct=True,
+                ),
+            )
+            .prefetch_related(*PACKAGE_PREFETCH_RELATED)
         )
 
     def _get_partner_package(self, partner, huz_token, with_prefetch=False):
@@ -519,7 +560,7 @@ class OperatorPackageBaseView(APIView):
         package_obj = package_obj or package
         return OperatorHuzPackageSerializer(
             package_obj,
-            context={"partner_rating_cache": {}},
+            context={"partner_rating_cache": {}, "request": self.request},
         ).data
 
     @staticmethod
@@ -1777,7 +1818,7 @@ class GetHuzShortPackageByTokenView(OperatorPackageBaseView):
             serializer = OperatorHuzPackageSerializer(
                 paginated_queryset,
                 many=True,
-                context={"partner_rating_cache": {}},
+                context={"partner_rating_cache": {}, "request": request},
             )
             return paginator.get_paginated_response(serializer.data)
         except Exception as exc:
@@ -1837,7 +1878,7 @@ class GetHuzPackageDetailByTokenView(OperatorPackageBaseView):
             serializer = OperatorHuzPackageSerializer(
                 [package],
                 many=True,
-                context={"partner_rating_cache": {}},
+                context={"partner_rating_cache": {}, "request": request},
             )
             return Response(serializer.data, status=status.HTTP_200_OK)
         except Exception as exc:

@@ -6,6 +6,8 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIRequestFactory, APITransactionTestCase
 
+from booking.models import BookingRatingAndReview
+
 from .models import HuzBasicDetail, PartnerProfile, Wallet, PartnerTransactionHistory
 from .partner_accounts_and_transactions import (
     GetPartnerAllTransactionHistoryView,
@@ -180,6 +182,49 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
         results = response.data.get("results") or []
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].get("huz_token"), self.completed_package.huz_token)
+
+    def test_get_short_packages_preserves_paginated_shape_with_rating_summary(self):
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=4,
+            partner_comment="Strong support",
+            rating_for_partner=self.partner,
+            rating_for_package=self.package,
+        )
+
+        response = self._request_short_packages(
+            partner_session_token=self.partner.partner_session_token,
+            package_type="Hajj",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("count", response.data)
+        self.assertIn("results", response.data)
+        self.assertGreaterEqual(response.data.get("count"), 2)
+        rating_payload = response.data["results"][0].get("rating_count")
+        self.assertIsInstance(rating_payload, dict)
+        self.assertEqual(rating_payload.get("rating_count"), 1)
+        self.assertEqual(rating_payload.get("average_stars"), 4.0)
+
+    def test_get_short_packages_accept_bearer_authorization(self):
+        response = self.client.get(
+            "/partner/get_package_short_detail_by_partner_token/",
+            {"package_type": "Hajj"},
+            HTTP_AUTHORIZATION=f"Bearer {self.partner.partner_session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("results", response.data)
+        returned_tokens = {item.get("huz_token") for item in response.data.get("results") or []}
+        self.assertIn(self.package.huz_token, returned_tokens)
+        self.assertNotIn("X-Auth-Deprecated", response)
+
+    def test_get_short_packages_rejects_unauthenticated_requests(self):
+        response = self.client.get(
+            "/partner/get_package_short_detail_by_partner_token/",
+            {"package_type": "Hajj"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
     def test_overall_package_statistics_include_all_supported_statuses(self):
         start_date = timezone.now() + timedelta(days=20)
