@@ -1,5 +1,5 @@
 from rest_framework.views import APIView
-from rest_framework.permissions import IsAdminUser
+from rest_framework.permissions import AllowAny, IsAdminUser
 from rest_framework.response import Response
 from rest_framework import status, pagination
 from .models import PartnerProfile, HuzBasicDetail, HuzAirlineDetail, HuzTransportDetail, HuzHotelDetail, HuzZiyarahDetail
@@ -1114,6 +1114,7 @@ class GetPartnersOverallPackagesStatisticsView(APIView):
 
 
 class GetHuzShortPackageForWebsiteView(APIView):
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         operation_description="Get a list of short Huz packages detail by token of partner with pagination",
@@ -1153,6 +1154,7 @@ class GetHuzShortPackageForWebsiteView(APIView):
 
 
 class GetHuzPackageDetailForWebsiteView(APIView):
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         operation_description="Get a detail of Huz packages by partner token and huz token",
@@ -1187,6 +1189,7 @@ class GetHuzPackageDetailForWebsiteView(APIView):
 
 
 class GetPackageCountCitiesWiseForWebsiteView(APIView):
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         manual_parameters=[
@@ -1237,6 +1240,7 @@ class GetPackageCountCitiesWiseForWebsiteView(APIView):
 
 
 class GetHuzFeaturedPackageForWebsiteView(APIView):
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         operation_description="Get a list of Feature Huz packages detail with pagination",
@@ -1276,6 +1280,7 @@ class GetHuzFeaturedPackageForWebsiteView(APIView):
 
 
 class GetSearchPackageByCityNDateView(APIView):
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         operation_summary="Retrieve a list of active packages based on search criteria",
