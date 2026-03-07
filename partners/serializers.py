@@ -9,9 +9,16 @@ from .models import (PartnerProfile, Wallet, PartnerServices, IndividualProfile,
 
 
 def _get_prefetched_items(instance, relation_name):
-    prefetched_cache = getattr(instance, '_prefetched_objects_cache', {})
-    if relation_name in prefetched_cache:
-        return prefetched_cache.get(relation_name) or []
+    prefetched_cache = getattr(instance, '_prefetched_objects_cache', None) or {}
+    if relation_name not in prefetched_cache:
+        return None
+    return list(prefetched_cache.get(relation_name) or [])
+
+
+def _list_related_items(instance, relation_name):
+    prefetched_items = _get_prefetched_items(instance, relation_name)
+    if prefetched_items is not None:
+        return prefetched_items
 
     relation = getattr(instance, relation_name, None)
     if relation is None:
@@ -24,12 +31,7 @@ def _get_prefetched_items(instance, relation_name):
 
 
 def _collect_hotel_images(instance):
-    hotel_images = _get_prefetched_items(instance, "hotel_images")
-    if not hotel_images:
-        try:
-            hotel_images = list(instance.hotel_images.all())
-        except Exception:
-            hotel_images = []
+    hotel_images = _list_related_items(instance, "hotel_images")
 
     if hotel_images:
         return hotel_images
@@ -38,21 +40,16 @@ def _collect_hotel_images(instance):
     if not catalog_hotel:
         return []
 
-    inherited_images = _get_prefetched_items(catalog_hotel, "hotel_images")
-    if inherited_images:
-        return inherited_images
-
-    try:
-        return list(catalog_hotel.hotel_images.all())
-    except Exception:
-        return []
+    return _list_related_items(catalog_hotel, "hotel_images")
 
 
 def get_type_and_detail(partner_profile):
     if partner_profile.partner_type == "Individual":
         prefetched_individuals = _get_prefetched_items(partner_profile, 'individual_profile_of_partner')
-        if prefetched_individuals:
-            return IndividualSerializer(prefetched_individuals[0]).data
+        if prefetched_individuals is not None:
+            if prefetched_individuals:
+                return IndividualSerializer(prefetched_individuals[0]).data
+            return None
         try:
             identity_detail = IndividualProfile.objects.get(individual_profile_of_partner=partner_profile.partner_id)
             return IndividualSerializer(identity_detail).data
@@ -60,8 +57,10 @@ def get_type_and_detail(partner_profile):
             return None
     elif partner_profile.partner_type == "Company":
         prefetched_companies = _get_prefetched_items(partner_profile, 'company_of_partner')
-        if prefetched_companies:
-            return BusinessSerializer(prefetched_companies[0]).data
+        if prefetched_companies is not None:
+            if prefetched_companies:
+                return BusinessSerializer(prefetched_companies[0]).data
+            return None
         try:
             company_detail = BusinessProfile.objects.get(company_of_partner=partner_profile.partner_id)
             return BusinessSerializer(company_detail).data
@@ -73,6 +72,11 @@ def get_type_and_detail(partner_profile):
 
 def get_company_detail(obj):
     if obj.package_provider.partner_type == "Company":
+        prefetched_companies = _get_prefetched_items(obj.package_provider, 'company_of_partner')
+        if prefetched_companies is not None:
+            if prefetched_companies:
+                return ShortBusinessSerializer(prefetched_companies[0]).data
+            return None
         try:
             company_detail = BusinessProfile.objects.get(company_of_partner=obj.package_provider.partner_id)
             return ShortBusinessSerializer(company_detail).data
@@ -83,6 +87,10 @@ def get_company_detail(obj):
 
 
 def get_hotel_info_detail(obj):
+    prefetched_hotels = _get_prefetched_items(obj, "hotel_for_package")
+    if prefetched_hotels is not None:
+        return HuzHotelSerializer(prefetched_hotels, many=True).data
+
     try:
         hotel = HuzHotelDetail.objects.filter(hotel_for_package=obj).select_related(
             "catalog_hotel"
@@ -93,6 +101,10 @@ def get_hotel_info_detail(obj):
 
 
 def get_ziyarah_detail(obj):
+    prefetched_ziyarah = _get_prefetched_items(obj, "ziyarah_for_package")
+    if prefetched_ziyarah is not None:
+        return HuzZiyarahSerializer(prefetched_ziyarah, many=True).data
+
     try:
         ziyarah = HuzZiyarahDetail.objects.filter(ziyarah_for_package=obj)
         return HuzZiyarahSerializer(ziyarah, many=True).data
@@ -101,6 +113,10 @@ def get_ziyarah_detail(obj):
 
 
 def get_transport_detail(obj):
+    prefetched_transport = _get_prefetched_items(obj, "transport_for_package")
+    if prefetched_transport is not None:
+        return HuzTransportSerializer(prefetched_transport, many=True).data
+
     try:
         transport = HuzTransportDetail.objects.filter(transport_for_package=obj)
         return HuzTransportSerializer(transport, many=True).data
@@ -109,6 +125,10 @@ def get_transport_detail(obj):
 
 
 def get_airline_detail(obj):
+    prefetched_airline = _get_prefetched_items(obj, "airline_for_package")
+    if prefetched_airline is not None:
+        return HuzAirlineSerializer(prefetched_airline, many=True).data
+
     try:
         airline = HuzAirlineDetail.objects.filter(airline_for_package=obj)
         return HuzAirlineSerializer(airline, many=True).data
@@ -117,12 +137,23 @@ def get_airline_detail(obj):
 
 
 def get_rating_count(obj):
+    prefetched_ratings = _get_prefetched_items(obj.package_provider, "rating_for_partner")
+    if prefetched_ratings is not None:
+        total_stars = sum((rating.partner_total_stars or 0) for rating in prefetched_ratings)
+        rating_count = len(prefetched_ratings)
+        average_stars = round(total_stars / rating_count, 1) if rating_count else 0
+        return {
+            'total_stars': total_stars,
+            'rating_count': rating_count,
+            'average_stars': average_stars
+        }
+
     rating_data = BookingRatingAndReview.objects.filter(rating_for_partner=obj.package_provider).aggregate(
         total_stars=Sum('partner_total_stars'),
         rating_count=Count('rating_id')
     )
-    rating_count=0
-    average_stars=0
+    rating_count = 0
+    average_stars = 0
     total_stars = rating_data['total_stars'] or 0
     if rating_data['rating_count'] > 0:
         rating_count = rating_data['rating_count']  # Number of ratings
@@ -183,16 +214,16 @@ class PartnerProfileSerializer(serializers.ModelSerializer):
 
     def get_wallet_amount(self, obj):
         prefetched_wallets = _get_prefetched_items(obj, 'wallet_session')
-        if prefetched_wallets:
-            return prefetched_wallets[0].wallet_amount
+        if prefetched_wallets is not None:
+            return prefetched_wallets[0].wallet_amount if prefetched_wallets else 0.0
 
         wallet_amount = Wallet.objects.filter(wallet_session=obj).values_list('wallet_amount', flat=True).first()
         return wallet_amount if wallet_amount is not None else 0.0
 
     def get_partner_service_detail(self, obj):
         prefetched_services = _get_prefetched_items(obj, 'services_of_partner')
-        if prefetched_services:
-            return PartnerServiceSerializer(prefetched_services[0]).data
+        if prefetched_services is not None:
+            return PartnerServiceSerializer(prefetched_services[0]).data if prefetched_services else {}
 
         try:
             service = PartnerServices.objects.get(services_of_partner=obj)
@@ -205,8 +236,9 @@ class PartnerProfileSerializer(serializers.ModelSerializer):
 
     def get_mailing_detail(self, obj):
         prefetched_mailing = _get_prefetched_items(obj, 'mailing_of_partner')
-        mailing_detail = prefetched_mailing[0] if prefetched_mailing else None
-        if mailing_detail is None:
+        if prefetched_mailing is not None:
+            mailing_detail = prefetched_mailing[0] if prefetched_mailing else None
+        else:
             mailing_detail = PartnerMailingDetail.objects.filter(mailing_of_partner=obj).first()
         if not mailing_detail:
             return {}

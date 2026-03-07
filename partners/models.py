@@ -313,6 +313,14 @@ class HuzBasicDetail(models.Model):
     # Reference to the partner providing the package
     package_provider = models.ForeignKey(PartnerProfile, related_name='package_provider', on_delete=models.CASCADE)
 
+    class Meta:
+        indexes = [
+            models.Index(fields=['package_type', 'package_status', 'start_date'], name='huz_pkg_type_status_start_idx'),
+            models.Index(fields=['package_status', 'created_time'], name='huz_pkg_status_created_idx'),
+            models.Index(fields=['package_provider', 'created_time'], name='huz_pkg_provider_created_idx'),
+            models.Index(fields=['is_featured', 'package_status', 'start_date'], name='huz_pkg_featured_status_idx'),
+        ]
+
     def __str__(self):
         return f"{self.huz_token} - {self.package_provider}"
 
@@ -354,6 +362,13 @@ class HuzAirlineDetail(models.Model):
     is_return_flight_included = models.BooleanField(null=True, default=False)
     # Foreign key to link the airline detail to a specific HuzBasicDetail package
     airline_for_package = models.ForeignKey(HuzBasicDetail, related_name='airline_for_package', on_delete=models.CASCADE)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['airline_for_package', 'flight_from'], name='huz_air_pkg_from_idx'),
+            models.Index(fields=['airline_for_package', 'flight_to'], name='huz_air_pkg_to_idx'),
+            models.Index(fields=['ticket_type'], name='huz_air_ticket_type_idx'),
+        ]
 
     def __str__(self):
         return f"{self.airline_name} - {self.airline_for_package}"

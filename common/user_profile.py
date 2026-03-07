@@ -12,12 +12,84 @@ from datetime import datetime
 from django.db import transaction
 from rest_framework.parsers import MultiPartParser, FormParser
 from decouple import config
+from django.conf import settings
 from django.utils import timezone
 from datetime import timedelta
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 
 GENDER_CHOICES = ['male', 'female', 'non_binary', 'prefer_not_to_say', 'other']
+SMS_GATEWAY_TIMEOUT_SECONDS = 6
+SMS_GATEWAY_MAX_ATTEMPTS = 2
+SMS_GATEWAY_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+DEV_OTP_BYPASS_ENABLED = config('DEV_OTP_BYPASS_ENABLED', cast=bool, default=False)
+DEV_OTP_BYPASS_CODE = '123456'
+LOCAL_DEV_HOSTS = {'127.0.0.1', 'localhost'}
+
+
+def send_sms_gateway_request(url):
+    last_exception = None
+
+    for attempt in range(1, SMS_GATEWAY_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.post(url, timeout=SMS_GATEWAY_TIMEOUT_SECONDS)
+            if (
+                response.status_code in SMS_GATEWAY_RETRYABLE_STATUS_CODES
+                and attempt < SMS_GATEWAY_MAX_ATTEMPTS
+            ):
+                logger.warning(
+                    "SMS gateway retry due to status code %s (attempt %s/%s).",
+                    response.status_code,
+                    attempt,
+                    SMS_GATEWAY_MAX_ATTEMPTS,
+                )
+                continue
+            return response
+        except requests.exceptions.Timeout as exc:
+            last_exception = exc
+            logger.warning(
+                "SMS gateway timeout (attempt %s/%s).",
+                attempt,
+                SMS_GATEWAY_MAX_ATTEMPTS,
+            )
+            continue
+        except requests.exceptions.RequestException as exc:
+            last_exception = exc
+            logger.error("SMS gateway request failed: %s", str(exc))
+            break
+
+    if last_exception:
+        raise last_exception
+
+    raise requests.exceptions.RequestException("SMS gateway request failed.")
+
+
+def is_dev_otp_bypass_enabled(request=None):
+    host = ''
+
+    if request is not None:
+        try:
+            host = request.get_host().split(':')[0].lower()
+        except Exception:
+            host = ''
+
+    return settings.DEBUG or DEV_OTP_BYPASS_ENABLED or host in LOCAL_DEV_HOSTS
+
+
+def upsert_user_otp(phone_number, otp_code):
+    user_otp, _ = UserOTP.objects.get_or_create(phone_number=phone_number)
+    user_otp.otp_password = otp_code
+    user_otp.save()
+    return user_otp
+
+
+def user_exists_for_phone(phone_number):
+    country_code = phone_number[:-10]
+    local_phone_number = phone_number[-10:]
+    return UserProfile.objects.filter(
+        country_code=country_code,
+        phone_number=local_phone_number,
+    ).exists()
 
 
 class SubscribeAPIView(APIView):
@@ -102,6 +174,11 @@ class SendOTPSMSAPIView(APIView):
         if country_code != '+92':
             return Response({"message": "Sending OTP to this country is not allowed."}, status=status.HTTP_400_BAD_REQUEST)
 
+        if is_dev_otp_bypass_enabled(request):
+            upsert_user_otp(phone_number, DEV_OTP_BYPASS_CODE)
+            logger.warning("DEV OTP bypass enabled for send_otp_sms on %s.", phone_number)
+            return Response({"message": "OTP sent successfully."}, status=status.HTTP_200_OK)
+
         # Getting a random 6-digit OTP from Utility
         otp_code = random_six_digits()
 
@@ -115,14 +192,11 @@ class SendOTPSMSAPIView(APIView):
 
         try:
             # Send SMS using requests module
-            response = requests.post(url)
+            response = send_sms_gateway_request(url)
 
             # Check response status
             if response.status_code == 200:
-                # Check if OTP record exists for this phone number, update or create accordingly
-                user_otp, created = UserOTP.objects.get_or_create(phone_number=phone_number)
-                user_otp.otp_password = otp_code
-                user_otp.save()
+                upsert_user_otp(phone_number, otp_code)
 
                 return Response({"message": "OTP sent successfully."}, status=status.HTTP_200_OK)
             else:
@@ -166,6 +240,14 @@ class MatchOTPSMSAPIView(APIView):
             serializer.validate_phone_number(phone_number)
         except serializers.ValidationError as e:
             return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
+
+        if is_dev_otp_bypass_enabled(request) and otp_entered == DEV_OTP_BYPASS_CODE:
+            if not user_exists_for_phone(phone_number):
+                return Response({"message": "OTP not found for this phone number."}, status=status.HTTP_400_BAD_REQUEST)
+
+            UserOTP.objects.filter(phone_number=phone_number).delete()
+            logger.warning("DEV OTP bypass accepted for verify_otp on %s.", phone_number)
+            return Response({"message": "OTP matched successfully."}, status=status.HTTP_200_OK)
 
         # If OTP record exists for the provided phone number
         try:
@@ -346,16 +428,21 @@ class CreateMemberProfileView(APIView):
                 serialized_user = UserProfileSerializer(user)
                 if country_code != '+92':
                     return Response({"message": "Sending OTP to this country is not allowed."}, status=status.HTTP_400_BAD_REQUEST)
+
+                if is_dev_otp_bypass_enabled(request):
+                    upsert_user_otp(phone_number_1, DEV_OTP_BYPASS_CODE)
+                    logger.warning("DEV OTP bypass enabled for signup flow on %s.", phone_number_1)
+                    new_user_welcome_email(user.email, user.name)
+                    return Response(serialized_user.data, status=status.HTTP_201_CREATED)
+
                 otp_code = random_six_digits()
                 sender = 'VTvOTP'
                 otp_message = f'HajjUmrah.co One-Time Password: {otp_code}. Please do not share OTP with anyone.'
                 API_Key = config('APIKey')
                 url = f'https://api.veevotech.com/v3/sendsms?hash={API_Key}&receivernum={phone_number_1}&sendernum={sender}&textmessage={otp_message}'
-                response = requests.post(url)
+                response = send_sms_gateway_request(url)
                 if response.status_code == 200:
-                    user_otp, created = UserOTP.objects.get_or_create(phone_number=phone_number_1)
-                    user_otp.otp_password = otp_code
-                    user_otp.save()
+                    upsert_user_otp(phone_number_1, otp_code)
 
                     new_user_welcome_email(user.email, user.name)
                     return Response(serialized_user.data, status=status.HTTP_201_CREATED)

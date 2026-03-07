@@ -13,6 +13,11 @@ class UserOTP(models.Model):
     # Timestamp indicating when the OTP was created, defaults to the current time
     created_time = models.DateTimeField(auto_now=True)
 
+    class Meta:
+        indexes = [
+            models.Index(fields=['phone_number'], name='userotp_phone_idx'),
+        ]
+
     def __str__(self):
         return str(self.otp_id)
 
@@ -75,6 +80,11 @@ class UserProfile(models.Model):
     created_time = models.DateTimeField(default=timezone.now)
     online = models.BooleanField(default=False)
     last_seen = models.DateTimeField(null=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['country_code', 'phone_number'], name='user_country_phone_idx'),
+        ]
 
     def __str__(self):
         return self.session_token

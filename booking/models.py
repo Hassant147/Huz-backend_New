@@ -67,6 +67,15 @@ class Booking(models.Model):
     # Token for the related travel package
     package_token = models.ForeignKey(HuzBasicDetail, related_name='package_token', on_delete=models.SET_NULL, null=True)
 
+    class Meta:
+        indexes = [
+            models.Index(fields=['booking_status', 'order_time'], name='booking_status_time_idx'),
+            models.Index(fields=['order_by', 'booking_status'], name='booking_user_status_idx'),
+            models.Index(fields=['order_to', 'booking_status'], name='booking_partner_status_idx'),
+            models.Index(fields=['package_token', 'booking_status'], name='booking_package_status_idx'),
+            models.Index(fields=['start_date'], name='booking_start_date_idx'),
+        ]
+
     def __str__(self):
         # Return booking_id as string representation of the model
         return str(self.booking_id)
@@ -104,6 +113,11 @@ class Payment(models.Model):
     payment_status = models.CharField(max_length=50, null=True)
     # Reference to the related booking
     booking_token = models.ForeignKey(Booking, related_name='booking_token', on_delete=models.SET_NULL, null=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['booking_token', 'transaction_time'], name='payment_booking_time_idx'),
+        ]
 
     def __str__(self):
         return str(self.payment_id)
@@ -326,4 +340,3 @@ class CustomPackages(models.Model):
 
     def __str__(self):
         return str(self.request_id)
-

@@ -7,7 +7,7 @@ from .serializers import HuzBasicSerializer, HuzAirlineSerializer, HuzTransportS
 from common.logs_file import logger
 from common.utility import generate_token, random_six_digits, validate_required_fields, CustomPagination
 from datetime import datetime
-from django.db.models import Sum, Count
+from django.db.models import Avg, Count, ExpressionWrapper, F, IntegerField, Prefetch, Q, Sum
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from datetime import datetime, timedelta
@@ -1113,41 +1113,238 @@ class GetPartnersOverallPackagesStatisticsView(APIView):
             return Response({"message": "Failed to fetch overall statistics. Internal server error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+PACKAGE_TYPE_NORMALIZER = {
+    "hajj": "Hajj",
+    "umrah": "Umrah",
+    "ziyarah": "Ziyarah",
+}
+
+WEBSITE_SORTING_MAP = {
+    "newest": ["-created_time"],
+    "price-high": ["-package_base_cost", "-created_time"],
+    "price-low": ["package_base_cost", "-created_time"],
+    "start-date": ["start_date", "-created_time"],
+}
+
+WEBSITE_PACKAGE_PREFETCH_RELATED = (
+    "package_provider__company_of_partner",
+    "package_provider__rating_for_partner",
+    "airline_for_package",
+    "transport_for_package",
+    "ziyarah_for_package",
+    Prefetch(
+        "hotel_for_package",
+        queryset=HuzHotelDetail.objects.select_related("catalog_hotel").prefetch_related(
+            "hotel_images",
+            "catalog_hotel__hotel_images",
+        ),
+    ),
+)
+
+
+def _normalize_package_type(package_type):
+    if not package_type:
+        return None
+    return PACKAGE_TYPE_NORMALIZER.get(str(package_type).strip().lower())
+
+
+def _parse_csv_values(raw_value):
+    if not raw_value:
+        return []
+
+    values = str(raw_value).split(",")
+    return [value.strip() for value in values if value and value.strip()]
+
+
+def _parse_int_values(raw_value):
+    parsed_values = []
+    for value in _parse_csv_values(raw_value):
+        try:
+            parsed_values.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    return parsed_values
+
+
+def _optimize_website_package_queryset(queryset):
+    return queryset.select_related("package_provider").prefetch_related(
+        *WEBSITE_PACKAGE_PREFETCH_RELATED
+    )
+
+
+def _build_website_package_queryset(package_type, minimum_start_date):
+    base_queryset = HuzBasicDetail.objects.filter(
+        package_type=package_type,
+        package_status="Active",
+        start_date__date__gte=minimum_start_date,
+    )
+    return _optimize_website_package_queryset(base_queryset)
+
+
+def _apply_website_filters(queryset, request):
+    query_params = request.GET
+
+    search_query = (query_params.get("search") or "").strip()[:100]
+    if search_query:
+        queryset = queryset.filter(
+            Q(package_name__icontains=search_query)
+            | Q(huz_token__icontains=search_query)
+            | Q(description__icontains=search_query)
+            | Q(package_provider__name__icontains=search_query)
+            | Q(package_provider__user_name__icontains=search_query)
+            | Q(package_provider__company_of_partner__company_name__icontains=search_query)
+            | Q(airline_for_package__flight_from__icontains=search_query)
+            | Q(airline_for_package__flight_to__icontains=search_query)
+        )
+
+    operator_query = (query_params.get("operator") or "").strip()[:100]
+    if operator_query:
+        queryset = queryset.filter(
+            Q(package_provider__name__icontains=operator_query)
+            | Q(package_provider__user_name__icontains=operator_query)
+            | Q(package_provider__company_of_partner__company_name__icontains=operator_query)
+        )
+
+    departure_values = _parse_csv_values(
+        query_params.get("departure_cities")
+        or query_params.get("departure_city")
+        or query_params.get("flight_from")
+    )
+    if departure_values:
+        departure_query = Q()
+        for city in departure_values[:20]:
+            departure_query |= Q(airline_for_package__flight_from__icontains=city)
+        queryset = queryset.filter(departure_query)
+
+    destination_values = _parse_csv_values(
+        query_params.get("destination_cities")
+        or query_params.get("destination_city")
+        or query_params.get("flight_to")
+    )
+    if destination_values:
+        destination_query = Q()
+        for city in destination_values[:20]:
+            destination_query |= Q(airline_for_package__flight_to__icontains=city)
+        queryset = queryset.filter(destination_query)
+
+    departure_date = query_params.get("start_date") or query_params.get("departure_date")
+    parsed_departure_date = parse_date(departure_date) if departure_date else None
+    if parsed_departure_date:
+        queryset = queryset.filter(start_date__date__gte=parsed_departure_date)
+
+    meals = {meal.lower() for meal in _parse_csv_values(query_params.get("meals"))}
+    if meals:
+        meal_query = Q()
+        if "breakfast" in meals:
+            meal_query |= Q(is_breakfast_included=True)
+        if "lunch" in meals:
+            meal_query |= Q(is_lunch_included=True)
+        if "dinner" in meals:
+            meal_query |= Q(is_dinner_included=True)
+        if meal_query:
+            queryset = queryset.filter(meal_query)
+
+    ziyarah_values = _parse_csv_values(query_params.get("ziyarah"))
+    if ziyarah_values:
+        ziyarah_query = Q()
+        for city in ziyarah_values[:20]:
+            ziyarah_query |= Q(ziyarah_for_package__ziyarah_list__icontains=city)
+        queryset = queryset.filter(ziyarah_query)
+
+    trip_duration_values = _parse_int_values(query_params.get("trip_duration"))
+    if trip_duration_values:
+        max_trip_duration = max(trip_duration_values)
+        queryset = queryset.annotate(
+            total_nights=ExpressionWrapper(
+                F("mecca_nights")
+                + F("madinah_nights")
+                + F("jeddah_nights")
+                + F("taif_nights")
+                + F("riyadah_nights"),
+                output_field=IntegerField(),
+            )
+        ).filter(total_nights__lte=max_trip_duration)
+
+    air_ticket_values = _parse_csv_values(query_params.get("air_tickets"))
+    if air_ticket_values:
+        normalized_tickets = {ticket.strip().lower() for ticket in air_ticket_values}
+        ticket_query = Q()
+        includes_without_ticket = any(
+            ticket in {"without air tickets", "without-air-tickets", "without_air_tickets"}
+            for ticket in normalized_tickets
+        )
+        filtered_ticket_types = [
+            ticket for ticket in air_ticket_values if ticket.strip().lower() not in {
+                "without air tickets",
+                "without-air-tickets",
+                "without_air_tickets",
+            }
+        ]
+        if filtered_ticket_types:
+            ticket_query |= Q(airline_for_package__ticket_type__in=filtered_ticket_types)
+        if includes_without_ticket:
+            ticket_query |= Q(airline_for_package__isnull=True)
+        if ticket_query:
+            queryset = queryset.filter(ticket_query)
+
+    return queryset
+
+
+def _apply_website_sorting(queryset, ordering):
+    sort_key = (ordering or "newest").strip().lower()
+
+    if sort_key == "top-rated":
+        return queryset.annotate(
+            average_partner_rating=Avg("package_provider__rating_for_partner__partner_total_stars"),
+            partner_rating_count=Count("package_provider__rating_for_partner", distinct=True),
+        ).order_by("-average_partner_rating", "-partner_rating_count", "-created_time")
+
+    return queryset.order_by(*WEBSITE_SORTING_MAP.get(sort_key, WEBSITE_SORTING_MAP["newest"]))
+
+
 class GetHuzShortPackageForWebsiteView(APIView):
     permission_classes = [AllowAny]
 
     @swagger_auto_schema(
-        operation_description="Get a list of short Huz packages detail by token of partner with pagination",
+        operation_description="Get a paginated list of active website packages with optional filters, search, and sorting.",
         manual_parameters=[
-            openapi.Parameter('package_type', openapi.IN_QUERY, description="Type of the package", type=openapi.TYPE_STRING, required=True),
+            openapi.Parameter('package_type', openapi.IN_QUERY, description="Type of package: Hajj, Umrah, or Ziyarah", type=openapi.TYPE_STRING, required=True),
+            openapi.Parameter('search', openapi.IN_QUERY, description="Text search against package/operator fields", type=openapi.TYPE_STRING),
+            openapi.Parameter('operator', openapi.IN_QUERY, description="Operator name search", type=openapi.TYPE_STRING),
+            openapi.Parameter('departure_cities', openapi.IN_QUERY, description="Comma-separated departure cities", type=openapi.TYPE_STRING),
+            openapi.Parameter('destination_cities', openapi.IN_QUERY, description="Comma-separated destination cities", type=openapi.TYPE_STRING),
+            openapi.Parameter('start_date', openapi.IN_QUERY, description="Start date lower bound in YYYY-MM-DD", type=openapi.TYPE_STRING),
+            openapi.Parameter('trip_duration', openapi.IN_QUERY, description="Comma-separated trip duration caps in days", type=openapi.TYPE_STRING),
+            openapi.Parameter('air_tickets', openapi.IN_QUERY, description="Comma-separated ticket types", type=openapi.TYPE_STRING),
+            openapi.Parameter('meals', openapi.IN_QUERY, description="Comma-separated meal filters", type=openapi.TYPE_STRING),
+            openapi.Parameter('ziyarah', openapi.IN_QUERY, description="Comma-separated ziyarah city filters", type=openapi.TYPE_STRING),
+            openapi.Parameter('ordering', openapi.IN_QUERY, description="Sort key: newest, price-high, price-low, top-rated, start-date", type=openapi.TYPE_STRING),
             openapi.Parameter('page', openapi.IN_QUERY, description="Page number", type=openapi.TYPE_INTEGER),
-            openapi.Parameter('page_size', openapi.IN_QUERY, description="Page size", type=openapi.TYPE_INTEGER)
+            openapi.Parameter('page_size', openapi.IN_QUERY, description="Page size", type=openapi.TYPE_INTEGER),
         ],
         responses={
             200: openapi.Response("Successful retrieval", HuzBasicShortSerializer(many=True)),
             400: "Bad Request: Missing or invalid input data.",
             401: "Unauthorized: Admin permissions required.",
-            404: "Not Found: User or packages not found.",
             500: "Server Error: Internal server error."
         }
     )
     def get(self, request):
         try:
-            package_type = request.GET.get('package_type')
+            requested_package_type = request.GET.get('package_type')
+            package_type = _normalize_package_type(requested_package_type)
+            if not package_type:
+                return Response({"message": "Invalid package_type. Use Hajj, Umrah, or Ziyarah."}, status=status.HTTP_400_BAD_REQUEST)
 
             min_start_date = datetime.now().date() + timedelta(days=10)
-            # Filter HuzBasicDetail queryset by user and package type
-            packages_list = HuzBasicDetail.objects.filter(package_type=package_type, package_status="Active", start_date__gte=min_start_date)
-            serialized_package = HuzBasicSerializer(packages_list, many=True)
-            return Response(serialized_package.data, status=status.HTTP_200_OK)
-            # if packages_list.exists():
-            #     # Initialize pagination & Paginate queryset based on request
-            #     paginator = CustomPagination()
-            #     paginated_packages = paginator.paginate_queryset(packages_list, request)
-            #     serialized_package = HuzBasicShortSerializer(paginated_packages, many=True)
-            #     return paginator.get_paginated_response(serialized_package.data)
-            # else:
-            #     return Response({"message": "Packages do not exist."}, status=status.HTTP_404_NOT_FOUND)
+            packages_list = _build_website_package_queryset(package_type, min_start_date)
+            packages_list = _apply_website_filters(packages_list, request)
+            packages_list = _apply_website_sorting(packages_list, request.GET.get("ordering")).distinct()
+
+            paginator = CustomPagination()
+            paginated_packages = paginator.paginate_queryset(packages_list, request)
+            serialized_package = HuzBasicSerializer(paginated_packages, many=True)
+            return paginator.get_paginated_response(serialized_package.data)
         except Exception as e:
             logger.error(f"GetHuzShortPackageForWebsiteView: {str(e)}")
             return Response({"message": "Failed to fetch packages list. Internal server error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -1176,7 +1373,9 @@ class GetHuzPackageDetailForWebsiteView(APIView):
                 return Response({"message": "Missing package information."}, status=status.HTTP_400_BAD_REQUEST)
 
             # Filter HuzBasicDetail queryset by user and package huz token
-            packages_list = HuzBasicDetail.objects.filter(huz_token=huz_token, package_status="Active")
+            packages_list = _optimize_website_package_queryset(
+                HuzBasicDetail.objects.filter(huz_token=huz_token, package_status="Active")
+            )
 
             if packages_list.exists():
                 serialized_package = HuzBasicSerializer(packages_list, many=True)
@@ -1243,37 +1442,35 @@ class GetHuzFeaturedPackageForWebsiteView(APIView):
     permission_classes = [AllowAny]
 
     @swagger_auto_schema(
-        operation_description="Get a list of Feature Huz packages detail with pagination",
+        operation_description="Get paginated featured website packages.",
         manual_parameters=[
-            openapi.Parameter('package_type', openapi.IN_QUERY, description="Type of the package", type=openapi.TYPE_STRING, required=True),
+            openapi.Parameter('package_type', openapi.IN_QUERY, description="Type of package: Hajj, Umrah, or Ziyarah", type=openapi.TYPE_STRING, required=True),
+            openapi.Parameter('ordering', openapi.IN_QUERY, description="Sort key: newest, price-high, price-low, top-rated, start-date", type=openapi.TYPE_STRING),
             openapi.Parameter('page', openapi.IN_QUERY, description="Page number", type=openapi.TYPE_INTEGER),
-            openapi.Parameter('page_size', openapi.IN_QUERY, description="Page size", type=openapi.TYPE_INTEGER)
+            openapi.Parameter('page_size', openapi.IN_QUERY, description="Page size", type=openapi.TYPE_INTEGER),
         ],
         responses={
             200: openapi.Response("Successful retrieval", HuzBasicShortSerializer(many=True)),
             400: "Bad Request: Missing or invalid input data.",
             401: "Unauthorized: Admin permissions required.",
-            404: "Not Found: User or packages not found.",
             500: "Server Error: Internal server error."
         }
     )
     def get(self, request):
         try:
-            package_type = request.GET.get('package_type')
-            min_start_date = datetime.now().date() + timedelta(days=10)
-            # Filter HuzBasicDetail queryset by user and package type
-            packages_list = HuzBasicDetail.objects.filter(is_featured=True, package_type=package_type, package_status="Active", start_date__gte=min_start_date)
+            requested_package_type = request.GET.get('package_type')
+            package_type = _normalize_package_type(requested_package_type)
+            if not package_type:
+                return Response({"message": "Invalid package_type. Use Hajj, Umrah, or Ziyarah."}, status=status.HTTP_400_BAD_REQUEST)
 
-            if packages_list.exists():
-                serialized_package = HuzBasicSerializer(packages_list, many=True)
-                return Response(serialized_package.data, status=status.HTTP_200_OK)
-                # # Initialize pagination & Paginate queryset based on request
-                # paginator = CustomPagination()
-                # paginated_packages = paginator.paginate_queryset(packages_list, request)
-                # serialized_package = HuzBasicShortSerializer(paginated_packages, many=True)
-                # return paginator.get_paginated_response(serialized_package.data)
-            else:
-                return Response({"message": "Packages do not exist."}, status=status.HTTP_404_NOT_FOUND)
+            min_start_date = datetime.now().date() + timedelta(days=10)
+            packages_list = _build_website_package_queryset(package_type, min_start_date).filter(is_featured=True)
+            packages_list = _apply_website_sorting(packages_list, request.GET.get("ordering")).distinct()
+
+            paginator = CustomPagination()
+            paginated_packages = paginator.paginate_queryset(packages_list, request)
+            serialized_package = HuzBasicSerializer(paginated_packages, many=True)
+            return paginator.get_paginated_response(serialized_package.data)
         except Exception as e:
             logger.error(f"GetHuzShortPackageForWebsiteView: {str(e)}")
             return Response({"message": "Failed to fetch packages list. Internal server error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -1284,73 +1481,50 @@ class GetSearchPackageByCityNDateView(APIView):
 
     @swagger_auto_schema(
         operation_summary="Retrieve a list of active packages based on search criteria",
-        operation_description="Fetches a paginated list of HuzBasicDetail packages based on `package_type`, `start_date`, and `flight_from` filter parameters. Only packages with an active status are returned.",
+        operation_description="Fetches a paginated list of active packages based on city/date and optional listing filters.",
         manual_parameters=[
-            openapi.Parameter('package_type', openapi.IN_QUERY, description="Type of the package (e.g., Hajj, Umrah, Ziyarah)",type=openapi.TYPE_STRING),
-            openapi.Parameter('start_date', openapi.IN_QUERY, description="Start date of the package in YYYY-MM-DD format", type=openapi.FORMAT_DATE),
+            openapi.Parameter('package_type', openapi.IN_QUERY, description="Type of package: Hajj, Umrah, or Ziyarah",type=openapi.TYPE_STRING, required=True),
+            openapi.Parameter('start_date', openapi.IN_QUERY, description="Start date lower bound in YYYY-MM-DD format", type=openapi.TYPE_STRING),
             openapi.Parameter('flight_from', openapi.IN_QUERY, description="Departure location of the flight",type=openapi.TYPE_STRING),
+            openapi.Parameter('search', openapi.IN_QUERY, description="Text search against package/operator fields", type=openapi.TYPE_STRING),
+            openapi.Parameter('operator', openapi.IN_QUERY, description="Operator name search", type=openapi.TYPE_STRING),
+            openapi.Parameter('destination_cities', openapi.IN_QUERY, description="Comma-separated destination cities", type=openapi.TYPE_STRING),
+            openapi.Parameter('trip_duration', openapi.IN_QUERY, description="Comma-separated trip duration caps in days", type=openapi.TYPE_STRING),
+            openapi.Parameter('air_tickets', openapi.IN_QUERY, description="Comma-separated ticket types", type=openapi.TYPE_STRING),
+            openapi.Parameter('meals', openapi.IN_QUERY, description="Comma-separated meal filters", type=openapi.TYPE_STRING),
+            openapi.Parameter('ziyarah', openapi.IN_QUERY, description="Comma-separated ziyarah city filters", type=openapi.TYPE_STRING),
+            openapi.Parameter('ordering', openapi.IN_QUERY, description="Sort key: newest, price-high, price-low, top-rated, start-date", type=openapi.TYPE_STRING),
             openapi.Parameter('page', openapi.IN_QUERY, description="Page number", type=openapi.TYPE_INTEGER),
-            openapi.Parameter('page_size', openapi.IN_QUERY, description="Page size", type=openapi.TYPE_INTEGER)
+            openapi.Parameter('page_size', openapi.IN_QUERY, description="Page size", type=openapi.TYPE_INTEGER),
         ],
         responses={
             200: openapi.Response("Successful retrieval", HuzBasicShortSerializer(many=True)),
             400: "Bad Request: Missing or invalid input data.",
             401: "Unauthorized: Admin permissions required.",
-            404: "Not Found: User or packages not found.",
             500: "Server Error: Internal server error."
         }
     )
     def get(self, request):
         try:
-            package_type = request.GET.get('package_type')
+            requested_package_type = request.GET.get('package_type')
+            package_type = _normalize_package_type(requested_package_type)
+            if not package_type:
+                return Response({"message": "Invalid package_type. Use Hajj, Umrah, or Ziyarah."}, status=status.HTTP_400_BAD_REQUEST)
+
+            min_start_date = datetime.now().date() + timedelta(days=10)
             start_date = request.GET.get('start_date')
-            flight_from = request.GET.get('flight_from')
+            parsed_start_date = parse_date(start_date) if start_date else None
+            if parsed_start_date and parsed_start_date > min_start_date:
+                min_start_date = parsed_start_date
 
-            start_date1 = parse_date(start_date)
-            if start_date1 and start_date1 >= (datetime.now() + timedelta(days=10)).date():
-                # Filter HuzBasicDetail queryset by user and package type
-                packages_list = HuzBasicDetail.objects.filter(package_type=package_type, start_date=start_date, package_status="Active", airline_for_package__flight_from=flight_from)
-                if packages_list.exists():
-                    serialized_package = HuzBasicSerializer(packages_list, many=True)
-                    return Response(serialized_package.data, status=status.HTTP_200_OK)
-                    # # Initialize pagination & Paginate queryset based on request
-                    # paginator = CustomPagination()
-                    # paginated_packages = paginator.paginate_queryset(packages_list, request)
-                    # serialized_package = HuzBasicShortSerializer(paginated_packages, many=True)
-                    # return paginator.get_paginated_response(serialized_package.data)
-                else:
-                    min_start_date = datetime.now().date() + timedelta(days=10)
-                    # Filter HuzBasicDetail queryset by user and package type
-                    packages_list = HuzBasicDetail.objects.filter(package_type=package_type, package_status="Active",
-                                                                  start_date__gte=min_start_date, airline_for_package__flight_from=flight_from)
+            packages_list = _build_website_package_queryset(package_type, min_start_date)
+            packages_list = _apply_website_filters(packages_list, request)
+            packages_list = _apply_website_sorting(packages_list, request.GET.get("ordering")).distinct()
 
-                    if packages_list.exists():
-                        # Initialize pagination & Paginate queryset based on request
-                        serialized_package = HuzBasicSerializer(packages_list, many=True)
-                        return Response(serialized_package.data, status=status.HTTP_200_OK)
-                        # paginator = CustomPagination()
-                        # paginated_packages = paginator.paginate_queryset(packages_list, request)
-                        # serialized_package = HuzBasicShortSerializer(paginated_packages, many=True)
-                        # return paginator.get_paginated_response(serialized_package.data)
-                    else:
-                        return Response({"message": "Packages do not exist."}, status=status.HTTP_404_NOT_FOUND)
-            else:
-                min_start_date = datetime.now().date() + timedelta(days=10)
-                # Filter HuzBasicDetail queryset by user and package type
-                packages_list = HuzBasicDetail.objects.filter(package_type=package_type, package_status="Active",
-                                                              start_date__gte=min_start_date,
-                                                              airline_for_package__flight_from=flight_from)
-
-                if packages_list.exists():
-                    serialized_package = HuzBasicSerializer(packages_list, many=True)
-                    return Response(serialized_package.data, status=status.HTTP_200_OK)
-                    # Initialize pagination & Paginate queryset based on request
-                    # paginator = CustomPagination()
-                    # paginated_packages = paginator.paginate_queryset(packages_list, request)
-                    # serialized_package = HuzBasicShortSerializer(paginated_packages, many=True)
-                    # return paginator.get_paginated_response(serialized_package.data)
-                else:
-                    return Response({"message": "Packages do not exist."}, status=status.HTTP_404_NOT_FOUND)
+            paginator = CustomPagination()
+            paginated_packages = paginator.paginate_queryset(packages_list, request)
+            serialized_package = HuzBasicSerializer(paginated_packages, many=True)
+            return paginator.get_paginated_response(serialized_package.data)
         except Exception as e:
             logger.error(f"GetHuzShortPackageForWebsiteView: {str(e)}")
             return Response({"message": "Failed to fetch packages list. Internal server error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

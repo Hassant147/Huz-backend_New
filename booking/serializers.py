@@ -7,9 +7,16 @@ from partners.serializers import ShortBusinessSerializer, PartnerMailingDetailSe
 
 
 def _get_prefetched_items(instance, relation_name):
-    prefetched_cache = getattr(instance, '_prefetched_objects_cache', {})
-    if relation_name in prefetched_cache:
-        return prefetched_cache.get(relation_name) or []
+    prefetched_cache = getattr(instance, '_prefetched_objects_cache', None) or {}
+    if relation_name not in prefetched_cache:
+        return None
+    return list(prefetched_cache.get(relation_name) or [])
+
+
+def _list_related_items(instance, relation_name):
+    prefetched_items = _get_prefetched_items(instance, relation_name)
+    if prefetched_items is not None:
+        return prefetched_items
 
     relation = getattr(instance, relation_name, None)
     if relation is None:
@@ -21,83 +28,56 @@ def _get_prefetched_items(instance, relation_name):
         return []
 
 
-def _get_first_prefetched_item(instance, relation_name):
-    prefetched_items = _get_prefetched_items(instance, relation_name)
-    return prefetched_items[0] if prefetched_items else None
+def _get_first_related_item(instance, relation_name):
+    related_items = _list_related_items(instance, relation_name)
+    return related_items[0] if related_items else None
 
 
 def get_company_detail(obj):
     if not obj.order_to or obj.order_to.partner_type != "Company":
         return None
 
-    prefetched_company = _get_first_prefetched_item(obj.order_to, 'company_of_partner')
+    prefetched_company = _get_first_related_item(obj.order_to, 'company_of_partner')
     if prefetched_company:
         return ShortBusinessSerializer(prefetched_company).data
 
-    if obj.order_to.partner_type == "Company":
-        try:
-            company_detail = BusinessProfile.objects.get(company_of_partner=obj.order_to.partner_id)
-            return ShortBusinessSerializer(company_detail).data
-        except BusinessProfile.DoesNotExist:
-            return None
-    else:
-        return None
+    return None
 
 
 def get_user_address_detail(obj):
     if not obj.order_by:
         return None
 
-    prefetched_address = _get_first_prefetched_item(obj.order_by, 'mailing_session')
+    prefetched_address = _get_first_related_item(obj.order_by, 'mailing_session')
     if prefetched_address:
         return MailingDetailSerializer(prefetched_address).data
 
-    try:
-        address_detail = MailingDetail.objects.get(mailing_session=obj.order_by)
-        return MailingDetailSerializer(address_detail).data
-    except MailingDetail.DoesNotExist:
-        return None
+    return None
 
 
 def get_partner_address_detail(obj):
     if not obj.order_to:
         return None
 
-    prefetched_address = _get_first_prefetched_item(obj.order_to, 'mailing_of_partner')
+    prefetched_address = _get_first_related_item(obj.order_to, 'mailing_of_partner')
     if prefetched_address:
         return PartnerMailingDetailSerializer(prefetched_address).data
 
-    try:
-        address_detail = PartnerMailingDetail.objects.get(mailing_of_partner=obj.order_to)
-        return PartnerMailingDetailSerializer(address_detail).data
-    except PartnerMailingDetail.DoesNotExist:
-        return None
+    return None
 
 
 def get_booking_objections(obj):
-    prefetched_objections = _get_prefetched_items(obj, 'objection_for_booking')
-    if prefetched_objections:
-        return BookingObjectionsSerializer(prefetched_objections, many=True).data
-
-    objections_detail = BookingObjections.objects.filter(objection_for_booking=obj.booking_id)
+    objections_detail = _list_related_items(obj, 'objection_for_booking')
     return BookingObjectionsSerializer(objections_detail, many=True).data
 
 
 def get_passport_validity(obj):
-    prefetched_passports = _get_prefetched_items(obj, 'passport_for_booking_number')
-    if prefetched_passports:
-        return PassportValiditySerializer(prefetched_passports, many=True).data
-
-    passport_validity = PassportValidity.objects.filter(passport_for_booking_number=obj.booking_id)
+    passport_validity = _list_related_items(obj, 'passport_for_booking_number')
     return PassportValiditySerializer(passport_validity, many=True).data
 
 
 def get_payment_detail(obj):
-    prefetched_payments = _get_prefetched_items(obj, 'booking_token')
-    if prefetched_payments:
-        return PaymentSerializer(prefetched_payments, many=True).data
-
-    payment_paid = Payment.objects.filter(booking_token=obj.booking_id)
+    payment_paid = _list_related_items(obj, 'booking_token')
     return PaymentSerializer(payment_paid, many=True).data
 
 
@@ -246,11 +226,7 @@ class DetailBookingSerializer(serializers.ModelSerializer):
         if not obj.package_token:
             return []
 
-        prefetched_airlines = _get_prefetched_items(obj.package_token, 'airline_for_package')
-        if prefetched_airlines:
-            return HuzAirlineSerializer(prefetched_airlines, many=True).data
-
-        airline = HuzAirlineDetail.objects.filter(airline_for_package=obj.package_token)
+        airline = _list_related_items(obj.package_token, 'airline_for_package')
         return HuzAirlineSerializer(airline, many=True).data
 
     def get_passport_validity_detail(self, obj):
@@ -266,53 +242,29 @@ class DetailBookingSerializer(serializers.ModelSerializer):
         return get_booking_objections(obj)
 
     def get_booking_documents_status(self, obj):
-        prefetched_documents = _get_prefetched_items(obj, 'status_for_booking')
-        if prefetched_documents:
-            return DocumentsStatusSerializer(prefetched_documents, many=True).data
-
-        documents = DocumentsStatus.objects.filter(status_for_booking=obj.booking_id)
+        documents = _list_related_items(obj, 'status_for_booking')
         return DocumentsStatusSerializer(documents, many=True).data
 
     def get_user_documents(self, obj):
-        prefetched_documents = _get_prefetched_items(obj, 'user_document_for_booking_token')
-        if prefetched_documents:
-            return UserRequiredBookingDocumentsSerializer(prefetched_documents, many=True).data
-
-        documents = UserRequiredDocuments.objects.filter(user_document_for_booking_token=obj.booking_id)
+        documents = _list_related_items(obj, 'user_document_for_booking_token')
         return UserRequiredBookingDocumentsSerializer(documents, many=True).data
 
     def get_booking_documents(self, obj):
-        prefetched_documents = _get_prefetched_items(obj, 'document_for_booking_token')
-        if prefetched_documents:
-            return BookingDocumentsSerializer(prefetched_documents, many=True).data
-
-        documents = BookingDocuments.objects.filter(document_for_booking_token=obj.booking_id)
+        documents = _list_related_items(obj, 'document_for_booking_token')
         return BookingDocumentsSerializer(documents, many=True).data
 
     def get_booking_airline_details(self, obj):
-        prefetched_airline_details = _get_prefetched_items(obj, 'airline_for_booking')
-        if prefetched_airline_details:
-            return BookingAirlineSerializer(prefetched_airline_details, many=True).data
-
-        airline = BookingAirlineDetail.objects.filter(airline_for_booking=obj.booking_id)
+        airline = _list_related_items(obj, 'airline_for_booking')
         return BookingAirlineSerializer(airline, many=True).data
 
     def get_booking_hotel_and_transport_details(self, obj):
-        prefetched_details = _get_prefetched_items(obj, 'hotel_or_transport_for_booking')
-        if prefetched_details:
-            return BookingHotelOrTransportSerializer(prefetched_details, many=True).data
-
-        airline = BookingHotelAndTransport.objects.filter(hotel_or_transport_for_booking=obj.booking_id)
+        airline = _list_related_items(obj, 'hotel_or_transport_for_booking')
         return BookingHotelOrTransportSerializer(airline, many=True).data
 
 
 
     def get_booking_rating(self, obj):
-        prefetched_ratings = _get_prefetched_items(obj, 'rating_for_booking')
-        if prefetched_ratings:
-            return BookingRatingAndReviewSerializer(prefetched_ratings, many=True).data
-
-        airline = BookingRatingAndReview.objects.filter(rating_for_booking=obj.booking_id)
+        airline = _list_related_items(obj, 'rating_for_booking')
         return BookingRatingAndReviewSerializer(airline, many=True).data
 
     def get_payment_detail(self, obj):
@@ -507,7 +459,7 @@ class PartnersBookingPaymentSerializer(serializers.ModelSerializer):
 
     def get_partner_contact_detail(self, obj):
         if obj.payment_for_partner:
-            prefetched_company = _get_first_prefetched_item(obj.payment_for_partner, 'company_of_partner')
+            prefetched_company = _get_first_related_item(obj.payment_for_partner, 'company_of_partner')
             if prefetched_company:
                 return ShortBusinessSerializer(prefetched_company).data
 
