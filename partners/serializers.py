@@ -1,5 +1,6 @@
 from rest_framework import serializers
-from django.db.models import Sum, Count
+from django.db.models import Count, Sum
+from django.utils import timezone
 from booking.models import BookingRatingAndReview
 import re
 from .models import (PartnerProfile, Wallet, PartnerServices, IndividualProfile, BusinessProfile, PartnerMailingDetail,
@@ -137,7 +138,7 @@ def get_airline_detail(obj):
 
 
 def get_rating_count(obj):
-    prefetched_ratings = _get_prefetched_items(obj.package_provider, "rating_for_partner")
+    prefetched_ratings = _get_prefetched_items(obj, "rating_for_package")
     if prefetched_ratings is not None:
         total_stars = sum((rating.partner_total_stars or 0) for rating in prefetched_ratings)
         rating_count = len(prefetched_ratings)
@@ -148,7 +149,19 @@ def get_rating_count(obj):
             'average_stars': average_stars
         }
 
-    rating_data = BookingRatingAndReview.objects.filter(rating_for_partner=obj.package_provider).aggregate(
+    annotated_rating_count = getattr(obj, "package_rating_total_count", None)
+    annotated_total_stars = getattr(obj, "package_rating_total_stars", None)
+    if annotated_rating_count is not None or annotated_total_stars is not None:
+        total_stars = float(annotated_total_stars or 0)
+        rating_count = int(annotated_rating_count or 0)
+        average_stars = round(total_stars / rating_count, 1) if rating_count else 0
+        return {
+            'total_stars': total_stars,
+            'rating_count': rating_count,
+            'average_stars': average_stars
+        }
+
+    rating_data = BookingRatingAndReview.objects.filter(rating_for_package=obj).aggregate(
         total_stars=Sum('partner_total_stars'),
         rating_count=Count('rating_id')
     )
@@ -369,7 +382,6 @@ class HuzPackageDateRangeSerializer(serializers.ModelSerializer):
 
 class HuzHotelSerializer(serializers.ModelSerializer):
     images = serializers.SerializerMethodField()
-    hotel_images = serializers.SerializerMethodField()
     primary_image = serializers.SerializerMethodField()
 
     def _serialized_images(self, instance):
@@ -389,9 +401,6 @@ class HuzHotelSerializer(serializers.ModelSerializer):
     def get_images(self, obj):
         return self._serialized_images(obj)
 
-    def get_hotel_images(self, obj):
-        return self._serialized_images(obj)
-
     def get_primary_image(self, obj):
         images = self._serialized_images(obj)
         if not images:
@@ -404,9 +413,9 @@ class HuzHotelSerializer(serializers.ModelSerializer):
             'hotel_id', 'hotel_city', 'hotel_name', 'hotel_rating', 'room_sharing_type', 'hotel_distance',
             'distance_type', 'is_shuttle_services_included', 'is_air_condition', 'is_television', 'is_wifi',
             'is_elevator', 'is_attach_bathroom', 'is_washroom_amenities', 'is_english_toilet',
-            'is_indian_toilet', 'is_laundry', 'catalog_hotel', 'images', 'hotel_images', 'primary_image'
+            'is_indian_toilet', 'is_laundry', 'catalog_hotel', 'images', 'primary_image'
         ]
-        read_only_fields = ('images', 'hotel_images', 'primary_image')
+        read_only_fields = ('images', 'primary_image')
 
 
 class HuzHotelImageSerializer(serializers.ModelSerializer):
@@ -441,6 +450,212 @@ class HuzZiyarahSerializer(serializers.ModelSerializer):
     class Meta:
         model = HuzZiyarahDetail
         fields = ['ziyarah_id', 'ziyarah_list']
+
+
+def _get_sorted_package_date_ranges(obj):
+    range_items = _list_related_items(obj, "package_date_ranges")
+    if not range_items:
+        range_items = list(
+            HuzPackageDateRange.objects.filter(date_range_for_package=obj).order_by(
+                "start_date", "end_date"
+            )
+        )
+
+    return sorted(
+        range_items,
+        key=lambda item: (
+            getattr(item, "start_date", None) or timezone.now(),
+            getattr(item, "end_date", None) or timezone.now(),
+        ),
+    )
+
+
+def _serialize_package_date_ranges(obj):
+    range_items = _get_sorted_package_date_ranges(obj)
+    if range_items:
+        return HuzPackageDateRangeSerializer(range_items, many=True).data
+
+    if not obj.start_date and not obj.end_date and not obj.package_validity:
+        return []
+
+    return [
+        {
+            "range_id": None,
+            "start_date": obj.start_date,
+            "end_date": obj.end_date,
+            "group_capacity": None,
+            "package_validity": obj.package_validity,
+        }
+    ]
+
+
+def _get_primary_package_date_range(obj):
+    range_items = _get_sorted_package_date_ranges(obj)
+    if not range_items:
+        return None
+
+    now = timezone.now()
+    future_ranges = [
+        item for item in range_items if getattr(item, "start_date", None) and item.start_date >= now
+    ]
+    return future_ranges[0] if future_ranges else range_items[0]
+
+
+class HuzAlignedPackageSerializer(serializers.ModelSerializer):
+    huz_id = serializers.UUIDField(read_only=True)
+    package_cost = serializers.FloatField(source="package_base_cost", read_only=True)
+    partner_session_token = serializers.CharField(
+        source="package_provider.partner_session_token",
+        read_only=True,
+    )
+
+    airline_detail = serializers.SerializerMethodField()
+    transport_detail = serializers.SerializerMethodField()
+    hotel_detail = serializers.SerializerMethodField()
+    ziyarah_detail = serializers.SerializerMethodField()
+
+    package_date_range = serializers.SerializerMethodField()
+    company_detail = serializers.SerializerMethodField()
+    rating_count = serializers.SerializerMethodField()
+    is_landed = serializers.SerializerMethodField()
+    package_capacity = serializers.SerializerMethodField()
+
+    class Meta:
+        model = HuzBasicDetail
+        fields = [
+            "huz_id",
+            "huz_token",
+            "package_type",
+            "package_name",
+            "package_base_cost",
+            "package_cost",
+            "cost_for_child",
+            "cost_for_infants",
+            "cost_for_sharing",
+            "cost_for_quad",
+            "cost_for_triple",
+            "cost_for_double",
+            "cost_for_single",
+            "discount_if_child_with_bed",
+            "mecca_nights",
+            "madinah_nights",
+            "jeddah_nights",
+            "taif_nights",
+            "riyadah_nights",
+            "description",
+            "is_visa_included",
+            "is_airport_reception_included",
+            "is_tour_guide_included",
+            "is_insurance_included",
+            "is_breakfast_included",
+            "is_lunch_included",
+            "is_dinner_included",
+            "is_package_open_for_other_date",
+            "package_date_range",
+            "package_capacity",
+            "is_landed",
+            "package_status",
+            "package_stage",
+            "created_time",
+            "partner_session_token",
+            "airline_detail",
+            "transport_detail",
+            "hotel_detail",
+            "ziyarah_detail",
+            "company_detail",
+            "rating_count",
+        ]
+
+    def _get_airline_items(self, obj):
+        items = _list_related_items(obj, "airline_for_package")
+        if items:
+            return items
+
+        airline = HuzAirlineDetail.objects.filter(airline_for_package=obj).first()
+        return [airline] if airline else []
+
+    def _get_transport_items(self, obj):
+        items = _list_related_items(obj, "transport_for_package")
+        if items:
+            return items
+
+        transport = HuzTransportDetail.objects.filter(transport_for_package=obj).first()
+        return [transport] if transport else []
+
+    def _get_ziyarah_items(self, obj):
+        items = _list_related_items(obj, "ziyarah_for_package")
+        if items:
+            return items
+
+        ziyarah = HuzZiyarahDetail.objects.filter(ziyarah_for_package=obj).first()
+        return [ziyarah] if ziyarah else []
+
+    def _get_hotel_items(self, obj):
+        items = _list_related_items(obj, "hotel_for_package")
+        if items:
+            return items
+
+        return list(
+            HuzHotelDetail.objects.filter(hotel_for_package=obj)
+            .select_related("catalog_hotel")
+            .prefetch_related("hotel_images", "catalog_hotel__hotel_images")
+        )
+
+    def _get_primary_capacity(self, obj):
+        primary_range = _get_primary_package_date_range(obj)
+        if not primary_range:
+            return None
+
+        capacity = getattr(primary_range, "group_capacity", None)
+        return int(capacity) if capacity is not None else None
+
+    def get_airline_detail(self, obj):
+        items = self._get_airline_items(obj)
+        if not items:
+            return None
+        return HuzAirlineSerializer(items[0], context=self.context).data
+
+    def get_transport_detail(self, obj):
+        items = self._get_transport_items(obj)
+        if not items:
+            return None
+        return HuzTransportSerializer(items[0], context=self.context).data
+
+    def get_ziyarah_detail(self, obj):
+        items = self._get_ziyarah_items(obj)
+        if not items:
+            return None
+        return HuzZiyarahSerializer(items[0], context=self.context).data
+
+    def get_hotel_detail(self, obj):
+        hotel_items = self._get_hotel_items(obj)
+        if not hotel_items:
+            return []
+        return HuzHotelSerializer(hotel_items, many=True, context=self.context).data
+
+    def get_company_detail(self, obj):
+        return get_company_detail(obj)
+
+    def get_rating_count(self, obj):
+        context = self.context if isinstance(self.context, dict) else {}
+        rating_cache = context.setdefault("package_rating_cache", {})
+
+        package_id = str(obj.huz_id)
+        if package_id in rating_cache:
+            return rating_cache[package_id]
+
+        result = get_rating_count(obj)
+        rating_cache[package_id] = result
+        return result
+
+    def get_package_date_range(self, obj):
+        return _serialize_package_date_ranges(obj)
+
+    def get_is_landed(self, obj):
+        return len(self._get_airline_items(obj)) == 0
+
+    def get_package_capacity(self, obj):
+        return self._get_primary_capacity(obj)
 
 
 class PartnerBankAccountSerializer(serializers.ModelSerializer):

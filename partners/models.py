@@ -239,7 +239,6 @@ class HuzBasicDetail(models.Model):
     PACKAGE_TYPE_CHOICES = [
         ('Hajj', 'hajj'),
         ('Umrah', 'umrah'),
-        ('Ziyarah', 'ziyarah')
     ]
 
     # Define package status choices

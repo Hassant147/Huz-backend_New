@@ -32,6 +32,7 @@ from .models import (
     PartnerProfile,
 )
 from .serializers import (
+    HuzAlignedPackageSerializer,
     HuzAirlineSerializer,
     HuzBasicSerializer,
     HuzHotelSerializer,
@@ -51,6 +52,7 @@ PACKAGE_PREFETCH_RELATED = (
     "hotel_for_package__catalog_hotel__hotel_images",
     "ziyarah_for_package",
     "package_date_ranges",
+    "rating_for_package",
     "package_provider__company_of_partner",
 )
 
@@ -115,6 +117,7 @@ STATUS_NORMALIZER = {
     "deactivate": "Deactivated",
     "pending": "Pending",
 }
+SUPPORTED_PACKAGE_TYPES = ("Hajj", "Umrah")
 MASTER_HOTEL_PACKAGE_TOKEN = "__system_master_hotel_package__"
 
 
@@ -219,259 +222,17 @@ def _normalize_package_type(raw_value):
         return "Hajj"
     if lower == "umrah":
         return "Umrah"
-    if lower == "ziyarah":
-        return "Ziyarah"
     return None
 
 
 def _serialize_catalog_hotel(hotel):
     payload = HuzHotelSerializer(hotel).data
-    payload.setdefault("hotel_images", [])
     payload.setdefault("images", [])
     return payload
 
 
-class OperatorHuzPackageSerializer(serializers.ModelSerializer):
-    huz_id = serializers.UUIDField(read_only=True)
-    package_cost = serializers.FloatField(source="package_base_cost", read_only=True)
-    partner_session_token = serializers.CharField(source="package_provider.partner_session_token", read_only=True)
-
-    airline_detail = serializers.SerializerMethodField()
-    transport_detail = serializers.SerializerMethodField()
-    hotel_detail = serializers.SerializerMethodField()
-    ziyarah_detail = serializers.SerializerMethodField()
-
-    airline_detail_list = serializers.SerializerMethodField()
-    transport_detail_list = serializers.SerializerMethodField()
-    ziyarah_detail_list = serializers.SerializerMethodField()
-
-    package_date_range = serializers.SerializerMethodField()
-    company_detail = serializers.SerializerMethodField()
-    rating_count = serializers.SerializerMethodField()
-
-    class Meta:
-        model = HuzBasicDetail
-        fields = [
-            "huz_id",
-            "huz_token",
-            "package_type",
-            "package_name",
-            "package_base_cost",
-            "package_cost",
-            "cost_for_child",
-            "cost_for_infants",
-            "cost_for_sharing",
-            "cost_for_quad",
-            "cost_for_triple",
-            "cost_for_double",
-            "cost_for_single",
-            "discount_if_child_with_bed",
-            "mecca_nights",
-            "madinah_nights",
-            "jeddah_nights",
-            "taif_nights",
-            "riyadah_nights",
-            "start_date",
-            "end_date",
-            "description",
-            "is_visa_included",
-            "is_airport_reception_included",
-            "is_tour_guide_included",
-            "is_insurance_included",
-            "is_breakfast_included",
-            "is_lunch_included",
-            "is_dinner_included",
-            "is_package_open_for_other_date",
-            "package_validity",
-            "package_date_range",
-            "package_status",
-            "package_stage",
-            "created_time",
-            "partner_session_token",
-            "airline_detail",
-            "transport_detail",
-            "hotel_detail",
-            "ziyarah_detail",
-            "airline_detail_list",
-            "transport_detail_list",
-            "ziyarah_detail_list",
-            "company_detail",
-            "rating_count",
-        ]
-
-    @staticmethod
-    def _prefetched_items(instance, relation_name):
-        prefetched_cache = getattr(instance, "_prefetched_objects_cache", {})
-        if relation_name in prefetched_cache:
-            return prefetched_cache.get(relation_name) or []
-
-        relation = getattr(instance, relation_name, None)
-        if relation is None:
-            return []
-
-        try:
-            return list(relation.all())
-        except Exception:
-            return []
-
-    def _get_airline_items(self, obj):
-        items = self._prefetched_items(obj, "airline_for_package")
-        if items:
-            return items
-        airline = HuzAirlineDetail.objects.filter(airline_for_package=obj).first()
-        return [airline] if airline else []
-
-    def _get_transport_items(self, obj):
-        items = self._prefetched_items(obj, "transport_for_package")
-        if items:
-            return items
-        transport = HuzTransportDetail.objects.filter(transport_for_package=obj).first()
-        return [transport] if transport else []
-
-    def _get_ziyarah_items(self, obj):
-        items = self._prefetched_items(obj, "ziyarah_for_package")
-        if items:
-            return items
-        ziyarah = HuzZiyarahDetail.objects.filter(ziyarah_for_package=obj).first()
-        return [ziyarah] if ziyarah else []
-
-    def _get_hotel_items(self, obj):
-        items = self._prefetched_items(obj, "hotel_for_package")
-        if items:
-            return items
-        return list(
-            HuzHotelDetail.objects.filter(hotel_for_package=obj)
-            .select_related("catalog_hotel")
-            .prefetch_related("hotel_images", "catalog_hotel__hotel_images")
-        )
-
-    def get_airline_detail_list(self, obj):
-        items = self._get_airline_items(obj)
-        if not items:
-            return []
-        return HuzAirlineSerializer(items, many=True).data
-
-    def get_transport_detail_list(self, obj):
-        items = self._get_transport_items(obj)
-        if not items:
-            return []
-        return HuzTransportSerializer(items, many=True).data
-
-    def get_ziyarah_detail_list(self, obj):
-        items = self._get_ziyarah_items(obj)
-        if not items:
-            return []
-        return HuzZiyarahSerializer(items, many=True).data
-
-    def get_airline_detail(self, obj):
-        details = self.get_airline_detail_list(obj)
-        return details[0] if details else None
-
-    def get_transport_detail(self, obj):
-        details = self.get_transport_detail_list(obj)
-        return details[0] if details else None
-
-    def get_ziyarah_detail(self, obj):
-        details = self.get_ziyarah_detail_list(obj)
-        return details[0] if details else None
-
-    def get_hotel_detail(self, obj):
-        hotel_items = self._get_hotel_items(obj)
-        wrapped_hotels = []
-
-        for hotel in hotel_items:
-            base_payload = HuzHotelSerializer(hotel).data
-            nested_hotel_detail = dict(base_payload)
-            nested_hotel_detail.setdefault("hotel_images", [])
-            nested_hotel_detail.setdefault("images", [])
-
-            wrapped_hotels.append(
-                {
-                    **base_payload,
-                    "huz_hotel_id": base_payload.get("hotel_id"),
-                    "hotel_detail": nested_hotel_detail,
-                }
-            )
-
-        return wrapped_hotels
-
-    def get_company_detail(self, obj):
-        partner = getattr(obj, "package_provider", None)
-        if not partner or partner.partner_type != "Company":
-            return None
-
-        prefetched_company = self._prefetched_items(partner, "company_of_partner")
-        if prefetched_company:
-            return ShortBusinessSerializer(prefetched_company[0]).data
-
-        company = BusinessProfile.objects.filter(company_of_partner=partner.partner_id).first()
-        if not company:
-            return None
-        return ShortBusinessSerializer(company).data
-
-    def get_rating_count(self, obj):
-        context = self.context if isinstance(self.context, dict) else {}
-        rating_cache = context.setdefault("partner_rating_cache", {})
-
-        partner_id = str(obj.package_provider_id)
-        if partner_id in rating_cache:
-            return rating_cache[partner_id]
-
-        annotated_rating_count = getattr(obj, "partner_rating_total_count", None)
-        annotated_total_stars = getattr(obj, "partner_rating_total_stars", None)
-        if annotated_rating_count is not None or annotated_total_stars is not None:
-            total_stars = float(annotated_total_stars or 0)
-            rating_count = int(annotated_rating_count or 0)
-            average_stars = round(total_stars / rating_count, 1) if rating_count else 0
-
-            result = {
-                "total_stars": total_stars,
-                "rating_count": rating_count,
-                "average_stars": average_stars,
-            }
-            rating_cache[partner_id] = result
-            return result
-
-        rating_data = BookingRatingAndReview.objects.filter(
-            rating_for_partner=obj.package_provider
-        ).aggregate(total_stars=Sum("partner_total_stars"), rating_count=Count("rating_id"))
-
-        total_stars = rating_data.get("total_stars") or 0
-        rating_count = rating_data.get("rating_count") or 0
-        average_stars = round(total_stars / rating_count, 1) if rating_count else 0
-
-        result = {
-            "total_stars": total_stars,
-            "rating_count": rating_count,
-            "average_stars": average_stars,
-        }
-        rating_cache[partner_id] = result
-        return result
-
-    def get_package_date_range(self, obj):
-        range_items = self._prefetched_items(obj, "package_date_ranges")
-        if not range_items:
-            range_items = list(
-                HuzPackageDateRange.objects.filter(date_range_for_package=obj).order_by(
-                    "start_date", "end_date"
-                )
-            )
-
-        if range_items:
-            return HuzPackageDateRangeSerializer(range_items, many=True).data
-
-        if not obj.start_date and not obj.end_date and not obj.package_validity:
-            return []
-
-        return [
-            {
-                "range_id": None,
-                "start_date": obj.start_date,
-                "end_date": obj.end_date,
-                "group_capacity": None,
-                "package_validity": obj.package_validity,
-            }
-        ]
+class OperatorHuzPackageSerializer(HuzAlignedPackageSerializer):
+    pass
 
 
 class OperatorPackageBaseView(APIView):
@@ -533,23 +294,17 @@ class OperatorPackageBaseView(APIView):
     @staticmethod
     def _package_queryset():
         return (
-            HuzBasicDetail.objects.select_related("package_provider")
-            .annotate(
-                partner_rating_total_stars=Coalesce(
-                    Sum("package_provider__rating_for_partner__partner_total_stars"),
-                    Value(0.0),
-                    output_field=FloatField(),
-                ),
-                partner_rating_total_count=Count(
-                    "package_provider__rating_for_partner__rating_id",
-                    distinct=True,
-                ),
-            )
+            HuzBasicDetail.objects.filter(package_type__in=SUPPORTED_PACKAGE_TYPES)
+            .select_related("package_provider")
             .prefetch_related(*PACKAGE_PREFETCH_RELATED)
         )
 
     def _get_partner_package(self, partner, huz_token, with_prefetch=False):
-        queryset = self._package_queryset() if with_prefetch else HuzBasicDetail.objects.all()
+        queryset = (
+            self._package_queryset()
+            if with_prefetch
+            else HuzBasicDetail.objects.filter(package_type__in=SUPPORTED_PACKAGE_TYPES)
+        )
         queryset = queryset.filter(package_provider=partner).filter(_build_package_token_query(huz_token))
         return queryset.first()
 
@@ -560,7 +315,7 @@ class OperatorPackageBaseView(APIView):
         package_obj = package_obj or package
         return OperatorHuzPackageSerializer(
             package_obj,
-            context={"partner_rating_cache": {}, "request": self.request},
+            context={"package_rating_cache": {}, "request": self.request},
         ).data
 
     @staticmethod
@@ -602,7 +357,7 @@ class OperatorPackageBaseView(APIView):
         if package_type not in (None, ""):
             resolved_type = _normalize_package_type(package_type)
             if not resolved_type:
-                return None, "package_type: Invalid package type. Use Hajj, Umrah, or Ziyarah."
+                return None, "package_type: Invalid package type. Use Hajj or Umrah."
             normalized["package_type"] = resolved_type
         elif create:
             return None, "package_type is required."
@@ -1784,7 +1539,7 @@ class GetHuzShortPackageByTokenView(OperatorPackageBaseView):
             normalized_package_type = _normalize_package_type(package_type)
             if not normalized_package_type:
                 return Response(
-                    {"message": "Invalid package_type. Use Hajj, Umrah, or Ziyarah."},
+                    {"message": "Invalid package_type. Use Hajj or Umrah."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
@@ -1912,7 +1667,10 @@ class GetPartnersOverallPackagesStatisticsView(OperatorPackageBaseView):
             counts = {status_name: 0 for status_name in requested_statuses}
 
             package_count = (
-                HuzBasicDetail.objects.filter(package_provider=partner)
+                HuzBasicDetail.objects.filter(
+                    package_provider=partner,
+                    package_type__in=SUPPORTED_PACKAGE_TYPES,
+                )
                 .values("package_status")
                 .annotate(total_count=Count("huz_id"))
             )

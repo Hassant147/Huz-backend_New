@@ -119,7 +119,7 @@ def random_phone():
 
 
 class Command(BaseCommand):
-    help = "Seed realistic random Hajj/Umrah/Ziyarah packages with linked details."
+    help = "Seed realistic random Hajj/Umrah packages with linked details."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -180,7 +180,7 @@ class Command(BaseCommand):
 
     @staticmethod
     def _random_package_type():
-        return random.choice(["Umrah", "Hajj", "Ziyarah"])
+        return random.choice(["Umrah", "Hajj"])
 
     def _build_name(self, package_type, nights):
         tier = random.choice(["Economy", "Value", "Premium", "Executive"])
@@ -338,10 +338,7 @@ class Command(BaseCommand):
 
     @staticmethod
     def _create_ziyarah(package):
-        if package.package_type == "Ziyarah":
-            places = random.sample(ZIYARAH_MAKKAH + ZIYARAH_MADINAH, k=8)
-        else:
-            places = random.sample(ZIYARAH_MAKKAH, k=4) + random.sample(ZIYARAH_MADINAH, k=4)
+        places = random.sample(ZIYARAH_MAKKAH, k=4) + random.sample(ZIYARAH_MADINAH, k=4)
         HuzZiyarahDetail.objects.create(
             ziyarah_list=",".join(places),
             ziyarah_for_package=package,

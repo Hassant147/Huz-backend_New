@@ -2,16 +2,35 @@ from rest_framework.views import APIView
 from rest_framework.permissions import AllowAny, IsAdminUser
 from rest_framework.response import Response
 from rest_framework import status, pagination
-from .models import PartnerProfile, HuzBasicDetail, HuzAirlineDetail, HuzTransportDetail, HuzHotelDetail, HuzZiyarahDetail
-from .serializers import HuzBasicSerializer, HuzAirlineSerializer, HuzTransportSerializer, HuzHotelSerializer, HuzZiyarahSerializer, HuzBasicShortSerializer
+from .models import (
+    PartnerProfile,
+    HuzBasicDetail,
+    HuzAirlineDetail,
+    HuzTransportDetail,
+    HuzHotelDetail,
+    HuzPackageDateRange,
+    HuzZiyarahDetail,
+)
+from .serializers import (
+    HuzAlignedPackageSerializer,
+    HuzAirlineSerializer,
+    HuzBasicSerializer,
+    HuzBasicShortSerializer,
+    HuzHotelSerializer,
+    HuzTransportSerializer,
+    HuzZiyarahSerializer,
+)
 from common.logs_file import logger
 from common.utility import generate_token, random_six_digits, validate_required_fields, CustomPagination
 from datetime import datetime
-from django.db.models import Avg, Count, ExpressionWrapper, F, IntegerField, Prefetch, Q, Sum
+from django.db.models import Avg, Count, ExpressionWrapper, F, FloatField, IntegerField, Min, Prefetch, Q, Sum, Value
+from django.db.models.functions import Coalesce
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from datetime import datetime, timedelta
 from django.utils.dateparse import parse_date
+
+SUPPORTED_PACKAGE_TYPES = ("Hajj", "Umrah")
 
 
 class CreateHuzPackageView(APIView):
@@ -988,16 +1007,22 @@ class GetHuzShortPackageByTokenView(APIView):
     def get(self, request):
         try:
             partner_session_token = request.GET.get('partner_session_token')
-            package_type = request.GET.get('package_type')
-            if not partner_session_token or not package_type:
+            requested_package_type = request.GET.get('package_type')
+            package_type = _normalize_package_type(requested_package_type)
+            if not partner_session_token or not requested_package_type:
                 return Response({"message": "Missing user or package type information."}, status=status.HTTP_400_BAD_REQUEST)
+            if not package_type:
+                return Response({"message": "Invalid package_type. Use Hajj or Umrah."}, status=status.HTTP_400_BAD_REQUEST)
 
             user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
             if not user:
                 return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
 
             # Filter HuzBasicDetail queryset by user and package type
-            packages_list = HuzBasicDetail.objects.filter(package_provider=user, package_type=package_type)
+            packages_list = _supported_package_queryset().filter(
+                package_provider=user,
+                package_type=package_type,
+            )
             serialized_package = HuzBasicSerializer(packages_list, many=True)
             return Response(serialized_package.data, status=status.HTTP_200_OK)
 
@@ -1043,7 +1068,10 @@ class GetHuzPackageDetailByTokenView(APIView):
                 return Response({"message": "User not found with the provided detail."}, status=status.HTTP_400_BAD_REQUEST)
 
             # Filter HuzBasicDetail queryset by user and package huz token
-            packages_list = HuzBasicDetail.objects.filter(package_provider=user, huz_token=huz_token)
+            packages_list = _supported_package_queryset().filter(
+                package_provider=user,
+                huz_token=huz_token,
+            )
 
             if packages_list.exists():
                 serialized_package = HuzBasicSerializer(packages_list, many=True)
@@ -1093,7 +1121,7 @@ class GetPartnersOverallPackagesStatisticsView(APIView):
             package_status = ['Initialize', 'Completed', 'Active', 'Deactivated']
 
             # Query to count packages by status for the user
-            package_count = HuzBasicDetail.objects.filter(package_provider=user) \
+            package_count = _supported_package_queryset().filter(package_provider=user) \
                 .values('package_status') \
                 .annotate(total_count=Count('huz_id')) \
                 .order_by('package_status')
@@ -1116,19 +1144,18 @@ class GetPartnersOverallPackagesStatisticsView(APIView):
 PACKAGE_TYPE_NORMALIZER = {
     "hajj": "Hajj",
     "umrah": "Umrah",
-    "ziyarah": "Ziyarah",
 }
 
 WEBSITE_SORTING_MAP = {
     "newest": ["-created_time"],
     "price-high": ["-package_base_cost", "-created_time"],
     "price-low": ["package_base_cost", "-created_time"],
-    "start-date": ["start_date", "-created_time"],
+    "start-date": ["next_available_start_date", "-created_time"],
 }
 
 WEBSITE_PACKAGE_PREFETCH_RELATED = (
     "package_provider__company_of_partner",
-    "package_provider__rating_for_partner",
+    "rating_for_package",
     "airline_for_package",
     "transport_for_package",
     "ziyarah_for_package",
@@ -1146,6 +1173,10 @@ def _normalize_package_type(package_type):
     if not package_type:
         return None
     return PACKAGE_TYPE_NORMALIZER.get(str(package_type).strip().lower())
+
+
+def _supported_package_queryset():
+    return HuzBasicDetail.objects.filter(package_type__in=SUPPORTED_PACKAGE_TYPES)
 
 
 def _parse_csv_values(raw_value):
@@ -1166,19 +1197,53 @@ def _parse_int_values(raw_value):
     return parsed_values
 
 
-def _optimize_website_package_queryset(queryset):
-    return queryset.select_related("package_provider").prefetch_related(
-        *WEBSITE_PACKAGE_PREFETCH_RELATED
+def _resolve_website_min_start_date(request, base_minimum_start_date):
+    departure_date = request.GET.get("start_date") or request.GET.get("departure_date")
+    parsed_departure_date = parse_date(departure_date) if departure_date else None
+    if parsed_departure_date and parsed_departure_date > base_minimum_start_date:
+        return parsed_departure_date
+    return base_minimum_start_date
+
+
+def _get_website_date_range_prefetch(minimum_start_date):
+    queryset = HuzPackageDateRange.objects.order_by("start_date", "end_date")
+    if minimum_start_date:
+        queryset = queryset.filter(start_date__date__gte=minimum_start_date)
+    return Prefetch("package_date_ranges", queryset=queryset)
+
+
+def _filter_available_website_packages(queryset, minimum_start_date):
+    return queryset.filter(
+        Q(package_date_ranges__start_date__date__gte=minimum_start_date)
+        | Q(package_date_ranges__isnull=True, start_date__date__gte=minimum_start_date)
+    )
+
+
+def _optimize_website_package_queryset(queryset, minimum_start_date):
+    upcoming_range_filter = (
+        Q(package_date_ranges__start_date__date__gte=minimum_start_date)
+        if minimum_start_date
+        else Q()
+    )
+    return (
+        queryset.select_related("package_provider")
+        .annotate(
+            next_available_start_date=Coalesce(
+                Min("package_date_ranges__start_date", filter=upcoming_range_filter),
+                F("start_date"),
+            ),
+        )
+        .prefetch_related(*WEBSITE_PACKAGE_PREFETCH_RELATED, _get_website_date_range_prefetch(minimum_start_date))
     )
 
 
 def _build_website_package_queryset(package_type, minimum_start_date):
-    base_queryset = HuzBasicDetail.objects.filter(
+    base_queryset = _supported_package_queryset().filter(
         package_type=package_type,
         package_status="Active",
-        start_date__date__gte=minimum_start_date,
     )
-    return _optimize_website_package_queryset(base_queryset)
+    base_queryset = _filter_available_website_packages(base_queryset, minimum_start_date)
+    return _optimize_website_package_queryset(base_queryset, minimum_start_date)
 
 
 def _apply_website_filters(queryset, request):
@@ -1226,11 +1291,6 @@ def _apply_website_filters(queryset, request):
         for city in destination_values[:20]:
             destination_query |= Q(airline_for_package__flight_to__icontains=city)
         queryset = queryset.filter(destination_query)
-
-    departure_date = query_params.get("start_date") or query_params.get("departure_date")
-    parsed_departure_date = parse_date(departure_date) if departure_date else None
-    if parsed_departure_date:
-        queryset = queryset.filter(start_date__date__gte=parsed_departure_date)
 
     meals = {meal.lower() for meal in _parse_csv_values(query_params.get("meals"))}
     if meals:
@@ -1295,9 +1355,9 @@ def _apply_website_sorting(queryset, ordering):
 
     if sort_key == "top-rated":
         return queryset.annotate(
-            average_partner_rating=Avg("package_provider__rating_for_partner__partner_total_stars"),
-            partner_rating_count=Count("package_provider__rating_for_partner", distinct=True),
-        ).order_by("-average_partner_rating", "-partner_rating_count", "-created_time")
+            average_package_rating=Avg("rating_for_package__partner_total_stars"),
+            package_rating_count=Count("rating_for_package", distinct=True),
+        ).order_by("-average_package_rating", "-package_rating_count", "-created_time")
 
     return queryset.order_by(*WEBSITE_SORTING_MAP.get(sort_key, WEBSITE_SORTING_MAP["newest"]))
 
@@ -1308,7 +1368,7 @@ class GetHuzShortPackageForWebsiteView(APIView):
     @swagger_auto_schema(
         operation_description="Get a paginated list of active website packages with optional filters, search, and sorting.",
         manual_parameters=[
-            openapi.Parameter('package_type', openapi.IN_QUERY, description="Type of package: Hajj, Umrah, or Ziyarah", type=openapi.TYPE_STRING, required=True),
+            openapi.Parameter('package_type', openapi.IN_QUERY, description="Type of package: Hajj or Umrah", type=openapi.TYPE_STRING, required=True),
             openapi.Parameter('search', openapi.IN_QUERY, description="Text search against package/operator fields", type=openapi.TYPE_STRING),
             openapi.Parameter('operator', openapi.IN_QUERY, description="Operator name search", type=openapi.TYPE_STRING),
             openapi.Parameter('departure_cities', openapi.IN_QUERY, description="Comma-separated departure cities", type=openapi.TYPE_STRING),
@@ -1334,16 +1394,17 @@ class GetHuzShortPackageForWebsiteView(APIView):
             requested_package_type = request.GET.get('package_type')
             package_type = _normalize_package_type(requested_package_type)
             if not package_type:
-                return Response({"message": "Invalid package_type. Use Hajj, Umrah, or Ziyarah."}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"message": "Invalid package_type. Use Hajj or Umrah."}, status=status.HTTP_400_BAD_REQUEST)
 
-            min_start_date = datetime.now().date() + timedelta(days=10)
+            default_min_start_date = datetime.now().date() + timedelta(days=10)
+            min_start_date = _resolve_website_min_start_date(request, default_min_start_date)
             packages_list = _build_website_package_queryset(package_type, min_start_date)
             packages_list = _apply_website_filters(packages_list, request)
             packages_list = _apply_website_sorting(packages_list, request.GET.get("ordering")).distinct()
 
             paginator = CustomPagination()
             paginated_packages = paginator.paginate_queryset(packages_list, request)
-            serialized_package = HuzBasicSerializer(paginated_packages, many=True)
+            serialized_package = HuzAlignedPackageSerializer(paginated_packages, many=True)
             return paginator.get_paginated_response(serialized_package.data)
         except Exception as e:
             logger.error(f"GetHuzShortPackageForWebsiteView: {str(e)}")
@@ -1372,13 +1433,15 @@ class GetHuzPackageDetailForWebsiteView(APIView):
             if not huz_token:
                 return Response({"message": "Missing package information."}, status=status.HTTP_400_BAD_REQUEST)
 
-            # Filter HuzBasicDetail queryset by user and package huz token
-            packages_list = _optimize_website_package_queryset(
-                HuzBasicDetail.objects.filter(huz_token=huz_token, package_status="Active")
+            min_start_date = datetime.now().date() + timedelta(days=10)
+            packages_list = _filter_available_website_packages(
+                _supported_package_queryset().filter(huz_token=huz_token, package_status="Active"),
+                min_start_date,
             )
+            packages_list = _optimize_website_package_queryset(packages_list, min_start_date)
 
             if packages_list.exists():
-                serialized_package = HuzBasicSerializer(packages_list, many=True)
+                serialized_package = HuzAlignedPackageSerializer(packages_list, many=True)
                 return Response(serialized_package.data, status=status.HTTP_200_OK)
             else:
                 return Response({"message": "Package do not exist."}, status=status.HTTP_404_NOT_FOUND)
@@ -1413,13 +1476,16 @@ class GetPackageCountCitiesWiseForWebsiteView(APIView):
     def get(self, request):
         try:
             # Check if package_type parameter is provided
-            package_type = self.request.GET.get('package_type', None)
+            requested_package_type = self.request.GET.get('package_type', None)
+            package_type = _normalize_package_type(requested_package_type)
             if not package_type:
-                return Response({"message": "package_type parameter is required"}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"message": "Invalid package_type. Use Hajj or Umrah."}, status=status.HTTP_400_BAD_REQUEST)
             min_start_date = datetime.now().date() + timedelta(days=10)
 
-            # Get active package IDs for the specified package type
-            active_package_ids = HuzBasicDetail.objects.filter(package_status="Active", package_type=package_type, start_date__gte=min_start_date).values_list('huz_id', flat=True)
+            active_package_ids = _build_website_package_queryset(
+                package_type,
+                min_start_date,
+            ).values_list('huz_id', flat=True).distinct()
 
             # Check if any active packages exist for the given package_type
             if not active_package_ids:
@@ -1444,7 +1510,7 @@ class GetHuzFeaturedPackageForWebsiteView(APIView):
     @swagger_auto_schema(
         operation_description="Get paginated featured website packages.",
         manual_parameters=[
-            openapi.Parameter('package_type', openapi.IN_QUERY, description="Type of package: Hajj, Umrah, or Ziyarah", type=openapi.TYPE_STRING, required=True),
+            openapi.Parameter('package_type', openapi.IN_QUERY, description="Type of package: Hajj or Umrah", type=openapi.TYPE_STRING, required=True),
             openapi.Parameter('ordering', openapi.IN_QUERY, description="Sort key: newest, price-high, price-low, top-rated, start-date", type=openapi.TYPE_STRING),
             openapi.Parameter('page', openapi.IN_QUERY, description="Page number", type=openapi.TYPE_INTEGER),
             openapi.Parameter('page_size', openapi.IN_QUERY, description="Page size", type=openapi.TYPE_INTEGER),
@@ -1461,15 +1527,16 @@ class GetHuzFeaturedPackageForWebsiteView(APIView):
             requested_package_type = request.GET.get('package_type')
             package_type = _normalize_package_type(requested_package_type)
             if not package_type:
-                return Response({"message": "Invalid package_type. Use Hajj, Umrah, or Ziyarah."}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"message": "Invalid package_type. Use Hajj or Umrah."}, status=status.HTTP_400_BAD_REQUEST)
 
-            min_start_date = datetime.now().date() + timedelta(days=10)
+            default_min_start_date = datetime.now().date() + timedelta(days=10)
+            min_start_date = _resolve_website_min_start_date(request, default_min_start_date)
             packages_list = _build_website_package_queryset(package_type, min_start_date).filter(is_featured=True)
             packages_list = _apply_website_sorting(packages_list, request.GET.get("ordering")).distinct()
 
             paginator = CustomPagination()
             paginated_packages = paginator.paginate_queryset(packages_list, request)
-            serialized_package = HuzBasicSerializer(paginated_packages, many=True)
+            serialized_package = HuzAlignedPackageSerializer(paginated_packages, many=True)
             return paginator.get_paginated_response(serialized_package.data)
         except Exception as e:
             logger.error(f"GetHuzShortPackageForWebsiteView: {str(e)}")
@@ -1483,7 +1550,7 @@ class GetSearchPackageByCityNDateView(APIView):
         operation_summary="Retrieve a list of active packages based on search criteria",
         operation_description="Fetches a paginated list of active packages based on city/date and optional listing filters.",
         manual_parameters=[
-            openapi.Parameter('package_type', openapi.IN_QUERY, description="Type of package: Hajj, Umrah, or Ziyarah",type=openapi.TYPE_STRING, required=True),
+            openapi.Parameter('package_type', openapi.IN_QUERY, description="Type of package: Hajj or Umrah",type=openapi.TYPE_STRING, required=True),
             openapi.Parameter('start_date', openapi.IN_QUERY, description="Start date lower bound in YYYY-MM-DD format", type=openapi.TYPE_STRING),
             openapi.Parameter('flight_from', openapi.IN_QUERY, description="Departure location of the flight",type=openapi.TYPE_STRING),
             openapi.Parameter('search', openapi.IN_QUERY, description="Text search against package/operator fields", type=openapi.TYPE_STRING),
@@ -1509,21 +1576,17 @@ class GetSearchPackageByCityNDateView(APIView):
             requested_package_type = request.GET.get('package_type')
             package_type = _normalize_package_type(requested_package_type)
             if not package_type:
-                return Response({"message": "Invalid package_type. Use Hajj, Umrah, or Ziyarah."}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"message": "Invalid package_type. Use Hajj or Umrah."}, status=status.HTTP_400_BAD_REQUEST)
 
-            min_start_date = datetime.now().date() + timedelta(days=10)
-            start_date = request.GET.get('start_date')
-            parsed_start_date = parse_date(start_date) if start_date else None
-            if parsed_start_date and parsed_start_date > min_start_date:
-                min_start_date = parsed_start_date
-
+            default_min_start_date = datetime.now().date() + timedelta(days=10)
+            min_start_date = _resolve_website_min_start_date(request, default_min_start_date)
             packages_list = _build_website_package_queryset(package_type, min_start_date)
             packages_list = _apply_website_filters(packages_list, request)
             packages_list = _apply_website_sorting(packages_list, request.GET.get("ordering")).distinct()
 
             paginator = CustomPagination()
             paginated_packages = paginator.paginate_queryset(packages_list, request)
-            serialized_package = HuzBasicSerializer(paginated_packages, many=True)
+            serialized_package = HuzAlignedPackageSerializer(paginated_packages, many=True)
             return paginator.get_paginated_response(serialized_package.data)
         except Exception as e:
             logger.error(f"GetHuzShortPackageForWebsiteView: {str(e)}")

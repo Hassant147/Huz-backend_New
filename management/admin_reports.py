@@ -12,6 +12,8 @@ from common.models import UserProfile
 from django.db.models import Count, Sum, F
 from common.logs_file import logger
 
+SUPPORTED_PACKAGE_TYPES = ("Hajj", "Umrah")
+
 
 def _parse_date_filters(request):
     start_raw = request.query_params.get('start_date', None)
@@ -1305,10 +1307,14 @@ class PackageStatusCountAPIView(APIView):
             valid_statuses = ['Initialize', 'Completed', 'Active', 'Deactivated', 'Block', 'Pending']
 
             # Define valid package types
-            valid_package_types = ['Hajj', 'Umrah', 'Ziyarah']
+            valid_package_types = list(SUPPORTED_PACKAGE_TYPES)
 
             # Filter HuzBasicDetail based on the partner_ids and the valid statuses
-            huz_queryset = HuzBasicDetail.objects.filter(package_provider__partner_id__in=partner_ids, package_status__in=valid_statuses)
+            huz_queryset = HuzBasicDetail.objects.filter(
+                package_provider__partner_id__in=partner_ids,
+                package_status__in=valid_statuses,
+                package_type__in=SUPPORTED_PACKAGE_TYPES,
+            )
 
             # Apply package type filter if provided
             if package_type and package_type != 'all' and package_type in valid_package_types:
@@ -1359,7 +1365,7 @@ class UserRegistrationCountAPIView(APIView):
             openapi.Parameter('city', openapi.IN_QUERY, description="Filter by city", type=openapi.TYPE_STRING, default='all'),
             openapi.Parameter('start_date', openapi.IN_QUERY, description="Filter users from this date", type=openapi.TYPE_STRING, format=openapi.FORMAT_DATETIME),
             openapi.Parameter('end_date', openapi.IN_QUERY, description="Filter users until this date", type=openapi.TYPE_STRING, format=openapi.FORMAT_DATETIME),
-            openapi.Parameter('package_type', openapi.IN_QUERY, description="Filter by package type (e.g. hajj, umrah, ziyarah)", type=openapi.TYPE_STRING, default='all'),
+            openapi.Parameter('package_type', openapi.IN_QUERY, description="Filter by package type (e.g. hajj, umrah)", type=openapi.TYPE_STRING, default='all'),
         ],
         tags=["Reports"],
         responses={
@@ -1435,7 +1441,7 @@ class BookingTypeStatusCountWithPriceAPIView(APIView):
             openapi.Parameter('city', openapi.IN_QUERY, description="Filter by city", type=openapi.TYPE_STRING, default='all'),
             openapi.Parameter('start_date', openapi.IN_QUERY, description="Filter bookings from this date", type=openapi.TYPE_STRING, format=openapi.FORMAT_DATETIME),
             openapi.Parameter('end_date', openapi.IN_QUERY, description="Filter bookings until this date", type=openapi.TYPE_STRING, format=openapi.FORMAT_DATETIME),
-            openapi.Parameter('package_type', openapi.IN_QUERY, description="Filter by package type (e.g. hajj, umrah, ziyarah)", type=openapi.TYPE_STRING, default='all'),
+            openapi.Parameter('package_type', openapi.IN_QUERY, description="Filter by package type (e.g. hajj, umrah)", type=openapi.TYPE_STRING, default='all'),
         ],
         tags=["Reports"],
         responses={
@@ -1491,30 +1497,6 @@ class BookingTypeStatusCountWithPriceAPIView(APIView):
                             "Rejected": 0,
                             "Rejected_price": 0,
                         },
-                        "Ziyarah": {
-                            "Initialize": 0,
-                            "Initialize_price": 0,
-                            "Passport_Validation": 0,
-                            "Passport_Validation_price": 0,
-                            "Paid": 0,
-                            "Paid_price": 0,
-                            "Confirm": 0,
-                            "Confirm_price": 0,
-                            "Pending": 0,
-                            "Pending_price": 0,
-                            "Active": 0,
-                            "Active_price": 0,
-                            "Completed": 0,
-                            "Completed_price": 0,
-                            "Closed": 0,
-                            "Closed_price": 0,
-                            "Objection": 0,
-                            "Objection_price": 0,
-                            "Report": 0,
-                            "Report_price": 0,
-                            "Rejected": 0,
-                            "Rejected_price": 0,
-                        }
                     }
                 }
             ),
@@ -1533,7 +1515,7 @@ class BookingTypeStatusCountWithPriceAPIView(APIView):
                 return error_response
 
             # Start with all bookings
-            bookings = Booking.objects.all()
+            bookings = Booking.objects.filter(package_token__package_type__in=SUPPORTED_PACKAGE_TYPES)
 
             # Apply country filter
             if country != 'all':
@@ -1568,7 +1550,7 @@ class BookingTypeStatusCountWithPriceAPIView(APIView):
             )
 
             # Initialize result structure with all package types and statuses
-            package_types = ['Hajj', 'Umrah', 'Ziyarah']
+            package_types = list(SUPPORTED_PACKAGE_TYPES)
             booking_statuses = [choice[0] for choice in Booking.BOOKING_TYPE]
 
             result = {pt: {} for pt in package_types}
@@ -1601,18 +1583,18 @@ class BookingStatsByPackageAPIView(APIView):
     permission_classes = [IsAdminUser]
 
     @swagger_auto_schema(
-        operation_description="Get the total bookings, sum of total prices, and sum of number of adults, children, and infants for each package type (Hajj, Umrah, Ziyarah), with filters based on country, city, and date range.",
+        operation_description="Get the total bookings, sum of total prices, and sum of number of adults, children, and infants for each package type (Hajj and Umrah), with filters based on country, city, and date range.",
         manual_parameters=[
             openapi.Parameter('country', openapi.IN_QUERY, description="Filter by country", type=openapi.TYPE_STRING, default='all'),
             openapi.Parameter('city', openapi.IN_QUERY, description="Filter by city", type=openapi.TYPE_STRING, default='all'),
             openapi.Parameter('start_date', openapi.IN_QUERY, description="Filter bookings from this date", type=openapi.TYPE_STRING, format=openapi.FORMAT_DATETIME),
             openapi.Parameter('end_date', openapi.IN_QUERY, description="Filter bookings until this date", type=openapi.TYPE_STRING, format=openapi.FORMAT_DATETIME),
-            openapi.Parameter('package_type', openapi.IN_QUERY, description="Filter by package type (e.g. hajj, umrah, ziyarah)", type=openapi.TYPE_STRING, default='all'),
+            openapi.Parameter('package_type', openapi.IN_QUERY, description="Filter by package type (e.g. hajj, umrah)", type=openapi.TYPE_STRING, default='all'),
         ],
         tags=["Reports"],
         responses={
             200: openapi.Response(
-                description="Total bookings stats for Hajj, Umrah, and Ziyarah with filtering",
+                description="Total bookings stats for Hajj and Umrah with filtering",
                 examples={
                     "application/json": {
                         "Hajj": {
@@ -1623,13 +1605,6 @@ class BookingStatsByPackageAPIView(APIView):
                             "total_infants": 0,
                         },
                         "Umrah": {
-                            "total_bookings": 0,
-                            "total_price": 0.0,
-                            "total_adults": 0,
-                            "total_children": 0,
-                            "total_infants": 0,
-                        },
-                        "Ziyarah": {
                             "total_bookings": 0,
                             "total_price": 0.0,
                             "total_adults": 0,
@@ -1654,7 +1629,7 @@ class BookingStatsByPackageAPIView(APIView):
                 return error_response
 
             # Start with all bookings
-            bookings = Booking.objects.all()
+            bookings = Booking.objects.filter(package_token__package_type__in=SUPPORTED_PACKAGE_TYPES)
 
             # Apply country filter
             if country != 'all':
@@ -1690,7 +1665,7 @@ class BookingStatsByPackageAPIView(APIView):
             )
 
             # Initialize result structure for all package types
-            package_types = ['Hajj', 'Umrah', 'Ziyarah']
+            package_types = list(SUPPORTED_PACKAGE_TYPES)
             result = {pt: {
                 "total_bookings": 0,
                 "total_price": 0.0,
