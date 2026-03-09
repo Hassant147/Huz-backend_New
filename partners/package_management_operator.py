@@ -118,6 +118,7 @@ STATUS_NORMALIZER = {
     "pending": "Pending",
 }
 SUPPORTED_PACKAGE_TYPES = ("Hajj", "Umrah")
+PACKAGE_BOOKING_VALIDITY_LEAD_DAYS = 2
 MASTER_HOTEL_PACKAGE_TOKEN = "__system_master_hotel_package__"
 
 
@@ -202,6 +203,13 @@ def _parse_datetime_value(value):
         return timezone.make_aware(parsed_datetime, timezone.get_current_timezone())
 
     return None
+
+
+def _derive_package_validity(start_date):
+    if not start_date:
+        return None
+
+    return start_date - timedelta(days=PACKAGE_BOOKING_VALIDITY_LEAD_DAYS)
 
 
 def _build_package_token_query(raw_token):
@@ -392,7 +400,7 @@ class OperatorPackageBaseView(APIView):
             elif create:
                 normalized[field] = False
 
-        for date_field in ("start_date", "end_date", "package_validity"):
+        for date_field in ("start_date", "end_date"):
             if payload.get(date_field) not in (None, ""):
                 parsed_datetime = _parse_datetime_value(payload.get(date_field))
                 if not parsed_datetime:
@@ -410,14 +418,19 @@ class OperatorPackageBaseView(APIView):
             if "end_date" not in normalized:
                 normalized["end_date"] = normalized["start_date"] + timedelta(days=nights_total)
 
-            if "package_validity" not in normalized:
-                normalized["package_validity"] = normalized["end_date"]
+            normalized["package_validity"] = _derive_package_validity(
+                normalized["start_date"]
+            )
 
             if payload.get("package_base_cost") in (None, ""):
                 normalized["package_base_cost"] = _to_float(
                     payload.get("cost_for_sharing"),
                     0.0,
                 )
+        elif "start_date" in normalized:
+            normalized["package_validity"] = _derive_package_validity(
+                normalized["start_date"]
+            )
 
         return normalized, None
 
@@ -485,14 +498,7 @@ class OperatorPackageBaseView(APIView):
             if end_date < start_date:
                 return None, f"package_date_range[{index}].end_date must be after start_date."
 
-            validity_raw = item.get("package_validity") or item.get("packageValidity")
-            package_validity = (
-                _parse_datetime_value(validity_raw)
-                if validity_raw not in (None, "")
-                else end_date
-            )
-            if validity_raw not in (None, "") and package_validity is None:
-                return None, f"package_date_range[{index}].package_validity: Invalid datetime value."
+            package_validity = _derive_package_validity(start_date)
 
             group_raw = item.get("group_capacity")
             if group_raw is None:
@@ -582,7 +588,10 @@ class OperatorPackageBaseView(APIView):
         package.start_date = ranges[0].start_date
         package.end_date = max(item.end_date for item in ranges)
         package.package_validity = max(
-            (item.package_validity or item.end_date for item in ranges),
+            (
+                item.package_validity or _derive_package_validity(item.start_date)
+                for item in ranges
+            ),
             default=package.end_date,
         )
         package.save(update_fields=["start_date", "end_date", "package_validity"])
@@ -754,7 +763,8 @@ class CreateHuzPackageView(OperatorPackageBaseView):
                             "start_date": package.start_date,
                             "end_date": package.end_date,
                             "group_capacity": None,
-                            "package_validity": package.package_validity or package.end_date,
+                            "package_validity": package.package_validity
+                            or _derive_package_validity(package.start_date),
                         }
                     ]
 

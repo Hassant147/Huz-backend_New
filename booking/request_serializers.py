@@ -76,6 +76,7 @@ class BookingCreateRequestSerializer(serializers.Serializer):
     session_token = serializers.CharField()
     partner_session_token = serializers.CharField()
     huz_token = serializers.CharField()
+    package_date_range_id = serializers.UUIDField(required=False, allow_null=True)
     adults = serializers.IntegerField()
     child = serializers.IntegerField(required=False, default=0)
     infants = serializers.IntegerField(required=False, default=0)
@@ -94,6 +95,7 @@ class BookingCreateRequestSerializer(serializers.Serializer):
 class BookingPaymentCreateRequestSerializer(serializers.Serializer):
     session_token = serializers.CharField()
     booking_number = serializers.CharField()
+    payment_id = serializers.UUIDField(required=False)
     transaction_number = serializers.CharField()
     transaction_type = serializers.CharField()
     transaction_amount = serializers.FloatField()
@@ -106,8 +108,10 @@ class BookingPaymentUpdateRequestSerializer(BookingPaymentCreateRequestSerialize
 class BookingPaymentPhotoUploadRequestSerializer(serializers.Serializer):
     session_token = serializers.CharField()
     booking_number = serializers.CharField()
+    payment_id = serializers.UUIDField(required=False)
     transaction_amount = serializers.FloatField()
     transaction_type = serializers.CharField()
+    transaction_number = serializers.CharField(required=False, allow_blank=True)
 
 
 class PassportValidityCreateRequestSerializer(serializers.Serializer):
@@ -120,6 +124,8 @@ class PassportValidityCreateRequestSerializer(serializers.Serializer):
     passport_number = serializers.CharField()
     passport_country = serializers.CharField()
     expiry_date = DateOrDateTimeField()
+    user_passport = serializers.FileField(required=False, allow_null=True)
+    user_photo = serializers.FileField(required=False, allow_null=True)
 
 
 class PassportValidityUpdateRequestSerializer(PassportValidityCreateRequestSerializer):

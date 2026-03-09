@@ -1205,25 +1205,59 @@ def _resolve_website_min_start_date(request, base_minimum_start_date):
     return base_minimum_start_date
 
 
-def _get_website_date_range_prefetch(minimum_start_date):
-    queryset = HuzPackageDateRange.objects.order_by("start_date", "end_date")
-    if minimum_start_date:
-        queryset = queryset.filter(start_date__date__gte=minimum_start_date)
-    return Prefetch("package_date_ranges", queryset=queryset)
+def _get_website_visibility_date():
+    return datetime.now().date()
 
 
-def _filter_available_website_packages(queryset, minimum_start_date):
-    return queryset.filter(
+def _build_website_range_visibility_query(minimum_start_date, visibility_date):
+    return (
         Q(package_date_ranges__start_date__date__gte=minimum_start_date)
-        | Q(package_date_ranges__isnull=True, start_date__date__gte=minimum_start_date)
+        & (
+            Q(package_date_ranges__package_validity__date__gte=visibility_date)
+            | Q(
+                package_date_ranges__package_validity__isnull=True,
+                package_date_ranges__start_date__date__gte=visibility_date,
+            )
+        )
     )
 
 
-def _optimize_website_package_queryset(queryset, minimum_start_date):
-    upcoming_range_filter = (
-        Q(package_date_ranges__start_date__date__gte=minimum_start_date)
-        if minimum_start_date
-        else Q()
+def _build_website_package_visibility_query(minimum_start_date, visibility_date):
+    return (
+        Q(start_date__date__gte=minimum_start_date)
+        & (
+            Q(package_validity__date__gte=visibility_date)
+            | Q(package_validity__isnull=True, start_date__date__gte=visibility_date)
+        )
+    )
+
+
+def _get_website_date_range_prefetch(minimum_start_date, visibility_date):
+    queryset = HuzPackageDateRange.objects.order_by("start_date", "end_date")
+    if minimum_start_date:
+        queryset = queryset.filter(start_date__date__gte=minimum_start_date)
+    if visibility_date:
+        queryset = queryset.filter(
+            Q(package_validity__date__gte=visibility_date)
+            | Q(package_validity__isnull=True, start_date__date__gte=visibility_date)
+        )
+    return Prefetch("package_date_ranges", queryset=queryset)
+
+
+def _filter_available_website_packages(queryset, minimum_start_date, visibility_date):
+    return queryset.filter(
+        _build_website_range_visibility_query(minimum_start_date, visibility_date)
+        | (
+            Q(package_date_ranges__isnull=True)
+            & _build_website_package_visibility_query(minimum_start_date, visibility_date)
+        )
+    )
+
+
+def _optimize_website_package_queryset(queryset, minimum_start_date, visibility_date):
+    upcoming_range_filter = _build_website_range_visibility_query(
+        minimum_start_date,
+        visibility_date,
     )
     return (
         queryset.select_related("package_provider")
@@ -1233,17 +1267,29 @@ def _optimize_website_package_queryset(queryset, minimum_start_date):
                 F("start_date"),
             ),
         )
-        .prefetch_related(*WEBSITE_PACKAGE_PREFETCH_RELATED, _get_website_date_range_prefetch(minimum_start_date))
+        .prefetch_related(
+            *WEBSITE_PACKAGE_PREFETCH_RELATED,
+            _get_website_date_range_prefetch(minimum_start_date, visibility_date),
+        )
     )
 
 
-def _build_website_package_queryset(package_type, minimum_start_date):
+def _build_website_package_queryset(package_type, minimum_start_date, visibility_date=None):
+    visibility_date = visibility_date or _get_website_visibility_date()
     base_queryset = _supported_package_queryset().filter(
         package_type=package_type,
         package_status="Active",
     )
-    base_queryset = _filter_available_website_packages(base_queryset, minimum_start_date)
-    return _optimize_website_package_queryset(base_queryset, minimum_start_date)
+    base_queryset = _filter_available_website_packages(
+        base_queryset,
+        minimum_start_date,
+        visibility_date,
+    )
+    return _optimize_website_package_queryset(
+        base_queryset,
+        minimum_start_date,
+        visibility_date,
+    )
 
 
 def _apply_website_filters(queryset, request):
@@ -1396,7 +1442,7 @@ class GetHuzShortPackageForWebsiteView(APIView):
             if not package_type:
                 return Response({"message": "Invalid package_type. Use Hajj or Umrah."}, status=status.HTTP_400_BAD_REQUEST)
 
-            default_min_start_date = datetime.now().date() + timedelta(days=10)
+            default_min_start_date = _get_website_visibility_date()
             min_start_date = _resolve_website_min_start_date(request, default_min_start_date)
             packages_list = _build_website_package_queryset(package_type, min_start_date)
             packages_list = _apply_website_filters(packages_list, request)
@@ -1433,12 +1479,17 @@ class GetHuzPackageDetailForWebsiteView(APIView):
             if not huz_token:
                 return Response({"message": "Missing package information."}, status=status.HTTP_400_BAD_REQUEST)
 
-            min_start_date = datetime.now().date() + timedelta(days=10)
+            min_start_date = _get_website_visibility_date()
             packages_list = _filter_available_website_packages(
                 _supported_package_queryset().filter(huz_token=huz_token, package_status="Active"),
                 min_start_date,
+                _get_website_visibility_date(),
             )
-            packages_list = _optimize_website_package_queryset(packages_list, min_start_date)
+            packages_list = _optimize_website_package_queryset(
+                packages_list,
+                min_start_date,
+                _get_website_visibility_date(),
+            )
 
             if packages_list.exists():
                 serialized_package = HuzAlignedPackageSerializer(packages_list, many=True)
@@ -1480,7 +1531,7 @@ class GetPackageCountCitiesWiseForWebsiteView(APIView):
             package_type = _normalize_package_type(requested_package_type)
             if not package_type:
                 return Response({"message": "Invalid package_type. Use Hajj or Umrah."}, status=status.HTTP_400_BAD_REQUEST)
-            min_start_date = datetime.now().date() + timedelta(days=10)
+            min_start_date = _get_website_visibility_date()
 
             active_package_ids = _build_website_package_queryset(
                 package_type,
@@ -1529,7 +1580,7 @@ class GetHuzFeaturedPackageForWebsiteView(APIView):
             if not package_type:
                 return Response({"message": "Invalid package_type. Use Hajj or Umrah."}, status=status.HTTP_400_BAD_REQUEST)
 
-            default_min_start_date = datetime.now().date() + timedelta(days=10)
+            default_min_start_date = _get_website_visibility_date()
             min_start_date = _resolve_website_min_start_date(request, default_min_start_date)
             packages_list = _build_website_package_queryset(package_type, min_start_date).filter(is_featured=True)
             packages_list = _apply_website_sorting(packages_list, request.GET.get("ordering")).distinct()
@@ -1578,7 +1629,7 @@ class GetSearchPackageByCityNDateView(APIView):
             if not package_type:
                 return Response({"message": "Invalid package_type. Use Hajj or Umrah."}, status=status.HTTP_400_BAD_REQUEST)
 
-            default_min_start_date = datetime.now().date() + timedelta(days=10)
+            default_min_start_date = _get_website_visibility_date()
             min_start_date = _resolve_website_min_start_date(request, default_min_start_date)
             packages_list = _build_website_package_queryset(package_type, min_start_date)
             packages_list = _apply_website_filters(packages_list, request)

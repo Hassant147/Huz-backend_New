@@ -195,6 +195,18 @@ def send_payment_verification_email(email, name, booking_number):
     return "Payment verification email is being sent"
 
 
+def send_payment_rejection_email(email, name, booking_number, review_message):
+    subject = f'Payment update needed for booking {booking_number}'
+    html_content = render_to_string('emails/payment-rejected.html', {
+        'email': email,
+        'name': name,
+        'booking_number': booking_number,
+        'review_message': review_message,
+    })
+    _dispatch_email(email, subject, html_content)
+    return "Payment rejection email is being sent"
+
+
 def send_new_order_email(email, name, package_type, package_name, start_date,  adults, infants, child, total_price, booking_number):
     subject = f'New Booking Received - {booking_number}'
     html_content = render_to_string('emails/partner-new-booking.html', {

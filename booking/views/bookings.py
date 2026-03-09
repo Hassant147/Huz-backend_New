@@ -9,7 +9,12 @@ from common.permissions import IsAdminOrAuthenticatedUserProfile
 from .. import manage_bookings as legacy_manage_bookings
 from ..request_serializers import BookingCreateRequestSerializer, validate_serializer_or_raise
 from ..serializers import DetailBookingSerializer
-from ..services import create_booking, get_user_bookings_queryset
+from ..services import (
+    create_booking,
+    get_booking_by_identifier_for_user,
+    get_user_bookings_queryset,
+    remove_booking_for_user,
+)
 
 
 ManageBookingsView = legacy_manage_bookings.ManageBookingsView
@@ -63,10 +68,31 @@ class BookingViewSet(viewsets.ViewSet):
         )
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    def retrieve(self, request, pk=None):
+        _, user_profile = _payload_with_user_session(request, request.query_params)
+        booking = get_booking_by_identifier_for_user(
+            user_profile,
+            pk,
+            must_be_future=False,
+        )
+        serializer = DetailBookingSerializer(booking, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
     def create(self, request):
         payload, _ = _payload_with_user_session(request, request.data)
         input_serializer = BookingCreateRequestSerializer(data=payload)
         validated_data = validate_serializer_or_raise(input_serializer)
-        booking = create_booking(validated_data)
+        booking, created = create_booking(validated_data)
         serializer = DetailBookingSerializer(booking, context={"request": request})
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(
+            serializer.data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+    def destroy(self, request, pk=None):
+        payload, user_profile = _payload_with_user_session(request, request.data or request.query_params)
+        result = remove_booking_for_user(
+            payload.get("session_token") or user_profile.session_token,
+            pk,
+        )
+        return Response(result, status=status.HTTP_200_OK)

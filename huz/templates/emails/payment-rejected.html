@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Payment update needed</title>
+  </head>
+  <body style="margin:0;padding:24px;background:#eceff1;font-family:Montserrat,Arial,sans-serif;color:#334155;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:12px;">
+      <tr>
+        <td style="padding:32px;">
+          <p style="margin:0 0 16px;font-size:24px;font-weight:700;color:#0f766e;">
+            Payment update needed
+          </p>
+          <p style="margin:0 0 16px;font-size:14px;line-height:24px;">
+            Hi {{ name }},
+          </p>
+          <p style="margin:0 0 16px;font-size:14px;line-height:24px;">
+            Your payment proof for booking <strong>{{ booking_number }}</strong> could not be approved.
+            Please open your application, review the note below, and submit updated payment proof.
+          </p>
+          <div style="margin:0 0 16px;padding:16px;border-radius:10px;background:#fff7ed;border:1px solid #fdba74;">
+            <p style="margin:0;font-size:14px;line-height:24px;color:#9a3412;">
+              {{ review_message|default:"Please upload a clearer or corrected payment proof and try again." }}
+            </p>
+          </div>
+          <p style="margin:0 0 16px;font-size:14px;line-height:24px;">
+            You can continue from the <strong>My Applications</strong> section of your Huz account.
+          </p>
+          <p style="margin:0;font-size:14px;line-height:24px;">
+            Best regards,<br />
+            The HajjUmrah.co Team
+          </p>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>

@@ -1,3 +1,6 @@
+from datetime import datetime
+
+from django.utils import timezone
 from rest_framework import serializers
 from .models import CustomPackages, Booking, Payment, BookingRequest, PassportValidity, BookingObjections, PartnersBookingPayment, BookingDocuments, DocumentsStatus, BookingAirlineDetail, BookingHotelAndTransport, BookingRatingAndReview, BookingComplaints, UserRequiredDocuments
 from common.models import UserProfile, MailingDetail
@@ -31,6 +34,18 @@ def _list_related_items(instance, relation_name):
 def _get_first_related_item(instance, relation_name):
     related_items = _list_related_items(instance, relation_name)
     return related_items[0] if related_items else None
+
+
+def _get_datetime_sort_value(value):
+    if isinstance(value, datetime):
+        if timezone.is_naive(value):
+            value = timezone.make_aware(value, timezone.get_current_timezone())
+        return value.timestamp()
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def get_company_detail(obj):
@@ -77,7 +92,11 @@ def get_passport_validity(obj):
 
 
 def get_payment_detail(obj):
-    payment_paid = _list_related_items(obj, 'booking_token')
+    payment_paid = sorted(
+        _list_related_items(obj, 'booking_token'),
+        key=lambda payment: _get_datetime_sort_value(getattr(payment, 'transaction_time', None)),
+        reverse=True,
+    )
     return PaymentSerializer(payment_paid, many=True).data
 
 
@@ -338,7 +357,16 @@ class AdminPaidBookingSerializer(serializers.ModelSerializer):
 class PaymentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Payment
-        fields = ['payment_id', 'transaction_number', 'transaction_photo', 'transaction_amount', 'transaction_time', 'transaction_type', 'payment_status']
+        fields = [
+            'payment_id',
+            'transaction_number',
+            'transaction_photo',
+            'transaction_amount',
+            'transaction_time',
+            'transaction_type',
+            'payment_status',
+            'review_message',
+        ]
 
 
 class BookingObjectionsSerializer(serializers.ModelSerializer):

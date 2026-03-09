@@ -222,6 +222,10 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
 
         self.assertEqual(created_package.start_date, created_range.start_date)
         self.assertEqual(created_package.end_date, created_range.end_date)
+        self.assertEqual(
+            created_range.package_validity,
+            range_start - timedelta(days=2),
+        )
         self.assertEqual(created_package.package_validity, created_range.package_validity)
 
     def test_get_package_detail_returns_404_for_unknown_token(self):
@@ -445,14 +449,14 @@ class PackageManagementWebsiteViewTests(APITransactionTestCase):
             start_date=early_start,
             end_date=early_end,
             group_capacity=12,
-            package_validity=early_end,
+            package_validity=early_start - timedelta(days=2),
             date_range_for_package=self.ranged_package,
         )
         self.future_range = HuzPackageDateRange.objects.create(
             start_date=next_visible_start,
             end_date=next_visible_end,
             group_capacity=18,
-            package_validity=next_visible_end,
+            package_validity=next_visible_start - timedelta(days=2),
             date_range_for_package=self.ranged_package,
         )
         HuzAirlineDetail.objects.create(
@@ -480,7 +484,7 @@ class PackageManagementWebsiteViewTests(APITransactionTestCase):
             start_date=next_visible_start + timedelta(days=1),
             end_date=next_visible_end + timedelta(days=1),
             group_capacity=None,
-            package_validity=next_visible_end + timedelta(days=1),
+            package_validity=next_visible_start - timedelta(days=1),
             date_range_for_package=self.landed_package,
         )
 
@@ -498,7 +502,7 @@ class PackageManagementWebsiteViewTests(APITransactionTestCase):
             start_date=later_start,
             end_date=later_end,
             group_capacity=10,
-            package_validity=later_end,
+            package_validity=later_start - timedelta(days=2),
             date_range_for_package=self.unrated_package,
         )
         HuzHotelDetail.objects.create(
@@ -534,12 +538,12 @@ class PackageManagementWebsiteViewTests(APITransactionTestCase):
             item for item in results if item.get("huz_token") == self.ranged_package.huz_token
         )
 
-        self.assertEqual(len(ranged_package_payload.get("package_date_range") or []), 1)
+        self.assertEqual(len(ranged_package_payload.get("package_date_range") or []), 2)
         self.assertEqual(
             ranged_package_payload["package_date_range"][0].get("group_capacity"),
-            18,
+            12,
         )
-        self.assertEqual(ranged_package_payload.get("package_capacity"), 18)
+        self.assertEqual(ranged_package_payload.get("package_capacity"), 12)
         self.assertFalse(ranged_package_payload.get("is_landed"))
         self.assertNotIn("package_seats", ranged_package_payload)
         self.assertNotIn("start_date", ranged_package_payload)
@@ -557,6 +561,35 @@ class PackageManagementWebsiteViewTests(APITransactionTestCase):
         returned_tokens = {item.get("huz_token") for item in results}
 
         self.assertIn(self.ranged_package.huz_token, returned_tokens)
+
+    def test_website_list_excludes_packages_after_booking_validity_passes(self):
+        expired_start = timezone.now() + timedelta(days=4)
+        expired_end = expired_start + timedelta(days=7)
+        expired_package = HuzBasicDetail.objects.create(
+            huz_token="website-package-token-expired",
+            package_type="Umrah",
+            package_name="Expired Booking Window",
+            start_date=expired_start,
+            end_date=expired_end,
+            description="Future trip but booking window already closed.",
+            package_status="Active",
+            package_provider=self.partner,
+        )
+        HuzPackageDateRange.objects.create(
+            start_date=expired_start,
+            end_date=expired_end,
+            group_capacity=6,
+            package_validity=timezone.now() - timedelta(days=1),
+            date_range_for_package=expired_package,
+        )
+
+        response = self._request_website_packages(package_type="Umrah")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.data.get("results") or []
+        returned_tokens = {item.get("huz_token") for item in results}
+
+        self.assertNotIn(expired_package.huz_token, returned_tokens)
 
     def test_website_detail_exposes_landed_packages_without_flight_data(self):
         request = self.factory.get(

@@ -22,8 +22,10 @@ from .request_serializers import (
     validate_serializer_or_raise,
 )
 from .services import (
+    _booking_passports_are_complete,
     create_booking,
     get_user_bookings_queryset,
+    remove_booking_for_user,
     record_booking_payment,
     update_booking_payment,
     validate_passport as create_passport_validation,
@@ -96,9 +98,12 @@ class ManageBookingsView(APIView):
         try:
             input_serializer = BookingCreateRequestSerializer(data=request.data)
             validated_data = validate_serializer_or_raise(input_serializer)
-            booking = create_booking(validated_data)
+            booking, created = create_booking(validated_data)
             serialized_booking = DetailBookingSerializer(booking)
-            return Response(serialized_booking.data, status=status.HTTP_201_CREATED)
+            return Response(
+                serialized_booking.data,
+                status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+            )
 
         except APIException:
             raise
@@ -292,20 +297,11 @@ class ManageBookingsView(APIView):
             user = UserProfile.objects.filter(session_token=session_token).first()
             if not user:
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+            result = remove_booking_for_user(session_token, booking_number)
+            return Response(result, status=status.HTTP_200_OK)
 
-            # Find the booking detail by user and booking number
-            booking_detail = Booking.objects.filter(order_by=user, booking_number=booking_number).first()
-            if not booking_detail:
-                return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Ensure booking status is "Initialize"
-            if booking_detail.booking_status != "Initialize":
-                return Response({"message": "Oops, this request cannot be processed. Please contact the support team."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Delete the booking
-            booking_detail.delete()
-            return Response({"message": "Selected booking request has been removed."}, status=status.HTTP_200_OK)
-
+        except APIException:
+            raise
         except Exception as e:
             # Log the error and return a generic error response
             logger.error(f"Error in ManageBookingsView-Delete: {str(e)}")
@@ -313,7 +309,7 @@ class ManageBookingsView(APIView):
 
 
 class ManagePassportValidityView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrAuthenticatedUserProfile]
 
     @swagger_auto_schema(
         operation_description="Submit a request to validate passport for a booking.",
@@ -438,7 +434,7 @@ class GetAllBookingsByUserView(APIView):
 
 
 class PaidAmountByTransactionNumberView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrAuthenticatedUserProfile]
 
     @swagger_auto_schema(
         operation_description="Create - Record a payment transaction for a booking",
@@ -516,7 +512,7 @@ class PaidAmountByTransactionNumberView(APIView):
 
 
 class PaidAmountTransactionPhotoView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrAuthenticatedUserProfile]
     parser_classes = [MultiPartParser, FormParser]
 
     @swagger_auto_schema(
@@ -610,7 +606,7 @@ class PaidAmountTransactionPhotoView(APIView):
 
 
 class DeleteAmountTransactionPhotoView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrAuthenticatedUserProfile]
 
     @swagger_auto_schema(
         operation_description="Delete a payment transaction record for a booking",
@@ -668,7 +664,7 @@ class DeleteAmountTransactionPhotoView(APIView):
 
 
 class ManageUserPassportView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrAuthenticatedUserProfile]
     parser_classes = [MultiPartParser, FormParser]
 
     @swagger_auto_schema(
@@ -725,7 +721,10 @@ class ManageUserPassportView(APIView):
         # Check if the traveller information exists for the booking number
 
         # Check if the specific passport exists in traveller information
-        traveller_info = PassportValidity.objects.filter(passport_id=passport_id).first()
+        traveller_info = PassportValidity.objects.filter(
+            passport_id=passport_id,
+            passport_for_booking_number=booking_detail,
+        ).first()
         if not traveller_info:
             return Response({"message": "Traveller information not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -739,11 +738,7 @@ class ManageUserPassportView(APIView):
             traveller_status = PassportValidity.objects.filter(passport_for_booking_number=booking_detail)
             if not traveller_status.exists():
                 return Response({"message": "No Traveller information found."}, status=status.HTTP_404_NOT_FOUND)
-            is_completed = True  # Start by assuming all records are filled
-            for passport in traveller_status:
-                if not passport.user_passport or not passport.user_photo or not passport.first_name or not passport.last_name or not passport.date_of_birth or not passport.passport_number or not passport.passport_country or not passport.expiry_date:
-                    is_completed = False
-                    break
+            is_completed = _booking_passports_are_complete(booking_detail)
             # Update the booking status if all documents are completed
             if is_completed:
                 booking_detail.booking_status = "Pending"
@@ -774,7 +769,7 @@ class ManageUserPassportView(APIView):
 
 
 class ManageUserPassportPhotoView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrAuthenticatedUserProfile]
     parser_classes = [MultiPartParser, FormParser]
 
     @swagger_auto_schema(
@@ -829,7 +824,10 @@ class ManageUserPassportPhotoView(APIView):
             return Response({"message": "Package detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
         # Check if the specific passport exists in traveller information
-        traveller_info = PassportValidity.objects.filter(passport_id=passport_id).first()
+        traveller_info = PassportValidity.objects.filter(
+            passport_id=passport_id,
+            passport_for_booking_number=booking_detail,
+        ).first()
         if not traveller_info:
             return Response({"message": "Traveller information not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -842,12 +840,7 @@ class ManageUserPassportPhotoView(APIView):
             traveller_status = PassportValidity.objects.filter(passport_for_booking_number=booking_detail)
             if not traveller_status.exists():
                 return Response({"message": "No Traveller information found."}, status=status.HTTP_404_NOT_FOUND)
-
-            is_completed = True  # Start by assuming all records are filled
-            for passport in traveller_status:
-                if not passport.user_passport or not passport.user_photo or not passport.first_name or not passport.last_name or not passport.date_of_birth or not passport.passport_number or not passport.passport_country or not passport.expiry_date:
-                    is_completed = False
-                    break
+            is_completed = _booking_passports_are_complete(booking_detail)
             # Update the booking status if all documents are completed
             if is_completed:
                 booking_detail.booking_status = "Pending"

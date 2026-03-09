@@ -5,11 +5,11 @@ from drf_yasg.utils import swagger_auto_schema
 from rest_framework import status
 from rest_framework.exceptions import APIException, ValidationError
 from rest_framework.parsers import FormParser, MultiPartParser
-from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from common.logs_file import logger
+from common.permissions import IsAdminOrAuthenticatedUserProfile
 
 from .. import manage_bookings as legacy_manage_bookings
 from ..request_serializers import (
@@ -44,6 +44,8 @@ def _payment_upload_error(message):
 def _validate_payment_upload_files(files):
     if not files:
         _payment_upload_error("transaction_photo: At least one file is required.")
+    if len(files) > 1:
+        _payment_upload_error("transaction_photo: Only one receipt file can be uploaded per payment.")
 
     for uploaded_file in files:
         extension = Path(uploaded_file.name or "").suffix.lower()
@@ -60,7 +62,7 @@ def _validate_payment_upload_files(files):
 
 
 class PaidAmountTransactionPhotoView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAdminOrAuthenticatedUserProfile]
     parser_classes = [MultiPartParser, FormParser]
 
     @swagger_auto_schema(

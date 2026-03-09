@@ -111,12 +111,20 @@ class Payment(models.Model):
     transaction_amount = models.FloatField()
     transaction_time = models.DateTimeField(default=timezone.now)
     payment_status = models.CharField(max_length=50, null=True)
+    review_message = models.TextField(null=True, blank=True)
     # Reference to the related booking
     booking_token = models.ForeignKey(Booking, related_name='booking_token', on_delete=models.SET_NULL, null=True)
 
     class Meta:
         indexes = [
             models.Index(fields=['booking_token', 'transaction_time'], name='payment_booking_time_idx'),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['transaction_number'],
+                condition=models.Q(transaction_number__isnull=False) & ~models.Q(transaction_number=''),
+                name='payment_transaction_number_unique',
+            ),
         ]
 
     def __str__(self):

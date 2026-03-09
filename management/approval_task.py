@@ -23,7 +23,15 @@ from partners.models import (
 )
 from partners.serializers import PartnerProfileSerializer, HuzBasicSerializer, HuzHotelSerializer
 from common.logs_file import logger
-from common.utility import send_company_approval_email, send_payment_verification_email, preparation_email
+from common.utility import (
+    save_notification,
+    send_company_approval_email,
+    send_payment_rejection_email,
+    send_payment_verification_email,
+    send_push_notification,
+    preparation_email,
+)
+from booking.flow_utils import get_expected_traveller_count
 from booking.models import Booking, PartnersBookingPayment, Payment, PassportValidity
 from booking.serializers import DetailBookingSerializer, PartnersBookingPaymentSerializer, AdminPaidBookingSerializer
 from django.utils import timezone
@@ -61,10 +69,70 @@ HOTEL_AMENITY_FIELDS = (
 )
 MAX_MASTER_HOTEL_IMAGES = 6
 MAX_MASTER_HOTEL_IMAGE_SIZE_BYTES = 5 * 1024 * 1024
+PAYMENT_REVIEWABLE_BOOKING_STATUSES = {"Paid", "Confirm", "Passport_Validation", "Pending"}
 
 
 def _invalidate_management_cache():
     cache.delete_many(MANAGEMENT_CACHE_KEYS)
+
+
+def _normalize_payment_review_decision(value):
+    normalized_value = str(value or "approve").strip().lower()
+    if normalized_value in {"approve", "approved"}:
+        return "approve"
+    if normalized_value in {"reject", "rejected"}:
+        return "reject"
+    return ""
+
+
+def _collect_user_notification_tokens(user):
+    tokens = []
+    for token in (
+        getattr(user, "firebase_token", ""),
+        getattr(user, "web_firebase_token", ""),
+    ):
+        normalized_token = str(token or "").strip()
+        if normalized_token and normalized_token not in tokens:
+            tokens.append(normalized_token)
+    return tokens
+
+
+def _notify_user_about_payment_update(user, booking_number, title, message):
+    save_notification(
+        user,
+        title,
+        message,
+        getattr(user, "firebase_token", "") or "",
+        getattr(user, "web_firebase_token", "") or "",
+        booking_number,
+    )
+
+    if not getattr(user, "is_notification_allowed", True):
+        return
+
+    registration_tokens = _collect_user_notification_tokens(user)
+    if not registration_tokens:
+        return
+
+    try:
+        send_push_notification(
+            title,
+            message,
+            registration_tokens,
+            {
+                "booking_number": str(booking_number or ""),
+            },
+        )
+    except Exception as exc:
+        logger.error("Failed to send push notification for booking %s: %s", booking_number, str(exc))
+
+
+def _has_approved_payment_for_stage(booking, transaction_type):
+    return Payment.objects.filter(
+        booking_token=booking,
+        transaction_type__iexact=transaction_type,
+        payment_status__iexact="Approved",
+    ).exists()
 
 
 def _coerce_bool(value):
@@ -859,13 +927,15 @@ class ApproveBookingPaymentView(APIView):
     permission_classes = [IsAdminUser]
 
     @swagger_auto_schema(
-        operation_description="Confirm payment and update booking status",
+        operation_description="Approve or reject a booking payment submission",
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
             properties={
                 'session_token': openapi.Schema(type=openapi.TYPE_STRING, description='User session token'),
                 'booking_number': openapi.Schema(type=openapi.TYPE_STRING, description='Booking number'),
-                'payment_id': openapi.Schema(type=openapi.TYPE_STRING, description='Optional payment Id')
+                'payment_id': openapi.Schema(type=openapi.TYPE_STRING, description='Optional payment Id'),
+                'decision': openapi.Schema(type=openapi.TYPE_STRING, description='approve or reject', enum=['approve', 'reject']),
+                'review_message': openapi.Schema(type=openapi.TYPE_STRING, description='Optional rejection reason shown to the user'),
             },
             required=['session_token', 'booking_number']
         ),
@@ -874,7 +944,7 @@ class ApproveBookingPaymentView(APIView):
             400: "Bad Request: Missing or invalid input data.",
             401: "Unauthorized: Admin permissions required",
             404: "Not Found: Booking detail or user detail not found.",
-            409: "Conflict: Only bookings with 'Paid' status can be confirmed.",
+            409: "Conflict: Booking/payment state does not allow this review decision.",
             500: "Server Error: Internal server error."
         }
     )
@@ -885,10 +955,14 @@ class ApproveBookingPaymentView(APIView):
             session_token = (request.data.get("session_token") or "").strip()
             booking_number = (request.data.get("booking_number") or "").strip()
             payment_id = (request.data.get("payment_id") or "").strip()
+            decision = _normalize_payment_review_decision(request.data.get("decision"))
+            review_message = (request.data.get("review_message") or "").strip()
 
             # Check for missing required fields
             if not session_token or not booking_number:
                 return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
+            if not decision:
+                return Response({"message": "decision must be either 'approve' or 'reject'."}, status=status.HTTP_400_BAD_REQUEST)
 
             # Retrieve user profile based on session token
             user = UserProfile.objects.filter(session_token=session_token).first()
@@ -904,9 +978,11 @@ class ApproveBookingPaymentView(APIView):
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
             current_status = (booking_detail.booking_status or "").strip()
-            if current_status not in {"Paid", "Confirm"}:
-                return Response({"message": "Only bookings with 'Paid' status can be confirmed."},
-                                status=status.HTTP_409_CONFLICT)
+            if current_status not in PAYMENT_REVIEWABLE_BOOKING_STATUSES:
+                return Response(
+                    {"message": "Only bookings with a submitted payment can be reviewed."},
+                    status=status.HTTP_409_CONFLICT,
+                )
 
             payment_queryset = Payment.objects.select_for_update().filter(booking_token=booking_detail)
             if payment_id:
@@ -919,34 +995,86 @@ class ApproveBookingPaymentView(APIView):
             if not check_payment:
                 return Response({"message": "Payment record not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            booking_already_confirmed = (
-                current_status == "Confirm" and booking_detail.is_payment_received
-            )
-            payment_already_approved = ((check_payment.payment_status or "").strip() == "Approved")
+            normalized_payment_status = str(check_payment.payment_status or "").strip().lower()
 
-            if not payment_already_approved:
-                check_payment.payment_status = "Approved"
-                check_payment.save(update_fields=['payment_status'])
+            if decision == "approve":
+                if normalized_payment_status == "rejected":
+                    return Response(
+                        {"message": "Rejected payment must be resubmitted before it can be approved."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
 
-            transitioned_to_confirm = False
-            if not booking_already_confirmed:
-                booking_detail.booking_status = "Confirm"
-                booking_detail.is_payment_received = True
-                booking_detail.save(update_fields=['booking_status', 'is_payment_received'])
-                transitioned_to_confirm = True
+                payment_already_approved = normalized_payment_status == "approved"
+                if not payment_already_approved:
+                    check_payment.payment_status = "Approved"
+                    check_payment.review_message = None
+                    check_payment.save(update_fields=['payment_status', 'review_message'])
 
-            # Create only missing PassportValidity records to keep endpoint idempotent.
-            required_passports = max(int(booking_detail.adults or 0), 0)
-            existing_passports = PassportValidity.objects.filter(passport_for_booking_number=booking_detail).count()
-            missing_passports = max(required_passports - existing_passports, 0)
-            if missing_passports:
-                PassportValidity.objects.bulk_create(
-                    [PassportValidity(passport_for_booking_number=booking_detail) for _ in range(missing_passports)]
+                transitioned_to_confirm = False
+                if current_status == "Paid":
+                    booking_already_confirmed = booking_detail.is_payment_received
+                    if not booking_already_confirmed:
+                        booking_detail.booking_status = "Confirm"
+                        booking_detail.is_payment_received = True
+                        booking_detail.save(update_fields=['booking_status', 'is_payment_received'])
+                        transitioned_to_confirm = True
+                elif not booking_detail.is_payment_received:
+                    booking_detail.is_payment_received = True
+                    booking_detail.save(update_fields=['is_payment_received'])
+
+                # Create only missing PassportValidity records to keep endpoint idempotent.
+                required_passports = get_expected_traveller_count(booking_detail)
+                existing_passports = PassportValidity.objects.filter(passport_for_booking_number=booking_detail).count()
+                missing_passports = max(required_passports - existing_passports, 0)
+                if missing_passports:
+                    PassportValidity.objects.bulk_create(
+                        [PassportValidity(passport_for_booking_number=booking_detail) for _ in range(missing_passports)]
+                    )
+
+                if not payment_already_approved:
+                    send_payment_verification_email(user.email, user.name, booking_number)
+                    _notify_user_about_payment_update(
+                        user,
+                        booking_number,
+                        "Payment approved",
+                        f"Your payment for booking {booking_number} has been approved.",
+                    )
+
+                if transitioned_to_confirm:
+                    preparation_email(user.email, user.name, booking_detail.package_token.package_type)
+            else:
+                rejection_note = review_message or "Please upload a clearer or corrected payment proof and submit it again."
+
+                if normalized_payment_status == "approved":
+                    return Response(
+                        {"message": "Approved payments cannot be rejected."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                check_payment.payment_status = "Rejected"
+                check_payment.review_message = rejection_note
+                check_payment.save(update_fields=['payment_status', 'review_message'])
+
+                has_approved_minimum_payment = _has_approved_payment_for_stage(booking_detail, "Minimum")
+                if not has_approved_minimum_payment:
+                    next_status = "Initialize"
+                    update_fields = []
+                    if booking_detail.booking_status != next_status:
+                        booking_detail.booking_status = next_status
+                        update_fields.append("booking_status")
+                    if booking_detail.is_payment_received:
+                        booking_detail.is_payment_received = False
+                        update_fields.append("is_payment_received")
+                    if update_fields:
+                        booking_detail.save(update_fields=update_fields)
+
+                send_payment_rejection_email(user.email, user.name, booking_number, rejection_note)
+                _notify_user_about_payment_update(
+                    user,
+                    booking_number,
+                    "Payment rejected",
+                    f"Your payment for booking {booking_number} was rejected. {rejection_note}",
                 )
-
-            if transitioned_to_confirm:
-                send_payment_verification_email(user.email, user.name, booking_number)
-                preparation_email(user.email, user.name, booking_detail.package_token.package_type)
 
             # Serialize the updated booking detail and return response
             serialized_booking = DetailBookingSerializer(booking_detail)
@@ -963,7 +1091,7 @@ class FetchPaidBookingView(APIView):
     permission_classes = [IsAdminUser]
 
     @swagger_auto_schema(
-        operation_description="Fetch all bookings with status 'Paid'",
+        operation_description="Fetch all bookings with a payment submission awaiting admin review",
         responses={
             200: openapi.Response('Successfully retrieved booking details', AdminPaidBookingSerializer(many=True)),
             401: "Unauthorized: Admin permissions required",
@@ -977,8 +1105,10 @@ class FetchPaidBookingView(APIView):
             if cached_payload is not None:
                 return Response(cached_payload, status=status.HTTP_200_OK)
 
-            # Retrieve all bookings with status "Paid"
-            booking_details_qs = Booking.objects.filter(booking_status="Paid").select_related(
+            booking_details_qs = Booking.objects.filter(
+                booking_status__in=PAYMENT_REVIEWABLE_BOOKING_STATUSES,
+                booking_token__payment_status__iexact="Pending",
+            ).select_related(
                 'order_to',
                 'order_by',
                 'package_token',
@@ -1011,7 +1141,7 @@ class FetchPaidBookingView(APIView):
                     ),
                 ),
                 'booking_token',
-            )
+            ).order_by('-order_time').distinct()
 
             booking_details = list(booking_details_qs)
 
