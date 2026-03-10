@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from rest_framework import serializers
 from django.db.models import Count, Sum
 from django.utils import timezone
@@ -42,6 +44,36 @@ def _collect_hotel_images(instance):
         return []
 
     return _list_related_items(catalog_hotel, "hotel_images")
+
+
+def _resolve_package_date_range_validity(range_item):
+    package_validity = getattr(range_item, "package_validity", None)
+    if package_validity:
+        return package_validity
+
+    start_date = getattr(range_item, "start_date", None)
+    if not start_date:
+        return None
+
+    return start_date - timedelta(days=2)
+
+
+def _to_local_date(value):
+    if not value:
+        return None
+
+    if timezone.is_aware(value):
+        value = timezone.localtime(value)
+
+    return value.date() if hasattr(value, "date") else None
+
+
+def _is_package_date_range_expired(range_item, reference_date=None):
+    validity_date = _to_local_date(_resolve_package_date_range_validity(range_item))
+    if validity_date is None:
+        return False
+
+    return (reference_date or timezone.localdate()) > validity_date
 
 
 def get_type_and_detail(partner_profile):
@@ -369,6 +401,8 @@ class HuzBasicSerializer(serializers.ModelSerializer):
 
 
 class HuzPackageDateRangeSerializer(serializers.ModelSerializer):
+    is_expired = serializers.SerializerMethodField()
+
     class Meta:
         model = HuzPackageDateRange
         fields = [
@@ -377,7 +411,11 @@ class HuzPackageDateRangeSerializer(serializers.ModelSerializer):
             "end_date",
             "group_capacity",
             "package_validity",
+            "is_expired",
         ]
+
+    def get_is_expired(self, obj):
+        return _is_package_date_range_expired(obj)
 
 
 class HuzHotelSerializer(serializers.ModelSerializer):
@@ -485,6 +523,7 @@ def _serialize_package_date_ranges(obj):
             "end_date": obj.end_date,
             "group_capacity": None,
             "package_validity": obj.package_validity,
+            "is_expired": _is_package_date_range_expired(obj),
         }
     ]
 
@@ -498,7 +537,10 @@ def _get_primary_package_date_range(obj):
     future_ranges = [
         item for item in range_items if getattr(item, "start_date", None) and item.start_date >= now
     ]
-    return future_ranges[0] if future_ranges else range_items[0]
+    active_future_ranges = [
+        item for item in future_ranges if not _is_package_date_range_expired(item)
+    ]
+    return active_future_ranges[0] if active_future_ranges else future_ranges[0] if future_ranges else range_items[0]
 
 
 class HuzAlignedPackageSerializer(serializers.ModelSerializer):

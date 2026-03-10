@@ -433,6 +433,107 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
         self.assertIn("only allows 5 travellers", response.data.get("message", "").lower())
 
+    def test_v1_create_booking_rejects_expired_range_by_range_id(self):
+        expired_start_date = timezone.now() + timedelta(days=1)
+        expired_end_date = expired_start_date + timedelta(days=5)
+        range_package = HuzBasicDetail.objects.create(
+            huz_token="booking-workflow-expired-range-id-token",
+            package_type="Hajj",
+            package_name="Expired Range Package",
+            package_base_cost=1000,
+            cost_for_child=300,
+            cost_for_infants=100,
+            start_date=expired_start_date,
+            end_date=expired_end_date,
+            description="Expired range package",
+            package_status="Active",
+            package_provider=self.partner,
+        )
+        expired_range = HuzPackageDateRange.objects.create(
+            date_range_for_package=range_package,
+            start_date=expired_start_date,
+            end_date=expired_end_date,
+            group_capacity=5,
+            package_validity=timezone.now() - timedelta(days=1),
+        )
+
+        response = self.client.post(
+            "/api/v1/bookings/",
+            {
+                "partner_session_token": self.partner.partner_session_token,
+                "huz_token": range_package.huz_token,
+                "package_date_range_id": str(expired_range.range_id),
+                "adults": 2,
+                "child": 0,
+                "infants": 0,
+                "sharing": "0",
+                "quad": "0",
+                "triple": "0",
+                "double": "0",
+                "single": "2",
+                "start_date": expired_start_date.isoformat(),
+                "end_date": expired_end_date.isoformat(),
+                "total_price": 2000,
+                "special_request": "Expired by range id",
+                "payment_type": "Bank",
+            },
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn("no longer open for booking", response.data.get("message", "").lower())
+
+    def test_v1_create_booking_rejects_expired_range_by_matching_dates(self):
+        expired_start_date = timezone.now() + timedelta(days=1)
+        expired_end_date = expired_start_date + timedelta(days=5)
+        range_package = HuzBasicDetail.objects.create(
+            huz_token="booking-workflow-expired-range-match-token",
+            package_type="Hajj",
+            package_name="Expired Match Package",
+            package_base_cost=1000,
+            cost_for_child=300,
+            cost_for_infants=100,
+            start_date=expired_start_date,
+            end_date=expired_end_date,
+            description="Expired match package",
+            package_status="Active",
+            package_provider=self.partner,
+        )
+        HuzPackageDateRange.objects.create(
+            date_range_for_package=range_package,
+            start_date=expired_start_date,
+            end_date=expired_end_date,
+            group_capacity=5,
+            package_validity=timezone.now() - timedelta(days=1),
+        )
+
+        response = self.client.post(
+            "/api/v1/bookings/",
+            {
+                "partner_session_token": self.partner.partner_session_token,
+                "huz_token": range_package.huz_token,
+                "adults": 2,
+                "child": 0,
+                "infants": 0,
+                "sharing": "0",
+                "quad": "0",
+                "triple": "0",
+                "double": "0",
+                "single": "2",
+                "start_date": expired_start_date.isoformat(),
+                "end_date": expired_end_date.isoformat(),
+                "total_price": 2000,
+                "special_request": "Expired by matching dates",
+                "payment_type": "Bank",
+            },
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn("no longer open for booking", response.data.get("message", "").lower())
+
     def test_v1_create_booking_rejects_when_other_active_bookings_exhaust_range_capacity(self):
         other_customer = UserProfile.objects.create(
             session_token="booking-range-capacity-other-user-token",

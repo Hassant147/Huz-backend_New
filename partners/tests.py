@@ -430,6 +430,8 @@ class PackageManagementWebsiteViewTests(APITransactionTestCase):
 
         early_start = timezone.now() + timedelta(days=5)
         early_end = early_start + timedelta(days=7)
+        expired_future_start = timezone.now() + timedelta(days=1)
+        expired_future_end = expired_future_start + timedelta(days=7)
         next_visible_start = timezone.now() + timedelta(days=22)
         next_visible_end = next_visible_start + timedelta(days=7)
         later_start = timezone.now() + timedelta(days=28)
@@ -444,6 +446,13 @@ class PackageManagementWebsiteViewTests(APITransactionTestCase):
             description="Uses future package ranges",
             package_status="Active",
             package_provider=self.partner,
+        )
+        self.expired_future_range = HuzPackageDateRange.objects.create(
+            start_date=expired_future_start,
+            end_date=expired_future_end,
+            group_capacity=8,
+            package_validity=timezone.now() - timedelta(days=1),
+            date_range_for_package=self.ranged_package,
         )
         HuzPackageDateRange.objects.create(
             start_date=early_start,
@@ -538,17 +547,35 @@ class PackageManagementWebsiteViewTests(APITransactionTestCase):
             item for item in results if item.get("huz_token") == self.ranged_package.huz_token
         )
 
-        self.assertEqual(len(ranged_package_payload.get("package_date_range") or []), 2)
-        self.assertEqual(
-            ranged_package_payload["package_date_range"][0].get("group_capacity"),
-            12,
-        )
+        ranges = ranged_package_payload.get("package_date_range") or []
+        self.assertEqual(len(ranges), 3)
+        self.assertTrue(any(range_item.get("is_expired") for range_item in ranges))
+        self.assertTrue(any(not range_item.get("is_expired") for range_item in ranges))
         self.assertEqual(ranged_package_payload.get("package_capacity"), 12)
         self.assertFalse(ranged_package_payload.get("is_landed"))
         self.assertNotIn("package_seats", ranged_package_payload)
         self.assertNotIn("start_date", ranged_package_payload)
         self.assertNotIn("end_date", ranged_package_payload)
         self.assertNotIn("package_validity", ranged_package_payload)
+
+    def test_website_detail_returns_expired_future_ranges_with_explicit_status(self):
+        request = self.factory.get(
+            "/partner/get_package_detail_by_package_id_for_web/",
+            {"huz_token": self.ranged_package.huz_token},
+        )
+
+        response = GetHuzPackageDetailForWebsiteView.as_view()(request)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        package_payload = response.data[0]
+        ranges = package_payload.get("package_date_range") or []
+
+        self.assertEqual(len(ranges), 3)
+        self.assertIn("is_expired", ranges[0])
+        expired_range = next(
+            range_item for range_item in ranges if range_item.get("range_id") == str(self.expired_future_range.range_id)
+        )
+        self.assertTrue(expired_range.get("is_expired"))
 
     def test_website_search_respects_future_package_ranges_even_with_old_package_start_date(self):
         response = self._request_website_search(

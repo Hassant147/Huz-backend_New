@@ -193,6 +193,39 @@ def _resolve_package_date_range(
     )
 
 
+def _resolve_booking_window_validity(package, package_date_range, start_date):
+    if package_date_range is not None:
+        package_validity = package_date_range.package_validity
+        if package_validity:
+            return package_validity
+        return package_date_range.start_date - timedelta(days=2)
+
+    package_validity = getattr(package, "package_validity", None)
+    if package_validity:
+        return package_validity
+
+    return start_date - timedelta(days=2)
+
+
+def _validate_booking_window_is_open(
+    *,
+    package,
+    package_date_range,
+    start_date,
+):
+    validity_date = _to_local_date(
+        _resolve_booking_window_validity(package, package_date_range, start_date)
+    )
+    if validity_date is None:
+        return
+
+    if timezone.localdate() > validity_date:
+        raise BookingServiceError(
+            "Selected departure window is no longer open for booking.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
 def _count_travellers_for_queryset(queryset):
     return sum(
         (int(adults or 0) + int(child or 0) + int(infants or 0))
@@ -554,6 +587,12 @@ def create_booking(validated_data):
     canonical_end_date = (
         package_date_range.end_date if package_date_range else validated_data["end_date"]
     )
+    _validate_package_can_be_booked(package)
+    _validate_booking_window_is_open(
+        package=package,
+        package_date_range=package_date_range,
+        start_date=canonical_start_date,
+    )
 
     booking_fields = {
         "adults": validated_data["adults"],
@@ -611,7 +650,6 @@ def create_booking(validated_data):
             DocumentsStatus.objects.get_or_create(status_for_booking=resumable_booking)
             return resumable_booking, False
 
-        _validate_package_can_be_booked(package)
         _validate_package_range_capacity(
             package=package,
             package_date_range=package_date_range,

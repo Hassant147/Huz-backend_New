@@ -1236,11 +1236,6 @@ def _get_website_date_range_prefetch(minimum_start_date, visibility_date):
     queryset = HuzPackageDateRange.objects.order_by("start_date", "end_date")
     if minimum_start_date:
         queryset = queryset.filter(start_date__date__gte=minimum_start_date)
-    if visibility_date:
-        queryset = queryset.filter(
-            Q(package_validity__date__gte=visibility_date)
-            | Q(package_validity__isnull=True, start_date__date__gte=visibility_date)
-        )
     return Prefetch("package_date_ranges", queryset=queryset)
 
 
