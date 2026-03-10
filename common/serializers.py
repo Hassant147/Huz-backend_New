@@ -44,7 +44,12 @@ class UserProfileSerializer(serializers.ModelSerializer):
                   )
 
     def get_wallet_amount(self, obj):
-        return Wallet.objects.values_list('wallet_amount').get(wallet_session=obj)[0]
+        wallet_amount = (
+            Wallet.objects.filter(wallet_session=obj)
+            .values_list('wallet_amount', flat=True)
+            .first()
+        )
+        return wallet_amount if wallet_amount is not None else 0.0
 
     def validate_phone_number(self, value):
         # Regular expression pattern for a valid phone number

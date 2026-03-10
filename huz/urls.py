@@ -22,6 +22,7 @@ schema_view = get_schema_view(
 
 urlpatterns = [
     path('api/v1/', include('booking.api_urls')),
+    path('api/v1/', include('common.api_urls')),
     path('common/', include('common.urls')),
     path('chat/', include('chat.urls')),
     path('partner/', include('partners.urls')),

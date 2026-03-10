@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from django.apps import apps
@@ -81,6 +81,10 @@ def ensure_tables_for_apps(app_labels):
             )
 
         pending_models = remaining_models
+
+
+def aware_midnight(value):
+    return timezone.make_aware(datetime.strptime(value, "%Y-%m-%d"))
 
 
 class ManageBookingsUserListViewTests(APITransactionTestCase):
@@ -592,19 +596,19 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         first_passport = PassportValidity.objects.create(
             first_name="Amina",
             last_name="Khan",
-            date_of_birth="1992-05-05",
+            date_of_birth=aware_midnight("1992-05-05"),
             passport_number="P9990001",
             passport_country="PK",
-            expiry_date="2031-05-05",
+            expiry_date=aware_midnight("2031-05-05"),
             passport_for_booking_number=self.existing_booking,
         )
         second_passport = PassportValidity.objects.create(
             first_name="Sara",
             last_name="Yousaf",
-            date_of_birth="1991-04-04",
+            date_of_birth=aware_midnight("1991-04-04"),
             passport_number="P9990002",
             passport_country="PK",
-            expiry_date="2031-06-06",
+            expiry_date=aware_midnight("2031-06-06"),
             passport_for_booking_number=self.existing_booking,
         )
 
@@ -726,10 +730,10 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         unrelated_passport = PassportValidity.objects.create(
             first_name="Amina",
             last_name="Khan",
-            date_of_birth="1992-05-05",
+            date_of_birth=aware_midnight("1992-05-05"),
             passport_number="P9990001",
             passport_country="PK",
-            expiry_date="2031-05-05",
+            expiry_date=aware_midnight("2031-05-05"),
             passport_for_booking_number=other_booking,
         )
 
@@ -758,10 +762,10 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         traveller_passport = PassportValidity.objects.create(
             first_name="Fatima",
             last_name="Noor",
-            date_of_birth="1990-01-10",
+            date_of_birth=aware_midnight("1990-01-10"),
             passport_number="P1234567",
             passport_country="US",
-            expiry_date="2030-06-01",
+            expiry_date=aware_midnight("2030-06-01"),
             passport_for_booking_number=self.existing_booking,
         )
         self.existing_booking.booking_status = "Passport_Validation"
@@ -1130,6 +1134,129 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
                 transaction_photo__contains="payment_uploads/",
             ).exists()
         )
+
+    def test_v1_payment_endpoint_accepts_receipt_upload_in_single_request(self):
+        payment_file = SimpleUploadedFile(
+            "payment-receipt-v1.pdf",
+            b"v1-payment-receipt",
+            content_type="application/pdf",
+        )
+
+        with patch("booking.services.user_new_booking_email"):
+            response = self.client.post(
+                f"/api/v1/bookings/{self.existing_booking.booking_id}/payments/",
+                {
+                    "transaction_amount": "2400",
+                    "transaction_type": "Full",
+                    "transaction_photo": payment_file,
+                },
+                format="multipart",
+                HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            Payment.objects.filter(
+                booking_token=self.existing_booking,
+                transaction_photo__contains="payment_uploads/",
+            ).exists()
+        )
+
+    def test_v1_complaint_endpoint_creates_record_and_user_list_returns_it(self):
+        self.existing_booking.booking_status = "Pending"
+        self.existing_booking.save(update_fields=["booking_status"])
+
+        response = self.client.post(
+            f"/api/v1/bookings/{self.existing_booking.booking_number}/complaints/",
+            {
+                "complaint_title": "Need support",
+                "complaint_message": "Please review this booking.",
+            },
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        list_response = self.client.get(
+            "/api/v1/users/me/complaints/",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(list_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(list_response.data), 1)
+        self.assertEqual(list_response.data[0].get("booking_number"), self.existing_booking.booking_number)
+
+    def test_v1_request_endpoint_creates_record_and_user_list_returns_it(self):
+        self.existing_booking.booking_status = "Completed"
+        self.existing_booking.save(update_fields=["booking_status"])
+
+        response = self.client.post(
+            f"/api/v1/bookings/{self.existing_booking.booking_number}/requests/",
+            {
+                "request_title": "Need concierge help",
+                "request_message": "Please arrange support.",
+            },
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        list_response = self.client.get(
+            "/api/v1/users/me/requests/",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(list_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(list_response.data), 1)
+        self.assertEqual(list_response.data[0].get("booking_number"), self.existing_booking.booking_number)
+
+    def test_v1_review_endpoint_accepts_bearer_auth(self):
+        self.existing_booking.booking_status = "Completed"
+        self.existing_booking.save(update_fields=["booking_status"])
+
+        response = self.client.post(
+            f"/api/v1/bookings/{self.existing_booking.booking_number}/reviews/",
+            {
+                "partner_total_stars": 5,
+                "partner_comment": "Everything went well.",
+            },
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            BookingRatingAndReview.objects.filter(rating_for_booking=self.existing_booking).exists()
+        )
+
+    def test_v1_objection_response_endpoint_accepts_bearer_auth(self):
+        self.existing_booking.booking_status = "Objection"
+        self.existing_booking.save(update_fields=["booking_status"])
+        objection = BookingObjections.objects.create(
+            remarks_or_reason="Passport photo is unclear.",
+            objection_for_booking=self.existing_booking,
+        )
+        objection_file = SimpleUploadedFile(
+            "objection-response.pdf",
+            b"updated-passport-copy",
+            content_type="application/pdf",
+        )
+
+        response = self.client.put(
+            f"/api/v1/bookings/{self.existing_booking.booking_number}/objections/{objection.objection_id}/response/",
+            {
+                "client_remarks": "Updated document attached.",
+                "objection_document": objection_file,
+            },
+            format="multipart",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.existing_booking.refresh_from_db()
+        objection.refresh_from_db()
+        self.assertEqual(self.existing_booking.booking_status, "Pending")
+        self.assertTrue(bool(objection.required_document_for_objection))
 
 
 class ApproveBookingPaymentViewTests(APITransactionTestCase):

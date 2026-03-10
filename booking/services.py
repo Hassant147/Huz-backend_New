@@ -645,7 +645,8 @@ def record_booking_payment(validated_data):
             booking=booking,
             payment_stage=payment_stage,
             transaction_amount=validated_data["transaction_amount"],
-            transaction_number=validated_data["transaction_number"],
+            transaction_number=validated_data.get("transaction_number"),
+            uploaded_file=validated_data.get("transaction_photo"),
             payment_id=validated_data.get("payment_id"),
         )
 
@@ -684,7 +685,8 @@ def update_booking_payment(validated_data):
             booking=booking,
             payment_stage=payment_stage,
             transaction_amount=validated_data["transaction_amount"],
-            transaction_number=validated_data["transaction_number"],
+            transaction_number=validated_data.get("transaction_number"),
+            uploaded_file=validated_data.get("transaction_photo"),
             payment_id=validated_data["payment_id"],
         )
         if booking.booking_status == "Initialize":

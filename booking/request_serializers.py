@@ -96,9 +96,22 @@ class BookingPaymentCreateRequestSerializer(serializers.Serializer):
     session_token = serializers.CharField()
     booking_number = serializers.CharField()
     payment_id = serializers.UUIDField(required=False)
-    transaction_number = serializers.CharField()
+    transaction_number = serializers.CharField(required=False, allow_blank=True)
     transaction_type = serializers.CharField()
     transaction_amount = serializers.FloatField()
+    transaction_photo = serializers.FileField(required=False, allow_null=True)
+
+    def validate(self, attrs):
+        transaction_number = str(attrs.get("transaction_number") or "").strip()
+        transaction_photo = attrs.get("transaction_photo")
+        if not transaction_number and transaction_photo is None:
+            raise ValidationError(
+                {
+                    "message": "Either transaction_number or transaction_photo is required.",
+                    "transaction_number": ["This field is required when no receipt file is uploaded."],
+                }
+            )
+        return attrs
 
 
 class BookingPaymentUpdateRequestSerializer(BookingPaymentCreateRequestSerializer):
