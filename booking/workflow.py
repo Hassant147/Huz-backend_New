@@ -1,0 +1,445 @@
+from datetime import timedelta
+
+from django.utils import timezone
+
+from .flow_utils import get_expected_traveller_count
+from .statuses import (
+    BOOKING_STATUS_AWAITING_FINAL_PAYMENT,
+    BOOKING_STATUS_CANCELLED,
+    BOOKING_STATUS_CAPACITY_SET,
+    BOOKING_STATUS_COMPLETED,
+    BOOKING_STATUS_EXPIRED,
+    BOOKING_STATUS_HOLD,
+    BOOKING_STATUS_IN_FULFILLMENT,
+    BOOKING_STATUS_OPERATOR_VISIBLE_SET,
+    BOOKING_STATUS_READY_FOR_OPERATOR,
+    BOOKING_STATUS_READY_FOR_TRAVEL,
+    BOOKING_STATUS_SET,
+    BOOKING_STATUS_TERMINAL_SET,
+    BOOKING_STATUS_TRAVELER_DETAILS_PENDING,
+    ISSUE_STATUS_NONE,
+    PAYMENT_STATUS_APPROVED,
+    PAYMENT_STATUS_NOT_SUBMITTED,
+    PAYMENT_STATUS_REJECTED,
+    PAYMENT_STATUS_UNDER_REVIEW,
+    WORKFLOW_BUCKET_COMPLETED,
+    WORKFLOW_BUCKET_FULFILLMENT,
+    WORKFLOW_BUCKET_HISTORY,
+    WORKFLOW_BUCKET_ISSUES,
+    WORKFLOW_BUCKET_READY,
+    WORKFLOW_BUCKET_READY_FOR_TRAVEL,
+    WORKFLOW_BUCKET_VIEW_ONLY,
+)
+
+PAYMENT_REVIEWABLE_STATUSES = {
+    BOOKING_STATUS_HOLD,
+    BOOKING_STATUS_TRAVELER_DETAILS_PENDING,
+    BOOKING_STATUS_AWAITING_FINAL_PAYMENT,
+    BOOKING_STATUS_READY_FOR_OPERATOR,
+}
+
+
+def normalize_booking_status(value):
+    normalized = str(value or "").strip().upper()
+    if normalized in BOOKING_STATUS_SET:
+        return normalized
+    return ""
+
+
+def normalize_payment_status(value):
+    normalized = str(value or "").strip().upper()
+    if normalized in {
+        PAYMENT_STATUS_UNDER_REVIEW,
+        PAYMENT_STATUS_APPROVED,
+        PAYMENT_STATUS_REJECTED,
+    }:
+        return normalized
+    return PAYMENT_STATUS_NOT_SUBMITTED
+
+
+def _payment_sort_key(payment):
+    transaction_time = getattr(payment, "transaction_time", None)
+    if transaction_time is None:
+        return 0
+    if timezone.is_naive(transaction_time):
+        transaction_time = timezone.make_aware(transaction_time, timezone.get_current_timezone())
+    return transaction_time.timestamp()
+
+
+def _as_local_date(value):
+    if value is None:
+        return None
+    if timezone.is_aware(value):
+        value = timezone.localtime(value)
+    return value.date()
+
+
+def get_booking_payments(booking):
+    cached_payments = getattr(booking, "_cached_booking_payments", None)
+    if cached_payments is not None:
+        return cached_payments
+
+    prefetched_cache = getattr(booking, "_prefetched_objects_cache", None) or {}
+    prefetched_payments = prefetched_cache.get("booking_token")
+    if prefetched_payments is not None:
+        payments = list(prefetched_payments)
+    else:
+        relation = getattr(booking, "booking_token", None)
+        payments = list(relation.all()) if relation is not None else []
+
+    sorted_payments = sorted(payments, key=_payment_sort_key, reverse=True)
+    setattr(booking, "_cached_booking_payments", sorted_payments)
+    return sorted_payments
+
+
+def _normalize_payment_stage(value):
+    normalized = str(value or "").strip().lower()
+    if normalized in {"minimum", "min"}:
+        return "Minimum"
+    if normalized in {"full"}:
+        return "Full"
+    return ""
+
+
+def get_latest_payment_for_stage(booking, stage):
+    normalized_stage = _normalize_payment_stage(stage)
+    if not normalized_stage:
+        return None
+    for payment in get_booking_payments(booking):
+        if _normalize_payment_stage(getattr(payment, "transaction_type", "")) == normalized_stage:
+            return payment
+    return None
+
+
+def get_payment_stage_status(booking, stage):
+    normalized_stage = _normalize_payment_stage(stage)
+    if normalized_stage == "Minimum":
+        annotated_status = getattr(booking, "annotated_minimum_payment_status", None)
+        if annotated_status:
+            return normalize_payment_status(annotated_status)
+    if normalized_stage == "Full":
+        annotated_status = getattr(booking, "annotated_full_payment_status", None)
+        if annotated_status:
+            return normalize_payment_status(annotated_status)
+
+    payment = get_latest_payment_for_stage(booking, stage)
+    if payment is None:
+        return PAYMENT_STATUS_NOT_SUBMITTED
+    return normalize_payment_status(getattr(payment, "payment_status", ""))
+
+
+def booking_has_any_submitted_payment(booking):
+    return (
+        get_payment_stage_status(booking, "Minimum") != PAYMENT_STATUS_NOT_SUBMITTED
+        or get_payment_stage_status(booking, "Full") != PAYMENT_STATUS_NOT_SUBMITTED
+    )
+
+
+def booking_has_under_review_payment(booking):
+    return (
+        get_payment_stage_status(booking, "Minimum") == PAYMENT_STATUS_UNDER_REVIEW
+        or get_payment_stage_status(booking, "Full") == PAYMENT_STATUS_UNDER_REVIEW
+    )
+
+
+def booking_has_minimum_approval(booking):
+    return (
+        get_payment_stage_status(booking, "Minimum") == PAYMENT_STATUS_APPROVED
+        or get_payment_stage_status(booking, "Full") == PAYMENT_STATUS_APPROVED
+    )
+
+
+def booking_has_full_approval(booking):
+    return get_payment_stage_status(booking, "Full") == PAYMENT_STATUS_APPROVED
+
+
+def get_total_approved_payment_amount(booking):
+    total = 0.0
+    for payment in get_booking_payments(booking):
+        if normalize_payment_status(getattr(payment, "payment_status", "")) == PAYMENT_STATUS_APPROVED:
+            total += float(getattr(payment, "transaction_amount", 0) or 0)
+    return total
+
+
+def get_remaining_amount_due(booking):
+    return max(float(getattr(booking, "total_price", 0) or 0) - get_total_approved_payment_amount(booking), 0.0)
+
+
+def _get_related_items(booking, relation_name):
+    related_items_cache = getattr(booking, "_cached_related_items", None)
+    if related_items_cache is None:
+        related_items_cache = {}
+        setattr(booking, "_cached_related_items", related_items_cache)
+
+    if relation_name in related_items_cache:
+        return related_items_cache[relation_name]
+
+    prefetched_cache = getattr(booking, "_prefetched_objects_cache", None) or {}
+    prefetched_items = prefetched_cache.get(relation_name)
+    if prefetched_items is not None:
+        related_items_cache[relation_name] = list(prefetched_items)
+        return related_items_cache[relation_name]
+
+    relation = getattr(booking, relation_name, None)
+    if relation is None:
+        related_items_cache[relation_name] = []
+        return related_items_cache[relation_name]
+
+    try:
+        related_items_cache[relation_name] = list(relation.all())
+    except Exception:
+        related_items_cache[relation_name] = []
+
+    return related_items_cache[relation_name]
+
+
+def booking_passports_are_complete(booking):
+    traveller_status = _get_related_items(booking, "passport_for_booking_number")
+    expected_traveller_count = get_expected_traveller_count(booking)
+    if len(traveller_status) < expected_traveller_count:
+        return False
+
+    return all(
+        item.user_passport
+        and item.user_photo
+        and item.first_name
+        and item.last_name
+        and item.date_of_birth
+        and item.passport_number
+        and item.passport_country
+        and item.expiry_date
+        for item in traveller_status[:expected_traveller_count]
+    )
+
+
+def booking_operator_documents_are_complete(booking):
+    document_statuses = _get_related_items(booking, "status_for_booking")
+    if not document_statuses:
+        return False
+
+    document_status = document_statuses[0]
+    return all(
+        bool(getattr(document_status, flag, False))
+        for flag in (
+            "is_visa_completed",
+            "is_airline_completed",
+            "is_airline_detail_completed",
+            "is_hotel_completed",
+            "is_transport_completed",
+        )
+    )
+
+
+def booking_has_operator_visibility(booking):
+    if booking_has_minimum_approval(booking):
+        return True
+    return normalize_booking_status(getattr(booking, "booking_status", "")) in BOOKING_STATUS_OPERATOR_VISIBLE_SET
+
+
+def booking_allows_operator_action(booking):
+    return normalize_booking_status(getattr(booking, "booking_status", "")) == BOOKING_STATUS_READY_FOR_OPERATOR
+
+
+def booking_allows_client_traveller_updates(booking):
+    return normalize_booking_status(getattr(booking, "booking_status", "")) == BOOKING_STATUS_TRAVELER_DETAILS_PENDING
+
+
+def booking_allows_minimum_payment_submission(booking):
+    if normalize_booking_status(getattr(booking, "booking_status", "")) in BOOKING_STATUS_TERMINAL_SET:
+        return False
+
+    minimum_status = get_payment_stage_status(booking, "Minimum")
+    full_status = get_payment_stage_status(booking, "Full")
+    if minimum_status == PAYMENT_STATUS_UNDER_REVIEW or full_status == PAYMENT_STATUS_UNDER_REVIEW:
+        return False
+    if minimum_status == PAYMENT_STATUS_APPROVED or full_status == PAYMENT_STATUS_APPROVED:
+        return False
+    return True
+
+
+def booking_allows_full_payment_submission(booking):
+    if normalize_booking_status(getattr(booking, "booking_status", "")) in BOOKING_STATUS_TERMINAL_SET:
+        return False
+
+    full_status = get_payment_stage_status(booking, "Full")
+    if full_status in {PAYMENT_STATUS_UNDER_REVIEW, PAYMENT_STATUS_APPROVED}:
+        return False
+    if not booking_has_minimum_approval(booking):
+        return False
+    return booking_passports_are_complete(booking)
+
+
+def resolve_client_workflow_stage(booking):
+    booking_status = normalize_booking_status(getattr(booking, "booking_status", ""))
+    minimum_status = get_payment_stage_status(booking, "Minimum")
+    full_status = get_payment_stage_status(booking, "Full")
+
+    if booking_status in BOOKING_STATUS_TERMINAL_SET:
+        return "booking_status"
+
+    has_any_approved_payment = booking_has_minimum_approval(booking)
+    if not has_any_approved_payment:
+        if (
+            minimum_status == PAYMENT_STATUS_UNDER_REVIEW
+            or full_status == PAYMENT_STATUS_UNDER_REVIEW
+        ):
+            return "minimum_payment_review"
+        return "minimum_payment"
+
+    if not booking_passports_are_complete(booking):
+        return "traveler_details"
+
+    if full_status == PAYMENT_STATUS_UNDER_REVIEW:
+        return "full_payment_review"
+
+    if not booking_has_full_approval(booking):
+        return "remaining_payment"
+
+    return "booking_status"
+
+
+def resolve_client_workflow_step(booking):
+    stage = resolve_client_workflow_stage(booking)
+    return {
+        "minimum_payment": 2,
+        "minimum_payment_review": 2,
+        "traveler_details": 3,
+        "remaining_payment": 4,
+        "full_payment_review": 4,
+        "booking_status": 5,
+    }.get(stage, 1)
+
+
+def booking_counts_against_capacity(booking):
+    return normalize_booking_status(getattr(booking, "booking_status", "")) in BOOKING_STATUS_CAPACITY_SET
+
+
+def resolve_operator_workflow_bucket(booking):
+    if not booking_has_operator_visibility(booking):
+        return ""
+
+    booking_status = normalize_booking_status(getattr(booking, "booking_status", ""))
+    issue_status = str(getattr(booking, "issue_status", ISSUE_STATUS_NONE) or ISSUE_STATUS_NONE).strip().upper()
+    if issue_status in {"OPERATOR_OBJECTION", "REPORTED"}:
+        return WORKFLOW_BUCKET_ISSUES
+
+    if booking_status in {BOOKING_STATUS_TRAVELER_DETAILS_PENDING, BOOKING_STATUS_AWAITING_FINAL_PAYMENT}:
+        return WORKFLOW_BUCKET_VIEW_ONLY
+    if booking_status == BOOKING_STATUS_READY_FOR_OPERATOR:
+        return WORKFLOW_BUCKET_READY
+    if booking_status == BOOKING_STATUS_IN_FULFILLMENT:
+        return WORKFLOW_BUCKET_FULFILLMENT
+    if booking_status == BOOKING_STATUS_READY_FOR_TRAVEL:
+        return WORKFLOW_BUCKET_READY_FOR_TRAVEL
+    if booking_status == BOOKING_STATUS_COMPLETED:
+        return WORKFLOW_BUCKET_COMPLETED
+    if booking_status in {BOOKING_STATUS_CANCELLED, BOOKING_STATUS_EXPIRED}:
+        return WORKFLOW_BUCKET_HISTORY
+    return ""
+
+
+def ensure_hold_expiry(booking, *, now=None):
+    now = now or timezone.now()
+    if getattr(booking, "hold_expires_at", None) or normalize_booking_status(getattr(booking, "booking_status", "")) == BOOKING_STATUS_HOLD:
+        if not booking_has_any_submitted_payment(booking) and not getattr(booking, "hold_expires_at", None):
+            booking.hold_expires_at = now + timedelta(minutes=15)
+            return True
+    return False
+
+
+def clear_booking_runtime_caches(booking):
+    for attribute_name in (
+        "_cached_booking_payments",
+        "_cached_related_items",
+        "_workflow_read_resolved",
+    ):
+        if hasattr(booking, attribute_name):
+            delattr(booking, attribute_name)
+
+    if hasattr(booking, "_prefetched_objects_cache"):
+        booking._prefetched_objects_cache = {}
+
+
+def sync_booking_state(booking, *, now=None, save=True):
+    now = now or timezone.now()
+    if save:
+        clear_booking_runtime_caches(booking)
+    update_fields = []
+
+    current_status = normalize_booking_status(getattr(booking, "booking_status", ""))
+    if current_status in BOOKING_STATUS_TERMINAL_SET:
+        target_status = current_status
+    else:
+        minimum_status = get_payment_stage_status(booking, "Minimum")
+        full_status = get_payment_stage_status(booking, "Full")
+        hold_expires_at = getattr(booking, "hold_expires_at", None)
+        correction_expires_at = getattr(booking, "payment_correction_expires_at", None)
+        booking_end_date = getattr(booking, "end_date", None)
+        has_submitted_payment = booking_has_any_submitted_payment(booking)
+        has_minimum_approval = booking_has_minimum_approval(booking)
+        has_full_approval = booking_has_full_approval(booking)
+        has_operator_documents = booking_operator_documents_are_complete(booking)
+        has_trip_ended = booking_end_date is not None and timezone.localdate(now) > _as_local_date(booking_end_date)
+
+        if hold_expires_at and not has_submitted_payment and now > hold_expires_at:
+            target_status = BOOKING_STATUS_EXPIRED
+        elif correction_expires_at and (
+            minimum_status == PAYMENT_STATUS_REJECTED or full_status == PAYMENT_STATUS_REJECTED
+        ) and now > correction_expires_at:
+            target_status = BOOKING_STATUS_EXPIRED
+        elif current_status == BOOKING_STATUS_READY_FOR_TRAVEL:
+            target_status = BOOKING_STATUS_COMPLETED if has_trip_ended else BOOKING_STATUS_READY_FOR_TRAVEL
+        elif current_status == BOOKING_STATUS_IN_FULFILLMENT:
+            if has_operator_documents:
+                target_status = BOOKING_STATUS_COMPLETED if has_trip_ended else BOOKING_STATUS_READY_FOR_TRAVEL
+            else:
+                target_status = BOOKING_STATUS_IN_FULFILLMENT
+        elif not has_minimum_approval:
+            target_status = BOOKING_STATUS_HOLD
+        elif not booking_passports_are_complete(booking):
+            target_status = BOOKING_STATUS_TRAVELER_DETAILS_PENDING
+        elif not has_full_approval:
+            target_status = BOOKING_STATUS_AWAITING_FINAL_PAYMENT
+        else:
+            target_status = BOOKING_STATUS_READY_FOR_OPERATOR
+
+    if target_status != current_status:
+        booking.booking_status = target_status
+        booking.status_changed_at = now
+        update_fields.extend(["booking_status", "status_changed_at"])
+
+    normalized_issue_status = str(getattr(booking, "issue_status", ISSUE_STATUS_NONE) or ISSUE_STATUS_NONE).strip().upper()
+    if not normalized_issue_status:
+        normalized_issue_status = ISSUE_STATUS_NONE
+    if normalized_issue_status != getattr(booking, "issue_status", ISSUE_STATUS_NONE):
+        booking.issue_status = normalized_issue_status
+        update_fields.append("issue_status")
+
+    has_any_approved_payment = (
+        get_payment_stage_status(booking, "Minimum") == PAYMENT_STATUS_APPROVED
+        or get_payment_stage_status(booking, "Full") == PAYMENT_STATUS_APPROVED
+    )
+    if bool(getattr(booking, "is_payment_received", False)) != has_any_approved_payment:
+        booking.is_payment_received = has_any_approved_payment
+        update_fields.append("is_payment_received")
+
+    should_clear_hold = booking_has_any_submitted_payment(booking)
+    if should_clear_hold and getattr(booking, "hold_expires_at", None) is not None:
+        booking.hold_expires_at = None
+        update_fields.append("hold_expires_at")
+    if not should_clear_hold and target_status == BOOKING_STATUS_HOLD and getattr(booking, "hold_expires_at", None) is None:
+        booking.hold_expires_at = now + timedelta(minutes=15)
+        update_fields.append("hold_expires_at")
+
+    has_rejected_payment = (
+        get_payment_stage_status(booking, "Minimum") == PAYMENT_STATUS_REJECTED
+        or get_payment_stage_status(booking, "Full") == PAYMENT_STATUS_REJECTED
+    )
+    if not has_rejected_payment and getattr(booking, "payment_correction_expires_at", None) is not None:
+        booking.payment_correction_expires_at = None
+        update_fields.append("payment_correction_expires_at")
+
+    if save and update_fields:
+        booking.save(update_fields=list(dict.fromkeys(update_fields)))
+
+    return booking

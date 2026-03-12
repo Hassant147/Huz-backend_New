@@ -18,18 +18,29 @@ from partners.models import HuzBasicDetail, HuzPackageDateRange, PartnerProfile
 from .flow_utils import get_expected_traveller_count
 from .manage_partner_booking import get_partner_bookings_queryset
 from .models import Booking, DocumentsStatus, PassportValidity, Payment
-
-
-ONGOING_BOOKING_STATUSES = {
-    "Initialize",
-    "Paid",
-    "Confirm",
-    "Passport_Validation",
-    "Pending",
-    "Active",
-    "Objection",
-    "Report",
-}
+from .querysets import (
+    annotate_effective_booking_status,
+    annotate_resume_priority,
+    filter_active_capacity_queryset,
+    filter_user_booking_status_bucket,
+)
+from .statuses import (
+    BOOKING_STATUS_CANCELLED,
+    BOOKING_STATUS_COMPLETED,
+    BOOKING_STATUS_EXPIRED,
+    BOOKING_STATUS_HOLD,
+    PAYMENT_STATUS_APPROVED,
+    PAYMENT_STATUS_NOT_SUBMITTED,
+    PAYMENT_STATUS_UNDER_REVIEW,
+)
+from .workflow import (
+    PAYMENT_REVIEWABLE_STATUSES,
+    booking_allows_client_traveller_updates,
+    booking_passports_are_complete,
+    get_payment_stage_status,
+    normalize_booking_status,
+    sync_booking_state,
+)
 
 PAYMENT_STAGE_ALIASES = {
     "full": "Full",
@@ -91,7 +102,14 @@ def _validate_package_can_be_booked(package):
         )
 
 
-def _get_booking_for_user(session_token, booking_number, *, must_be_future=False, lock_for_update=False):
+def _get_booking_for_user(
+    session_token,
+    booking_number,
+    *,
+    must_be_future=False,
+    lock_for_update=False,
+    persist_state=True,
+):
     user = _get_user_by_session_token(session_token)
     filters = {
         "order_by": user,
@@ -109,6 +127,7 @@ def _get_booking_for_user(session_token, booking_number, *, must_be_future=False
         message = "Booking detail not found or expire." if must_be_future else "Booking detail not found."
         raise BookingServiceError(message, status_code=status.HTTP_404_NOT_FOUND)
 
+    sync_booking_state(booking, save=persist_state)
     return user, booking
 
 
@@ -233,6 +252,24 @@ def _count_travellers_for_queryset(queryset):
     )
 
 
+def _get_active_booking_window_queryset(
+    *,
+    package,
+    start_date,
+    end_date,
+    lock_for_update=False,
+):
+    queryset = Booking.objects.filter(
+        package_token=package,
+        **_build_booking_window_filters(start_date, end_date),
+    )
+    if lock_for_update:
+        queryset = queryset.select_for_update()
+
+    queryset = annotate_effective_booking_status(queryset)
+    return filter_active_capacity_queryset(queryset)
+
+
 def _validate_package_range_capacity(
     *,
     package,
@@ -258,10 +295,11 @@ def _validate_package_range_capacity(
             status_code=status.HTTP_409_CONFLICT,
         )
 
-    active_bookings = Booking.objects.select_for_update().filter(
-        package_token=package,
-        booking_status__in=ONGOING_BOOKING_STATUSES,
-        **_build_booking_window_filters(start_date, end_date),
+    active_bookings = _get_active_booking_window_queryset(
+        package=package,
+        start_date=start_date,
+        end_date=end_date,
+        lock_for_update=True,
     )
     if exclude_booking_id:
         active_bookings = active_bookings.exclude(booking_id=exclude_booking_id)
@@ -294,7 +332,11 @@ def _normalize_payment_stage(value):
 
 
 def _is_payment_approved(payment):
-    return str(getattr(payment, "payment_status", "") or "").strip().lower() == "approved"
+    return str(getattr(payment, "payment_status", "") or "").strip().upper() == PAYMENT_STATUS_APPROVED
+
+
+def _is_payment_under_review(payment):
+    return str(getattr(payment, "payment_status", "") or "").strip().upper() == PAYMENT_STATUS_UNDER_REVIEW
 
 
 def _normalize_transaction_number(transaction_number):
@@ -330,33 +372,12 @@ def _get_payment_stage_queryset(booking, payment_stage, *, lock_for_update=False
     return queryset
 
 
-def _booking_passports_are_complete(booking):
-    traveller_status = list(
-        PassportValidity.objects.filter(passport_for_booking_number=booking).order_by("passport_id")
-    )
-    expected_traveller_count = get_expected_traveller_count(booking)
-    if len(traveller_status) < expected_traveller_count:
-        return False
-
-    return all(
-        item.user_passport
-        and item.user_photo
-        and item.first_name
-        and item.last_name
-        and item.date_of_birth
-        and item.passport_number
-        and item.passport_country
-        and item.expiry_date
-        for item in traveller_status[:expected_traveller_count]
-    )
-
-
 def _update_booking_status_for_passport_progress(booking):
-    next_status = "Pending" if _booking_passports_are_complete(booking) else "Passport_Validation"
-    if booking.booking_status != next_status:
-        booking.booking_status = next_status
-        booking.save(update_fields=["booking_status"])
-    return booking
+    return sync_booking_state(booking, save=True)
+
+
+def _booking_passports_are_complete(booking):
+    return booking_passports_are_complete(booking)
 
 
 def _attach_passport_files(passport, validated_data):
@@ -417,6 +438,11 @@ def _upsert_payment_record(
                 "This payment has already been approved and cannot be updated.",
                 status_code=status.HTTP_409_CONFLICT,
             )
+        if _is_payment_under_review(payment):
+            raise BookingServiceError(
+                f"{payment_stage} payment is already under review for this booking.",
+                status_code=status.HTTP_409_CONFLICT,
+            )
         conflicting_stage_payment = stage_queryset.exclude(payment_id=payment.payment_id).first()
         if conflicting_stage_payment:
             if _is_payment_approved(conflicting_stage_payment):
@@ -429,13 +455,18 @@ def _upsert_payment_record(
                 status_code=status.HTTP_409_CONFLICT,
             )
     else:
-        approved_stage_payment = stage_queryset.filter(payment_status__iexact="Approved").first()
+        approved_stage_payment = stage_queryset.filter(payment_status__iexact=PAYMENT_STATUS_APPROVED).first()
         if approved_stage_payment:
             raise BookingServiceError(
                 f"{payment_stage} payment has already been approved for this booking.",
                 status_code=status.HTTP_409_CONFLICT,
             )
-        payment = stage_queryset.exclude(payment_status__iexact="Approved").first()
+        payment = stage_queryset.exclude(payment_status__iexact=PAYMENT_STATUS_APPROVED).first()
+        if payment and _is_payment_under_review(payment):
+            raise BookingServiceError(
+                f"{payment_stage} payment is already under review for this booking.",
+                status_code=status.HTTP_409_CONFLICT,
+            )
 
     normalized_transaction_number = _ensure_transaction_number_is_available(
         transaction_number,
@@ -454,7 +485,7 @@ def _upsert_payment_record(
         payment.transaction_number = normalized_transaction_number or payment.transaction_number
         payment.transaction_type = payment_stage
         payment.transaction_amount = transaction_amount
-        payment.payment_status = "Pending"
+        payment.payment_status = PAYMENT_STATUS_UNDER_REVIEW
         payment.review_message = None
         payment.transaction_time = timezone.now()
     else:
@@ -462,7 +493,7 @@ def _upsert_payment_record(
             transaction_number=normalized_transaction_number or None,
             transaction_type=payment_stage,
             transaction_amount=transaction_amount,
-            payment_status="Pending",
+            payment_status=PAYMENT_STATUS_UNDER_REVIEW,
             review_message=None,
             booking_token=booking,
         )
@@ -498,6 +529,7 @@ def get_booking_by_identifier_for_user(
     *,
     must_be_future=False,
     lock_for_update=False,
+    persist_state=False,
 ):
     lookup = Q(booking_number=str(identifier))
     try:
@@ -516,6 +548,7 @@ def get_booking_by_identifier_for_user(
         message = "Booking detail not found or expire." if must_be_future else "Booking detail not found."
         raise BookingServiceError(message, status_code=status.HTTP_404_NOT_FOUND)
 
+    sync_booking_state(booking, save=persist_state)
     return booking
 
 
@@ -527,10 +560,19 @@ def remove_booking_for_user(session_token, booking_identifier):
             booking_identifier,
             must_be_future=False,
             lock_for_update=True,
+            persist_state=True,
         )
 
-        normalized_status = str(booking.booking_status or "").strip().lower()
-        if normalized_status == "initialize":
+        sync_booking_state(booking, save=True)
+        booking_status = normalize_booking_status(booking.booking_status)
+        minimum_payment_status = get_payment_stage_status(booking, "Minimum")
+        full_payment_status = get_payment_stage_status(booking, "Full")
+        has_submitted_payment = (
+            minimum_payment_status != PAYMENT_STATUS_NOT_SUBMITTED
+            or full_payment_status != PAYMENT_STATUS_NOT_SUBMITTED
+        )
+
+        if booking_status == BOOKING_STATUS_HOLD and not has_submitted_payment:
             booking_number = booking.booking_number
             booking.delete()
             return {
@@ -539,20 +581,14 @@ def remove_booking_for_user(session_token, booking_identifier):
                 "deleted": True,
             }
 
-        if normalized_status == "paid":
-            if booking.booking_status != "Cancel":
-                booking.booking_status = "Cancel"
-                booking.save(update_fields=["booking_status"])
-
-            return {
-                "message": "Booking has been cancelled successfully.",
-                "booking_number": booking.booking_number,
-                "booking_status": booking.booking_status,
-                "deleted": False,
-            }
+        if booking_status == BOOKING_STATUS_HOLD:
+            raise BookingServiceError(
+                "Bookings with submitted payments cannot be removed or cancelled from self-service.",
+                status_code=status.HTTP_409_CONFLICT,
+            )
 
         raise BookingServiceError(
-            "Only initialized bookings can be deleted and paid bookings can be cancelled.",
+            "Only bookings that are still on hold can be removed or cancelled.",
             status_code=status.HTTP_409_CONFLICT,
         )
 
@@ -565,7 +601,46 @@ def generate_unique_booking_number():
 
 
 def get_user_bookings_queryset(user_profile):
-    return get_partner_bookings_queryset(include_detail_relations=True).filter(order_by=user_profile)
+    return (
+        get_partner_bookings_queryset(include_detail_relations=False)
+        .filter(order_by=user_profile)
+        .order_by("-order_time")
+    )
+
+
+def get_filtered_user_bookings_queryset(user_profile, *, status_bucket="all"):
+    queryset = annotate_effective_booking_status(get_user_bookings_queryset(user_profile))
+    return filter_user_booking_status_bucket(queryset, status_bucket)
+
+
+def find_existing_user_booking(
+    user_profile,
+    *,
+    huz_token,
+    start_date=None,
+    end_date=None,
+):
+    queryset = annotate_effective_booking_status(
+        get_partner_bookings_queryset(include_detail_relations=False).filter(
+            order_by=user_profile,
+            package_token__huz_token=huz_token,
+        )
+    )
+    queryset = queryset.exclude(
+        effective_booking_status__in=(
+            BOOKING_STATUS_COMPLETED,
+            BOOKING_STATUS_CANCELLED,
+            BOOKING_STATUS_EXPIRED,
+        )
+    )
+
+    if start_date is not None:
+        queryset = queryset.filter(start_date__date=_to_local_date(start_date))
+    if end_date is not None:
+        queryset = queryset.filter(end_date__date=_to_local_date(end_date))
+
+    queryset = annotate_resume_priority(queryset)
+    return queryset.order_by("resume_priority", "-order_time").first()
 
 
 def create_booking(validated_data):
@@ -607,7 +682,8 @@ def create_booking(validated_data):
         "end_date": canonical_end_date,
         "total_price": validated_data["total_price"],
         "special_request": validated_data.get("special_request"),
-        "booking_status": "Initialize",
+        "booking_status": BOOKING_STATUS_HOLD,
+        "hold_expires_at": timezone.now() + timedelta(minutes=15),
         "payment_type": validated_data["payment_type"],
         "order_by": user,
         "order_to": partner,
@@ -617,18 +693,18 @@ def create_booking(validated_data):
     with transaction.atomic():
         locked_user = UserProfile.objects.select_for_update().filter(pk=user.pk).first()
         resumable_booking = (
-            Booking.objects.select_for_update()
-            .filter(
-                order_by=locked_user,
-                package_token=package,
-                booking_status__in=ONGOING_BOOKING_STATUSES,
-                **_build_booking_window_filters(canonical_start_date, canonical_end_date),
+            _get_active_booking_window_queryset(
+                package=package,
+                start_date=canonical_start_date,
+                end_date=canonical_end_date,
+                lock_for_update=True,
             )
+            .filter(order_by=locked_user)
             .order_by("-order_time")
             .first()
         )
         if resumable_booking:
-            if resumable_booking.booking_status == "Initialize":
+            if normalize_booking_status(resumable_booking.booking_status) == BOOKING_STATUS_HOLD:
                 _validate_package_range_capacity(
                     package=package,
                     package_date_range=package_date_range,
@@ -648,7 +724,7 @@ def create_booking(validated_data):
                     resumable_booking.save(update_fields=updated_fields)
 
             DocumentsStatus.objects.get_or_create(status_for_booking=resumable_booking)
-            return resumable_booking, False
+            return sync_booking_state(resumable_booking, save=True), False
 
         _validate_package_range_capacity(
             package=package,
@@ -663,7 +739,7 @@ def create_booking(validated_data):
             **booking_fields,
         )
         DocumentsStatus.objects.get_or_create(status_for_booking=booking)
-        return booking, True
+        return sync_booking_state(booking, save=True), True
 
 
 def record_booking_payment(validated_data):
@@ -671,7 +747,7 @@ def record_booking_payment(validated_data):
         user, booking = _get_booking_for_user(
             validated_data["session_token"],
             validated_data["booking_number"],
-            must_be_future=True,
+            must_be_future=False,
             lock_for_update=True,
         )
         package = booking.package_token
@@ -688,9 +764,10 @@ def record_booking_payment(validated_data):
             payment_id=validated_data.get("payment_id"),
         )
 
-        if booking.booking_status == "Initialize":
-            booking.booking_status = "Paid"
-            booking.save(update_fields=["booking_status"])
+        booking.hold_expires_at = None
+        booking.payment_correction_expires_at = None
+        booking.save(update_fields=["hold_expires_at", "payment_correction_expires_at"])
+        sync_booking_state(booking, save=True)
 
         if not has_existing_payment:
             user_new_booking_email(
@@ -707,7 +784,7 @@ def record_booking_payment(validated_data):
                 validated_data["transaction_amount"],
             )
 
-        return booking
+        return sync_booking_state(booking, save=True)
 
 
 def update_booking_payment(validated_data):
@@ -727,10 +804,10 @@ def update_booking_payment(validated_data):
             uploaded_file=validated_data.get("transaction_photo"),
             payment_id=validated_data["payment_id"],
         )
-        if booking.booking_status == "Initialize":
-            booking.booking_status = "Paid"
-            booking.save(update_fields=["booking_status"])
-        return booking
+        booking.hold_expires_at = None
+        booking.payment_correction_expires_at = None
+        booking.save(update_fields=["hold_expires_at", "payment_correction_expires_at"])
+        return sync_booking_state(booking, save=True)
 
 
 def record_booking_payment_photo_uploads(validated_data, files):
@@ -738,7 +815,7 @@ def record_booking_payment_photo_uploads(validated_data, files):
         user, booking = _get_booking_for_user(
             validated_data["session_token"],
             validated_data["booking_number"],
-            must_be_future=True,
+            must_be_future=False,
             lock_for_update=True,
         )
         package = booking.package_token
@@ -755,9 +832,10 @@ def record_booking_payment_photo_uploads(validated_data, files):
             payment_id=validated_data.get("payment_id"),
         )
 
-        if booking.booking_status == "Initialize":
-            booking.booking_status = "Paid"
-            booking.save(update_fields=["booking_status"])
+        booking.hold_expires_at = None
+        booking.payment_correction_expires_at = None
+        booking.save(update_fields=["hold_expires_at", "payment_correction_expires_at"])
+        sync_booking_state(booking, save=True)
 
         if not has_existing_payment:
             user_new_booking_email(
@@ -774,7 +852,7 @@ def record_booking_payment_photo_uploads(validated_data, files):
                 validated_data["transaction_amount"],
             )
 
-        return booking
+        return sync_booking_state(booking, save=True)
 
 
 def validate_passport(validated_data):
@@ -785,6 +863,11 @@ def validate_passport(validated_data):
             must_be_future=False,
             lock_for_update=True,
         )
+        if not booking_allows_client_traveller_updates(booking):
+            raise BookingServiceError(
+                "Traveler details cannot be updated at the current booking stage.",
+                status_code=status.HTTP_409_CONFLICT,
+            )
         traveller_status = PassportValidity.objects.select_for_update().filter(
             passport_for_booking_number=booking
         ).order_by("passport_id")
@@ -845,6 +928,11 @@ def update_passport_validation(validated_data):
             must_be_future=False,
             lock_for_update=True,
         )
+        if not booking_allows_client_traveller_updates(booking):
+            raise BookingServiceError(
+                "Traveler details cannot be updated at the current booking stage.",
+                status_code=status.HTTP_409_CONFLICT,
+            )
         passport_queryset = PassportValidity.objects.select_for_update().filter(
             passport_for_booking_number=booking
         )

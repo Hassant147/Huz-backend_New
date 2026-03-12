@@ -7,6 +7,29 @@ from common.models import UserProfile, MailingDetail
 from common.serializers import MailingDetailSerializer
 from partners.models import PartnerProfile, HuzBasicDetail, BusinessProfile, PartnerMailingDetail, HuzAirlineDetail
 from partners.serializers import ShortBusinessSerializer, PartnerMailingDetailSerializer, HuzAirlineSerializer
+from .statuses import ISSUE_STATUS_NONE
+from .workflow import (
+    booking_allows_client_traveller_updates,
+    booking_allows_full_payment_submission,
+    booking_allows_minimum_payment_submission,
+    booking_allows_operator_action,
+    booking_has_operator_visibility,
+    get_payment_stage_status,
+    get_remaining_amount_due,
+    resolve_client_workflow_stage,
+    resolve_client_workflow_step,
+    resolve_operator_workflow_bucket,
+    sync_booking_state,
+)
+
+
+def _resolve_workflow_read_state(obj):
+    if getattr(obj, "_workflow_read_resolved", False):
+        return obj
+
+    sync_booking_state(obj, save=False)
+    setattr(obj, "_workflow_read_resolved", True)
+    return obj
 
 
 def _get_prefetched_items(instance, relation_name):
@@ -92,6 +115,7 @@ def get_passport_validity(obj):
 
 
 def get_payment_detail(obj):
+    _resolve_workflow_read_state(obj)
     payment_paid = sorted(
         _list_related_items(obj, 'booking_token'),
         key=lambda payment: _get_datetime_sort_value(getattr(payment, 'transaction_time', None)),
@@ -100,7 +124,175 @@ def get_payment_detail(obj):
     return PaymentSerializer(payment_paid, many=True).data
 
 
-class ShortBookingSerializer(serializers.ModelSerializer):
+def should_hide_payment_detail(serializer):
+    return bool(getattr(serializer, "context", {}).get("hide_payment_detail"))
+
+
+class BookingWorkflowFieldsMixin(serializers.Serializer):
+    issue_status = serializers.CharField(read_only=True)
+    minimum_payment_status = serializers.SerializerMethodField()
+    full_payment_status = serializers.SerializerMethodField()
+    client_workflow_stage = serializers.SerializerMethodField()
+    client_workflow_step = serializers.SerializerMethodField()
+    operator_visible = serializers.SerializerMethodField()
+    operator_can_act = serializers.SerializerMethodField()
+    client_can_edit_travellers = serializers.SerializerMethodField()
+    client_can_submit_minimum_payment = serializers.SerializerMethodField()
+    client_can_submit_full_payment = serializers.SerializerMethodField()
+    remaining_amount_due = serializers.SerializerMethodField()
+    workflow_bucket = serializers.SerializerMethodField()
+
+    def to_representation(self, instance):
+        _resolve_workflow_read_state(instance)
+        return super().to_representation(instance)
+
+    def get_minimum_payment_status(self, obj):
+        _resolve_workflow_read_state(obj)
+        return get_payment_stage_status(obj, "Minimum")
+
+    def get_full_payment_status(self, obj):
+        _resolve_workflow_read_state(obj)
+        return get_payment_stage_status(obj, "Full")
+
+    def get_client_workflow_stage(self, obj):
+        _resolve_workflow_read_state(obj)
+        return resolve_client_workflow_stage(obj)
+
+    def get_client_workflow_step(self, obj):
+        _resolve_workflow_read_state(obj)
+        return resolve_client_workflow_step(obj)
+
+    def get_operator_visible(self, obj):
+        _resolve_workflow_read_state(obj)
+        return booking_has_operator_visibility(obj)
+
+    def get_operator_can_act(self, obj):
+        _resolve_workflow_read_state(obj)
+        return booking_allows_operator_action(obj)
+
+    def get_client_can_edit_travellers(self, obj):
+        _resolve_workflow_read_state(obj)
+        return booking_allows_client_traveller_updates(obj)
+
+    def get_client_can_submit_minimum_payment(self, obj):
+        _resolve_workflow_read_state(obj)
+        return booking_allows_minimum_payment_submission(obj)
+
+    def get_client_can_submit_full_payment(self, obj):
+        _resolve_workflow_read_state(obj)
+        return booking_allows_full_payment_submission(obj)
+
+    def get_remaining_amount_due(self, obj):
+        _resolve_workflow_read_state(obj)
+        return get_remaining_amount_due(obj)
+
+    def get_workflow_bucket(self, obj):
+        _resolve_workflow_read_state(obj)
+        return resolve_operator_workflow_bucket(obj)
+
+
+class CurrentUserBookingListSerializer(BookingWorkflowFieldsMixin, serializers.ModelSerializer):
+    package_name = serializers.CharField(source="package_token.package_name", read_only=True)
+    package_type = serializers.CharField(source="package_token.package_type", read_only=True)
+    package_cost = serializers.CharField(source="package_token.package_base_cost", read_only=True)
+    partner_name = serializers.CharField(source="order_to.name", read_only=True)
+    partner_session_token = serializers.CharField(source="order_to.partner_session_token", read_only=True)
+
+    class Meta:
+        model = Booking
+        fields = (
+            "booking_id",
+            "booking_number",
+            "adults",
+            "child",
+            "infants",
+            "start_date",
+            "end_date",
+            "total_price",
+            "booking_status",
+            "issue_status",
+            "order_time",
+            "payment_type",
+            "hold_expires_at",
+            "payment_correction_expires_at",
+            "minimum_payment_status",
+            "full_payment_status",
+            "client_workflow_stage",
+            "client_workflow_step",
+            "operator_visible",
+            "operator_can_act",
+            "client_can_edit_travellers",
+            "client_can_submit_minimum_payment",
+            "client_can_submit_full_payment",
+            "remaining_amount_due",
+            "workflow_bucket",
+            "package_name",
+            "package_type",
+            "package_cost",
+            "partner_name",
+            "partner_session_token",
+        )
+
+
+class PartnerBookingListSerializer(BookingWorkflowFieldsMixin, serializers.ModelSerializer):
+    user_session_token = serializers.CharField(source="order_by.session_token", read_only=True)
+    user_fullName = serializers.CharField(source="order_by.name", read_only=True)
+    user_fullname = serializers.CharField(source="order_by.name", read_only=True)
+    user_country_code = serializers.CharField(source="order_by.country_code", read_only=True)
+    user_phone_number = serializers.CharField(source="order_by.phone_number", read_only=True)
+    user_email = serializers.CharField(source="order_by.email", read_only=True)
+    user_photo = serializers.CharField(source="order_by.user_photo", read_only=True)
+    user_address_detail = serializers.SerializerMethodField()
+    package_name = serializers.CharField(source="package_token.package_name", read_only=True)
+    package_type = serializers.CharField(source="package_token.package_type", read_only=True)
+    package_cost = serializers.CharField(source="package_token.package_base_cost", read_only=True)
+
+    class Meta:
+        model = Booking
+        fields = (
+            "booking_id",
+            "booking_number",
+            "adults",
+            "child",
+            "infants",
+            "start_date",
+            "end_date",
+            "total_price",
+            "booking_status",
+            "issue_status",
+            "order_time",
+            "payment_type",
+            "hold_expires_at",
+            "payment_correction_expires_at",
+            "minimum_payment_status",
+            "full_payment_status",
+            "client_workflow_stage",
+            "client_workflow_step",
+            "operator_visible",
+            "operator_can_act",
+            "client_can_edit_travellers",
+            "client_can_submit_minimum_payment",
+            "client_can_submit_full_payment",
+            "remaining_amount_due",
+            "workflow_bucket",
+            "user_session_token",
+            "user_fullName",
+            "user_fullname",
+            "user_country_code",
+            "user_phone_number",
+            "user_email",
+            "user_photo",
+            "user_address_detail",
+            "package_name",
+            "package_type",
+            "package_cost",
+        )
+
+    def get_user_address_detail(self, obj):
+        return get_user_address_detail(obj)
+
+
+class ShortBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSerializer):
     # Partner Section
     partner_session_token = serializers.CharField(source='order_to.partner_session_token', read_only=True)
     # User Section
@@ -133,8 +325,13 @@ class ShortBookingSerializer(serializers.ModelSerializer):
         model = Booking
         fields = (
             'booking_number', 'adults', 'child', 'infants', 'start_date', 'end_date', 'sharing', 'quad', 'triple',
-            'double', 'single', 'total_price', 'special_request', 'booking_status', 'order_time', 'payment_type',
-            'is_payment_received',
+            'double', 'single', 'total_price', 'special_request', 'booking_status', 'issue_status',
+            'order_time', 'payment_type', 'is_payment_received', 'hold_expires_at',
+            'payment_correction_expires_at', 'minimum_payment_status', 'full_payment_status',
+            'client_workflow_stage', 'client_workflow_step',
+            'operator_visible', 'operator_can_act', 'client_can_edit_travellers',
+            'client_can_submit_minimum_payment', 'client_can_submit_full_payment',
+            'remaining_amount_due', 'workflow_bucket',
 
             'partner_session_token',
 
@@ -158,13 +355,15 @@ class ShortBookingSerializer(serializers.ModelSerializer):
         return get_user_address_detail(obj)
 
     def get_payment_detail(self, obj):
+        if should_hide_payment_detail(self):
+            return []
         return get_payment_detail(obj)
 
     def get_passport_validity_detail(self, obj):
         return get_passport_validity(obj)
 
 
-class DetailBookingSerializer(serializers.ModelSerializer):
+class DetailBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSerializer):
     # Partner Section
     partner_session_token = serializers.CharField(source='order_to.partner_session_token', read_only=True)
     partner_email = serializers.CharField(source='order_to.email', read_only=True)
@@ -211,13 +410,18 @@ class DetailBookingSerializer(serializers.ModelSerializer):
     payment_detail = serializers.SerializerMethodField()
     booking_objections = serializers.SerializerMethodField()
     passport_validity_detail = serializers.SerializerMethodField()
-
     class Meta:
         model = Booking
         fields = (
             'booking_id', 'booking_number', 'adults', 'child', 'infants', 'start_date', 'end_date', 'sharing', 'quad',
             'triple', 'double', 'single', 'total_price',
-            'special_request', 'booking_status', 'order_time', 'payment_type', 'is_payment_received', 'partner_remarks',
+            'special_request', 'booking_status', 'issue_status', 'order_time', 'payment_type',
+            'is_payment_received', 'partner_remarks', 'hold_expires_at',
+            'payment_correction_expires_at', 'minimum_payment_status', 'full_payment_status',
+            'client_workflow_stage', 'client_workflow_step',
+            'operator_visible', 'operator_can_act', 'client_can_edit_travellers',
+            'client_can_submit_minimum_payment', 'client_can_submit_full_payment',
+            'remaining_amount_due', 'workflow_bucket',
 
             'partner_session_token', 'partner_email', 'partner_name', 'partner_username', 'company_detail',
             'partner_address_detail',
@@ -287,10 +491,22 @@ class DetailBookingSerializer(serializers.ModelSerializer):
         return BookingRatingAndReviewSerializer(airline, many=True).data
 
     def get_payment_detail(self, obj):
+        if should_hide_payment_detail(self):
+            return []
         return get_payment_detail(obj)
 
 
-class AdminPaidBookingSerializer(serializers.ModelSerializer):
+class LegacyDetailBookingSerializer(DetailBookingSerializer):
+    traveller_detail = serializers.SerializerMethodField()
+
+    class Meta(DetailBookingSerializer.Meta):
+        fields = DetailBookingSerializer.Meta.fields + ('traveller_detail',)
+
+    def get_traveller_detail(self, obj):
+        return get_passport_validity(obj)
+
+
+class AdminPaidBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSerializer):
     # Partner Section
     partner_session_token = serializers.CharField(source='order_to.partner_session_token', read_only=True)
     partner_email = serializers.CharField(source='order_to.email', read_only=True)
@@ -328,8 +544,13 @@ class AdminPaidBookingSerializer(serializers.ModelSerializer):
         model = Booking
         fields = (
             'booking_number', 'adults', 'child', 'infants', 'start_date', 'end_date', 'sharing', 'quad', 'triple',
-            'double', 'single', 'total_price', 'special_request', 'booking_status', 'order_time', 'payment_type',
-            'is_payment_received',
+            'double', 'single', 'total_price', 'special_request', 'booking_status', 'issue_status',
+            'order_time', 'payment_type', 'is_payment_received', 'hold_expires_at',
+            'payment_correction_expires_at', 'minimum_payment_status', 'full_payment_status',
+            'client_workflow_stage', 'client_workflow_step',
+            'operator_visible', 'operator_can_act', 'client_can_edit_travellers',
+            'client_can_submit_minimum_payment', 'client_can_submit_full_payment',
+            'remaining_amount_due', 'workflow_bucket',
 
             'partner_session_token', 'partner_email', 'partner_name', 'partner_username',
             'company_detail', 'partner_address_detail',
@@ -351,6 +572,8 @@ class AdminPaidBookingSerializer(serializers.ModelSerializer):
         return get_partner_address_detail(obj)
 
     def get_payment_detail(self, obj):
+        if should_hide_payment_detail(self):
+            return []
         return get_payment_detail(obj)
 
 

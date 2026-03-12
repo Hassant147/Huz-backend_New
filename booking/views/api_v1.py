@@ -28,6 +28,15 @@ from ..services import (
     update_passport_validation,
     validate_passport,
 )
+from ..statuses import (
+    BOOKING_STATUS_COMPLETED,
+    BOOKING_STATUS_IN_FULFILLMENT,
+    BOOKING_STATUS_READY_FOR_OPERATOR,
+    BOOKING_STATUS_READY_FOR_TRAVEL,
+    ISSUE_STATUS_NONE,
+    ISSUE_STATUS_OPERATOR_OBJECTION,
+)
+from ..workflow import sync_booking_state
 from .bookings import BookingViewSet as BaseBookingViewSet
 
 
@@ -100,7 +109,7 @@ class BookingViewSet(BaseBookingViewSet):
         booking = get_booking_by_identifier_for_user(
             user_profile,
             pk,
-            must_be_future=request.method.lower() == "post",
+            must_be_future=False,
         )
 
         payload["booking_number"] = booking.booking_number
@@ -153,7 +162,8 @@ class BookingViewSet(BaseBookingViewSet):
                 status=status.HTTP_409_CONFLICT,
             )
 
-        if booking.booking_status not in ["Completed", "Closed", "Close"]:
+        sync_booking_state(booking, save=True)
+        if booking.booking_status not in [BOOKING_STATUS_READY_FOR_TRAVEL, BOOKING_STATUS_COMPLETED]:
             return Response(
                 {
                     "message": "Reviews and ratings can only be submitted after your booking is completed or closed."
@@ -201,10 +211,16 @@ class BookingViewSet(BaseBookingViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if booking.booking_status not in ["Pending", "Completed", "Active", "Closed", "Close"]:
+        sync_booking_state(booking, save=True)
+        if booking.booking_status not in [
+            BOOKING_STATUS_READY_FOR_OPERATOR,
+            BOOKING_STATUS_IN_FULFILLMENT,
+            BOOKING_STATUS_READY_FOR_TRAVEL,
+            BOOKING_STATUS_COMPLETED,
+        ]:
             return Response(
                 {
-                    "message": "Complaint can only be raised when the booking status is Pending, Complete, Active, or Closed."
+                    "message": "Complaint can only be raised once the booking reaches operator readiness, fulfillment, ready-for-travel, or completion."
                 },
                 status=status.HTTP_409_CONFLICT,
             )
@@ -259,10 +275,15 @@ class BookingViewSet(BaseBookingViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if booking.booking_status not in ["Completed", "Active", "Closed"]:
+        sync_booking_state(booking, save=True)
+        if booking.booking_status not in [
+            BOOKING_STATUS_READY_FOR_TRAVEL,
+            BOOKING_STATUS_COMPLETED,
+            BOOKING_STATUS_IN_FULFILLMENT,
+        ]:
             return Response(
                 {
-                    "message": "Request can only be raised when the booking status is Completed, Active or Closed."
+                    "message": "Request can only be raised when the booking is in fulfillment, ready for travel, or completed."
                 },
                 status=status.HTTP_409_CONFLICT,
             )
@@ -299,9 +320,10 @@ class BookingViewSet(BaseBookingViewSet):
         payload, user_profile = _payload_with_user_session(request, request.data)
         booking = get_booking_by_identifier_for_user(user_profile, pk, must_be_future=False)
 
-        if booking.booking_status != "Objection":
+        sync_booking_state(booking, save=True)
+        if getattr(booking, "issue_status", ISSUE_STATUS_NONE) != ISSUE_STATUS_OPERATOR_OBJECTION:
             return Response(
-                {"message": "Invalid booking status. Booking status should be 'Objection'."},
+                {"message": "Invalid booking status. Booking status should be 'OPERATOR_OBJECTION'."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -334,8 +356,9 @@ class BookingViewSet(BaseBookingViewSet):
         objection_detail.client_remarks = client_remarks
         objection_detail.save()
 
-        booking.booking_status = "Pending"
-        booking.save(update_fields=["booking_status"])
+        booking.issue_status = ISSUE_STATUS_NONE
+        booking.save(update_fields=["issue_status"])
+        sync_booking_state(booking, save=True)
 
         serializer = DetailBookingSerializer(booking, context={"request": request})
         return Response(serializer.data, status=status.HTTP_200_OK)

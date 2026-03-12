@@ -23,8 +23,8 @@ from .serializers import (
 from common.logs_file import logger
 from common.utility import generate_token, random_six_digits, validate_required_fields, CustomPagination
 from datetime import datetime
-from django.db.models import Avg, Count, ExpressionWrapper, F, FloatField, IntegerField, Min, Prefetch, Q, Sum, Value
-from django.db.models.functions import Coalesce
+from django.db.models import Avg, Case, Count, ExpressionWrapper, F, FloatField, IntegerField, Min, Prefetch, Q, Sum, Value, When
+from django.db.models.functions import Cast, Coalesce
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from datetime import datetime, timedelta
@@ -1197,6 +1197,14 @@ def _parse_int_values(raw_value):
     return parsed_values
 
 
+def _parse_float_value(raw_value):
+    try:
+        parsed_value = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return parsed_value if parsed_value >= 0 else None
+
+
 def _resolve_website_min_start_date(request, base_minimum_start_date):
     departure_date = request.GET.get("start_date") or request.GET.get("departure_date")
     parsed_departure_date = parse_date(departure_date) if departure_date else None
@@ -1388,6 +1396,53 @@ def _apply_website_filters(queryset, request):
         if ticket_query:
             queryset = queryset.filter(ticket_query)
 
+    makkah_hotel_distance = _parse_float_value(
+        query_params.get("makkah_hotel_distance")
+        or query_params.get("makkahHotelDistance")
+    )
+    if makkah_hotel_distance is not None and makkah_hotel_distance > 0.5:
+        queryset = queryset.annotate(
+            website_makkah_hotel_distance=Min(
+                Case(
+                    When(
+                        Q(hotel_for_package__hotel_city__iexact="Makkah")
+                        & Q(hotel_for_package__hotel_distance__isnull=False)
+                        & ~Q(hotel_for_package__hotel_distance=""),
+                        then=Cast(F("hotel_for_package__hotel_distance"), FloatField()),
+                    ),
+                    default=Value(None),
+                    output_field=FloatField(),
+                )
+            )
+        ).filter(
+            Q(website_makkah_hotel_distance__isnull=True)
+            | Q(website_makkah_hotel_distance__lte=makkah_hotel_distance)
+        )
+
+    madinah_hotel_distance = _parse_float_value(
+        query_params.get("madinah_hotel_distance")
+        or query_params.get("madina_hotel_distance")
+        or query_params.get("madinaHotelDistance")
+    )
+    if madinah_hotel_distance is not None and madinah_hotel_distance > 0.5:
+        queryset = queryset.annotate(
+            website_madinah_hotel_distance=Min(
+                Case(
+                    When(
+                        Q(hotel_for_package__hotel_city__iexact="Madinah")
+                        & Q(hotel_for_package__hotel_distance__isnull=False)
+                        & ~Q(hotel_for_package__hotel_distance=""),
+                        then=Cast(F("hotel_for_package__hotel_distance"), FloatField()),
+                    ),
+                    default=Value(None),
+                    output_field=FloatField(),
+                )
+            )
+        ).filter(
+            Q(website_madinah_hotel_distance__isnull=True)
+            | Q(website_madinah_hotel_distance__lte=madinah_hotel_distance)
+        )
+
     return queryset
 
 
@@ -1419,6 +1474,8 @@ class GetHuzShortPackageForWebsiteView(APIView):
             openapi.Parameter('air_tickets', openapi.IN_QUERY, description="Comma-separated ticket types", type=openapi.TYPE_STRING),
             openapi.Parameter('meals', openapi.IN_QUERY, description="Comma-separated meal filters", type=openapi.TYPE_STRING),
             openapi.Parameter('ziyarah', openapi.IN_QUERY, description="Comma-separated ziyarah city filters", type=openapi.TYPE_STRING),
+            openapi.Parameter('makkah_hotel_distance', openapi.IN_QUERY, description="Maximum Makkah hotel distance in KM", type=openapi.TYPE_NUMBER),
+            openapi.Parameter('madinah_hotel_distance', openapi.IN_QUERY, description="Maximum Madinah hotel distance in KM", type=openapi.TYPE_NUMBER),
             openapi.Parameter('ordering', openapi.IN_QUERY, description="Sort key: newest, price-high, price-low, top-rated, start-date", type=openapi.TYPE_STRING),
             openapi.Parameter('page', openapi.IN_QUERY, description="Page number", type=openapi.TYPE_INTEGER),
             openapi.Parameter('page_size', openapi.IN_QUERY, description="Page size", type=openapi.TYPE_INTEGER),
@@ -1606,6 +1663,8 @@ class GetSearchPackageByCityNDateView(APIView):
             openapi.Parameter('air_tickets', openapi.IN_QUERY, description="Comma-separated ticket types", type=openapi.TYPE_STRING),
             openapi.Parameter('meals', openapi.IN_QUERY, description="Comma-separated meal filters", type=openapi.TYPE_STRING),
             openapi.Parameter('ziyarah', openapi.IN_QUERY, description="Comma-separated ziyarah city filters", type=openapi.TYPE_STRING),
+            openapi.Parameter('makkah_hotel_distance', openapi.IN_QUERY, description="Maximum Makkah hotel distance in KM", type=openapi.TYPE_NUMBER),
+            openapi.Parameter('madinah_hotel_distance', openapi.IN_QUERY, description="Maximum Madinah hotel distance in KM", type=openapi.TYPE_NUMBER),
             openapi.Parameter('ordering', openapi.IN_QUERY, description="Sort key: newest, price-high, price-low, top-rated, start-date", type=openapi.TYPE_STRING),
             openapi.Parameter('page', openapi.IN_QUERY, description="Page number", type=openapi.TYPE_INTEGER),
             openapi.Parameter('page_size', openapi.IN_QUERY, description="Page size", type=openapi.TYPE_INTEGER),

@@ -1,18 +1,26 @@
+from datetime import datetime, time
+
+from django.utils import timezone
+from django.utils.dateparse import parse_date, parse_datetime
 from rest_framework import status, viewsets
 from rest_framework.exceptions import AuthenticationFailed
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from common.auth_utils import is_admin_request, require_user_profile
 from common.models import UserProfile
+from common.pagination import CustomPagination
 from common.permissions import IsAdminOrAuthenticatedUserProfile
 
 from .. import manage_bookings as legacy_manage_bookings
+from ..querysets import USER_BOOKING_STATUS_BUCKETS, normalize_user_booking_status_bucket
 from ..request_serializers import BookingCreateRequestSerializer, validate_serializer_or_raise
-from ..serializers import DetailBookingSerializer
+from ..serializers import CurrentUserBookingListSerializer, DetailBookingSerializer
 from ..services import (
     create_booking,
+    find_existing_user_booking,
     get_booking_by_identifier_for_user,
-    get_user_bookings_queryset,
+    get_filtered_user_bookings_queryset,
     remove_booking_for_user,
 )
 
@@ -55,18 +63,55 @@ def _payload_with_user_session(request, payload=None):
     return base_payload, user_profile
 
 
+def _parse_optional_booking_date(value):
+    normalized_value = str(value or "").strip()
+    if not normalized_value:
+        return None
+
+    parsed_datetime = parse_datetime(normalized_value)
+    if parsed_datetime is not None:
+        if timezone.is_naive(parsed_datetime):
+            return timezone.make_aware(parsed_datetime, timezone.get_current_timezone())
+        return parsed_datetime
+
+    parsed_date_value = parse_date(normalized_value)
+    if parsed_date_value is None:
+        return None
+
+    return timezone.make_aware(
+        datetime.combine(parsed_date_value, time.min),
+        timezone.get_current_timezone(),
+    )
+
+
 class BookingViewSet(viewsets.ViewSet):
     permission_classes = [IsAdminOrAuthenticatedUserProfile]
 
     def list(self, request):
         _, user_profile = _payload_with_user_session(request, request.query_params)
-        queryset = get_user_bookings_queryset(user_profile)
-        serializer = DetailBookingSerializer(
-            queryset,
+        status_bucket = str(request.query_params.get("status_bucket") or "").strip().lower()
+        if status_bucket and status_bucket not in USER_BOOKING_STATUS_BUCKETS:
+            return Response(
+                {
+                    "message": "Invalid status_bucket. Must be one of: "
+                    + ", ".join(sorted(USER_BOOKING_STATUS_BUCKETS))
+                    + "."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        queryset = get_filtered_user_bookings_queryset(
+            user_profile,
+            status_bucket=normalize_user_booking_status_bucket(status_bucket),
+        )
+        paginator = CustomPagination()
+        page = paginator.paginate_queryset(queryset, request)
+        serializer = CurrentUserBookingListSerializer(
+            page,
             many=True,
             context={"request": request},
         )
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        return paginator.get_paginated_response(serializer.data)
 
     def retrieve(self, request, pk=None):
         _, user_profile = _payload_with_user_session(request, request.query_params)
@@ -96,3 +141,44 @@ class BookingViewSet(viewsets.ViewSet):
             pk,
         )
         return Response(result, status=status.HTTP_200_OK)
+
+
+class CurrentUserExistingBookingView(APIView):
+    permission_classes = [IsAdminOrAuthenticatedUserProfile]
+
+    def get(self, request):
+        _, user_profile = _payload_with_user_session(request, request.query_params)
+        huz_token = str(request.query_params.get("huz_token") or "").strip()
+        if not huz_token:
+            return Response(
+                {"message": "Missing required data fields."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        start_date = _parse_optional_booking_date(request.query_params.get("start_date"))
+        end_date = _parse_optional_booking_date(request.query_params.get("end_date"))
+        if request.query_params.get("start_date") and start_date is None:
+            return Response(
+                {"message": "Invalid start_date."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if request.query_params.get("end_date") and end_date is None:
+            return Response(
+                {"message": "Invalid end_date."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        booking = find_existing_user_booking(
+            user_profile,
+            huz_token=huz_token,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        if not booking:
+            return Response({"exists": False, "booking": None}, status=status.HTTP_200_OK)
+
+        serializer = CurrentUserBookingListSerializer(booking, context={"request": request})
+        return Response(
+            {"exists": True, "booking": serializer.data},
+            status=status.HTTP_200_OK,
+        )

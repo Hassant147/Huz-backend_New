@@ -19,6 +19,8 @@ from .manage_partner_booking import (
     BookingAirlineDetailsView,
     BookingHotelAndTransportDetailsView,
     CloseBookingView,
+    DeleteBookingDocumentsView,
+    GetBookingDetailByBookingNumberForPartnerView,
     GetPartnerComplaintsView,
     GetPartnersOverallBookingStatisticsView,
     GetBookingShortDetailForPartnersView,
@@ -41,12 +43,34 @@ from .models import (
     Booking,
     BookingAirlineDetail,
     BookingComplaints,
+    BookingDocuments,
     BookingObjections,
+    DocumentsStatus,
     PassportValidity,
     BookingRatingAndReview,
     Payment,
     PartnersBookingPayment,
 )
+from .serializers import DetailBookingSerializer, LegacyDetailBookingSerializer
+from .statuses import (
+    BOOKING_STATUS_AWAITING_FINAL_PAYMENT,
+    BOOKING_STATUS_CANCELLED,
+    BOOKING_STATUS_COMPLETED,
+    BOOKING_STATUS_HOLD,
+    BOOKING_STATUS_IN_FULFILLMENT,
+    BOOKING_STATUS_READY_FOR_OPERATOR,
+    BOOKING_STATUS_READY_FOR_TRAVEL,
+    BOOKING_STATUS_TRAVELER_DETAILS_PENDING,
+    ISSUE_STATUS_OPERATOR_OBJECTION,
+    ISSUE_STATUS_REPORTED,
+    PAYMENT_STATUS_APPROVED,
+    PAYMENT_STATUS_REJECTED,
+    PAYMENT_STATUS_UNDER_REVIEW,
+    WORKFLOW_BUCKET_HISTORY,
+    WORKFLOW_BUCKET_ISSUES,
+    WORKFLOW_BUCKET_VIEW_ONLY,
+)
+from .workflow import sync_booking_state
 
 
 def ensure_tables_for_apps(app_labels):
@@ -158,7 +182,7 @@ class ManageBookingsUserListViewTests(APITransactionTestCase):
             end_date=end_date,
             total_price=1800,
             special_request="Window seat",
-            booking_status="Pending",
+            booking_status=BOOKING_STATUS_HOLD,
             payment_type="Bank",
             order_by=self.customer,
             order_to=self.partner,
@@ -168,7 +192,7 @@ class ManageBookingsUserListViewTests(APITransactionTestCase):
             transaction_number="PAY-BOOKING-USER-LIST-001",
             transaction_type="Full",
             transaction_amount=1800,
-            payment_status="Pending",
+            payment_status=PAYMENT_STATUS_UNDER_REVIEW,
             booking_token=self.booking,
         )
         self.other_booking = Booking.objects.create(
@@ -185,7 +209,7 @@ class ManageBookingsUserListViewTests(APITransactionTestCase):
             end_date=end_date,
             total_price=900,
             special_request="None",
-            booking_status="Pending",
+            booking_status=BOOKING_STATUS_HOLD,
             payment_type="Bank",
             order_by=self.other_customer,
             order_to=self.partner,
@@ -306,7 +330,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
             end_date=self.end_date,
             total_price=2400,
             special_request="Wheelchair support",
-            booking_status="Initialize",
+            booking_status=BOOKING_STATUS_HOLD,
             payment_type="Bank",
             order_by=self.customer,
             order_to=self.partner,
@@ -316,6 +340,97 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
     def _authenticated_request(self, request):
         force_authenticate(request, user=self.admin_user)
         return request
+
+    def _create_payment(self, booking, *, stage, amount, status_value, suffix):
+        return Payment.objects.create(
+            transaction_number=f"{booking.booking_number}-{stage}-{suffix}",
+            transaction_type=stage,
+            transaction_amount=amount,
+            payment_status=status_value,
+            booking_token=booking,
+        )
+
+    def _approve_minimum(self, booking=None):
+        booking = booking or self.existing_booking
+        payment = self._create_payment(
+            booking,
+            stage="Minimum",
+            amount=max(float(booking.total_price) * 0.1, 1),
+            status_value=PAYMENT_STATUS_APPROVED,
+            suffix="approved-minimum",
+        )
+        sync_booking_state(booking, save=True)
+        return payment
+
+    def _approve_full(self, booking=None):
+        booking = booking or self.existing_booking
+        payment = self._create_payment(
+            booking,
+            stage="Full",
+            amount=float(booking.total_price),
+            status_value=PAYMENT_STATUS_APPROVED,
+            suffix="approved-full",
+        )
+        sync_booking_state(booking, save=True)
+        return payment
+
+    def _add_complete_passports(self, booking=None):
+        booking = booking or self.existing_booking
+        traveller_count = booking.adults + booking.child + booking.infants
+        for index in range(traveller_count):
+            PassportValidity.objects.create(
+                first_name=f"Traveler{index + 1}",
+                last_name="Test",
+                date_of_birth=aware_midnight("1990-01-10"),
+                passport_number=f"{booking.booking_number}-{index + 1:02d}",
+                passport_country="PK",
+                expiry_date=aware_midnight("2031-06-01"),
+                user_passport=SimpleUploadedFile(
+                    f"passport-{index + 1}.jpg",
+                    b"passport-image",
+                    content_type="image/jpeg",
+                ),
+                user_photo=SimpleUploadedFile(
+                    f"photo-{index + 1}.jpg",
+                    b"photo-image",
+                    content_type="image/jpeg",
+                ),
+                passport_for_booking_number=booking,
+            )
+        sync_booking_state(booking, save=True)
+
+    def _mark_ready_for_operator(self, booking=None):
+        booking = booking or self.existing_booking
+        self._approve_minimum(booking)
+        self._add_complete_passports(booking)
+        self._approve_full(booking)
+        booking.refresh_from_db()
+        sync_booking_state(booking, save=True)
+        return booking
+
+    def _mark_in_fulfillment(self, booking=None):
+        booking = self._mark_ready_for_operator(booking)
+        booking.booking_status = BOOKING_STATUS_IN_FULFILLMENT
+        booking.save(update_fields=["booking_status"])
+        booking.refresh_from_db()
+        sync_booking_state(booking, save=True)
+        return booking
+
+    def _mark_ready_for_travel(self, booking=None):
+        booking = self._mark_in_fulfillment(booking)
+        DocumentsStatus.objects.update_or_create(
+            status_for_booking=booking,
+            defaults={
+                "is_visa_completed": True,
+                "is_airline_completed": True,
+                "is_airline_detail_completed": True,
+                "is_hotel_completed": True,
+                "is_transport_completed": True,
+            },
+        )
+        booking.refresh_from_db()
+        sync_booking_state(booking, save=True)
+        return booking
 
     def _booking_payload(self):
         return {
@@ -576,7 +691,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
             end_date=self.end_date,
             total_price=4000,
             special_request="Occupy seats",
-            booking_status="Paid",
+            booking_status=BOOKING_STATUS_HOLD,
             payment_type="Bank",
             order_by=other_customer,
             order_to=self.partner,
@@ -631,6 +746,8 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         self.assertIn("transaction_type", response.data)
 
     def test_passport_validation_accepts_legacy_date_only_payload(self):
+        self._approve_minimum()
+
         payload = {
             "session_token": self.customer.session_token,
             "booking_number": self.existing_booking.booking_number,
@@ -653,7 +770,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.existing_booking.refresh_from_db()
-        self.assertEqual(self.existing_booking.booking_status, "Passport_Validation")
+        self.assertEqual(self.existing_booking.booking_status, BOOKING_STATUS_TRAVELER_DETAILS_PENDING)
         self.assertTrue(
             PassportValidity.objects.filter(
                 passport_for_booking_number=self.existing_booking,
@@ -662,6 +779,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         )
 
     def test_passport_validation_reuses_existing_placeholder_row(self):
+        self._approve_minimum()
         placeholder_passport = PassportValidity.objects.create(
             passport_for_booking_number=self.existing_booking,
         )
@@ -694,6 +812,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         self.assertEqual(placeholder_passport.passport_number, "P7651000")
 
     def test_v1_passport_update_rejects_duplicate_passport_number_inside_booking(self):
+        self._approve_minimum()
         first_passport = PassportValidity.objects.create(
             first_name="Amina",
             last_name="Khan",
@@ -733,6 +852,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         self.assertEqual(second_passport.passport_number, "P9990002")
 
     def test_v1_passport_endpoint_accepts_bearer_auth_without_legacy_session_token(self):
+        self._approve_minimum()
         response = self.client.post(
             f"/api/v1/bookings/{self.existing_booking.booking_number}/passports/",
             {
@@ -749,7 +869,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.existing_booking.refresh_from_db()
-        self.assertEqual(self.existing_booking.booking_status, "Passport_Validation")
+        self.assertEqual(self.existing_booking.booking_status, BOOKING_STATUS_TRAVELER_DETAILS_PENDING)
         self.assertTrue(
             PassportValidity.objects.filter(
                 passport_for_booking_number=self.existing_booking,
@@ -760,6 +880,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
     def test_v1_passport_endpoint_accepts_files_in_single_request(self):
         self.existing_booking.adults = 1
         self.existing_booking.save(update_fields=["adults"])
+        self._approve_minimum()
 
         passport_file = SimpleUploadedFile(
             "traveler-passport.jpg",
@@ -790,7 +911,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.existing_booking.refresh_from_db()
-        self.assertEqual(self.existing_booking.booking_status, "Pending")
+        self.assertEqual(self.existing_booking.booking_status, BOOKING_STATUS_AWAITING_FINAL_PAYMENT)
 
         traveller_passport = PassportValidity.objects.get(
             passport_for_booking_number=self.existing_booking,
@@ -800,6 +921,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         self.assertTrue(bool(traveller_passport.user_photo))
 
     def test_v1_passport_update_rejects_unrelated_passport_id(self):
+        self._approve_minimum()
         other_customer = UserProfile.objects.create(
             session_token="booking-workflow-other-user-token",
             name="Other Workflow User",
@@ -822,12 +944,20 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
             end_date=self.end_date,
             total_price=1200,
             special_request="N/A",
-            booking_status="Passport_Validation",
+            booking_status=BOOKING_STATUS_TRAVELER_DETAILS_PENDING,
             payment_type="Bank",
             order_by=other_customer,
             order_to=self.partner,
             package_token=self.package,
         )
+        self._create_payment(
+            other_booking,
+            stage="Minimum",
+            amount=120,
+            status_value=PAYMENT_STATUS_APPROVED,
+            suffix="other-approved-minimum",
+        )
+        sync_booking_state(other_booking, save=True)
         unrelated_passport = PassportValidity.objects.create(
             first_name="Amina",
             last_name="Khan",
@@ -860,6 +990,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
     def test_legacy_passport_upload_endpoints_accept_bearer_auth(self):
         self.existing_booking.adults = 1
         self.existing_booking.save(update_fields=["adults"])
+        self._approve_minimum()
         traveller_passport = PassportValidity.objects.create(
             first_name="Fatima",
             last_name="Noor",
@@ -869,7 +1000,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
             expiry_date=aware_midnight("2030-06-01"),
             passport_for_booking_number=self.existing_booking,
         )
-        self.existing_booking.booking_status = "Passport_Validation"
+        self.existing_booking.booking_status = BOOKING_STATUS_TRAVELER_DETAILS_PENDING
         self.existing_booking.save(update_fields=["booking_status"])
 
         passport_file = SimpleUploadedFile(
@@ -913,7 +1044,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         self.existing_booking.refresh_from_db()
         self.assertTrue(bool(traveller_passport.user_passport))
         self.assertTrue(bool(traveller_passport.user_photo))
-        self.assertEqual(self.existing_booking.booking_status, "Pending")
+        self.assertEqual(self.existing_booking.booking_status, BOOKING_STATUS_AWAITING_FINAL_PAYMENT)
 
     def test_v1_users_me_bookings_accepts_bearer_auth(self):
         response = self.client.get(
@@ -922,9 +1053,97 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertIsInstance(response.data, list)
-        self.assertEqual(len(response.data), 1)
-        self.assertEqual(response.data[0].get("booking_number"), self.existing_booking.booking_number)
+        self.assertEqual(response.data.get("count"), 1)
+        self.assertEqual(len(response.data.get("results", [])), 1)
+        self.assertEqual(
+            response.data["results"][0].get("booking_number"),
+            self.existing_booking.booking_number,
+        )
+
+    def test_v1_users_me_bookings_filters_status_bucket_server_side(self):
+        self._create_payment(
+            self.existing_booking,
+            stage="Minimum",
+            amount=max(float(self.existing_booking.total_price) * 0.1, 1),
+            status_value=PAYMENT_STATUS_UNDER_REVIEW,
+            suffix="users-me-under-review",
+        )
+        other_booking = Booking.objects.create(
+            booking_number="BOOKING-WORKFLOW-COMPLETED-001",
+            adults=1,
+            child=0,
+            infants=0,
+            sharing="Yes",
+            quad="0",
+            triple="0",
+            double="1",
+            single="0",
+            start_date=self.start_date + timedelta(days=7),
+            end_date=self.end_date + timedelta(days=7),
+            total_price=1200,
+            special_request="N/A",
+            booking_status=BOOKING_STATUS_COMPLETED,
+            payment_type="Bank",
+            order_by=self.customer,
+            order_to=self.partner,
+            package_token=self.package,
+        )
+
+        response = self.client.get(
+            "/api/v1/users/me/bookings/",
+            {"status_bucket": "under_review"},
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 1)
+        self.assertEqual(
+            response.data["results"][0].get("booking_number"),
+            self.existing_booking.booking_number,
+        )
+        self.assertNotEqual(
+            response.data["results"][0].get("booking_number"),
+            other_booking.booking_number,
+        )
+
+    def test_v1_existing_booking_lookup_returns_matching_active_booking(self):
+        response = self.client.get(
+            "/api/v1/users/me/bookings/existing/",
+            {
+                "huz_token": self.package.huz_token,
+                "start_date": self.start_date.date().isoformat(),
+                "end_date": self.end_date.date().isoformat(),
+            },
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data.get("exists"))
+        self.assertEqual(
+            response.data.get("booking", {}).get("booking_number"),
+            self.existing_booking.booking_number,
+        )
+
+    def test_detail_booking_serializer_does_not_save_during_read_serialization(self):
+        with patch.object(Booking, "save", autospec=True) as save_mock:
+            serializer = DetailBookingSerializer(self.existing_booking)
+            payload = serializer.data
+
+        self.assertEqual(payload.get("booking_number"), self.existing_booking.booking_number)
+        save_mock.assert_not_called()
+
+    def test_detail_booking_serializer_omits_legacy_traveller_alias(self):
+        payload = DetailBookingSerializer(self.existing_booking).data
+
+        self.assertIn("passport_validity_detail", payload)
+        self.assertNotIn("traveller_detail", payload)
+
+    def test_legacy_detail_booking_serializer_keeps_traveller_alias(self):
+        payload = LegacyDetailBookingSerializer(self.existing_booking).data
+
+        self.assertIn("passport_validity_detail", payload)
+        self.assertIn("traveller_detail", payload)
+        self.assertEqual(payload["traveller_detail"], payload["passport_validity_detail"])
 
     def test_v1_booking_detail_accepts_bearer_auth(self):
         response = self.client.get(
@@ -959,7 +1178,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
             end_date=self.end_date + timedelta(days=3),
             total_price=1200,
             special_request="N/A",
-            booking_status="Initialize",
+            booking_status=BOOKING_STATUS_HOLD,
             payment_type="Bank",
             order_by=other_customer,
             order_to=self.partner,
@@ -989,7 +1208,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data.get("user_session_token"), self.customer.session_token)
 
-    def test_v1_delete_endpoint_removes_initialized_booking_with_bearer_auth(self):
+    def test_v1_delete_endpoint_removes_hold_booking_with_bearer_auth(self):
         response = self.client.delete(
             f"/api/v1/bookings/{self.existing_booking.booking_number}/",
             format="json",
@@ -1002,9 +1221,15 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
             Booking.objects.filter(booking_number=self.existing_booking.booking_number).exists()
         )
 
-    def test_legacy_delete_endpoint_cancels_paid_booking(self):
-        self.existing_booking.booking_status = "Paid"
-        self.existing_booking.save(update_fields=["booking_status"])
+    def test_legacy_delete_endpoint_rejects_paid_hold_booking(self):
+        self._create_payment(
+            self.existing_booking,
+            stage="Full",
+            amount=2400,
+            status_value=PAYMENT_STATUS_UNDER_REVIEW,
+            suffix="hold-cancel",
+        )
+        sync_booking_state(self.existing_booking, save=True)
 
         request = self._authenticated_request(
             self.factory.delete(
@@ -1019,10 +1244,37 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
 
         response = ManageBookingsView.as_view()(request)
 
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
         self.existing_booking.refresh_from_db()
-        self.assertEqual(self.existing_booking.booking_status, "Cancel")
-        self.assertFalse(response.data.get("deleted"))
+        self.assertEqual(self.existing_booking.booking_status, BOOKING_STATUS_HOLD)
+        self.assertEqual(
+            response.data.get("message"),
+            "Bookings with submitted payments cannot be removed or cancelled from self-service.",
+        )
+
+    def test_v1_delete_endpoint_rejects_hold_booking_with_submitted_payment(self):
+        self._create_payment(
+            self.existing_booking,
+            stage="Full",
+            amount=2400,
+            status_value=PAYMENT_STATUS_UNDER_REVIEW,
+            suffix="hold-delete-blocked",
+        )
+        sync_booking_state(self.existing_booking, save=True)
+
+        response = self.client.delete(
+            f"/api/v1/bookings/{self.existing_booking.booking_number}/",
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.existing_booking.refresh_from_db()
+        self.assertEqual(self.existing_booking.booking_status, BOOKING_STATUS_HOLD)
+        self.assertEqual(
+            response.data.get("message"),
+            "Bookings with submitted payments cannot be removed or cancelled from self-service.",
+        )
 
     def test_v1_payment_endpoint_accepts_path_booking_identifier(self):
         with patch("booking.services.user_new_booking_email"):
@@ -1039,9 +1291,113 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.existing_booking.refresh_from_db()
-        self.assertEqual(self.existing_booking.booking_status, "Paid")
+        self.assertEqual(self.existing_booking.booking_status, BOOKING_STATUS_HOLD)
 
-    def test_v1_payment_endpoint_reuses_existing_stage_payment_record(self):
+    def test_v1_booking_detail_locks_actions_for_full_payment_under_review(self):
+        with patch("booking.services.user_new_booking_email"):
+            response = self.client.post(
+                f"/api/v1/bookings/{self.existing_booking.booking_id}/payments/",
+                {
+                    "transaction_number": "V1-TRANS-UNDER-REVIEW-001",
+                    "transaction_type": "Full",
+                    "transaction_amount": 2400,
+                },
+                format="json",
+                HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.existing_booking.refresh_from_db()
+        self.assertEqual(self.existing_booking.booking_status, BOOKING_STATUS_HOLD)
+        self.assertIsNone(self.existing_booking.hold_expires_at)
+
+        detail_response = self.client.get(
+            f"/api/v1/bookings/{self.existing_booking.booking_number}/",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(detail_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(detail_response.data.get("minimum_payment_status"), "NOT_SUBMITTED")
+        self.assertEqual(detail_response.data.get("full_payment_status"), "UNDER_REVIEW")
+        self.assertEqual(detail_response.data.get("client_workflow_stage"), "minimum_payment_review")
+        self.assertEqual(detail_response.data.get("client_workflow_step"), 2)
+        self.assertFalse(detail_response.data.get("client_can_submit_minimum_payment"))
+        self.assertFalse(detail_response.data.get("client_can_submit_full_payment"))
+        self.assertFalse(detail_response.data.get("client_can_edit_travellers"))
+        self.assertIsNone(detail_response.data.get("hold_expires_at"))
+
+    def test_v1_booking_detail_reports_final_payment_review_stage(self):
+        self._approve_minimum()
+        self._add_complete_passports()
+
+        with patch("booking.services.user_new_booking_email"):
+            response = self.client.post(
+                f"/api/v1/bookings/{self.existing_booking.booking_number}/payments/",
+                {
+                    "transaction_number": "V1-TRANS-FULL-REVIEW-001",
+                    "transaction_type": "Full",
+                    "transaction_amount": 2400,
+                },
+                format="json",
+                HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        detail_response = self.client.get(
+            f"/api/v1/bookings/{self.existing_booking.booking_number}/",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(detail_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(detail_response.data.get("client_workflow_stage"), "full_payment_review")
+        self.assertEqual(detail_response.data.get("client_workflow_step"), 4)
+
+    def test_v1_payment_endpoint_accepts_near_term_booking_inside_10_day_window(self):
+        near_term_start_date = timezone.now() + timedelta(days=2)
+        near_term_end_date = near_term_start_date + timedelta(days=5)
+        near_term_booking = Booking.objects.create(
+            booking_number="BOOKING-WORKFLOW-NEAR-TERM-001",
+            adults=1,
+            child=0,
+            infants=0,
+            sharing="0",
+            quad="0",
+            triple="0",
+            double="1",
+            single="0",
+            start_date=near_term_start_date,
+            end_date=near_term_end_date,
+            total_price=1200,
+            special_request="Near-term booking",
+            booking_status=BOOKING_STATUS_HOLD,
+            payment_type="Bank",
+            order_by=self.customer,
+            order_to=self.partner,
+            package_token=self.package,
+        )
+
+        with patch("booking.services.user_new_booking_email"):
+            response = self.client.post(
+                f"/api/v1/bookings/{near_term_booking.booking_number}/payments/",
+                {
+                    "transaction_number": "V1-TRANS-NEAR-TERM-001",
+                    "transaction_type": "Minimum",
+                    "transaction_amount": 120,
+                },
+                format="json",
+                HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            Payment.objects.filter(
+                booking_token=near_term_booking,
+                transaction_number="V1-TRANS-NEAR-TERM-001",
+            ).exists()
+        )
+
+    def test_v1_payment_endpoint_rejects_resubmission_while_stage_is_under_review(self):
         with patch("booking.services.user_new_booking_email"):
             first_response = self.client.post(
                 f"/api/v1/bookings/{self.existing_booking.booking_id}/payments/",
@@ -1065,22 +1421,22 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
             )
 
         self.assertEqual(first_response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(second_response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(second_response.status_code, status.HTTP_409_CONFLICT)
         full_payments = Payment.objects.filter(
             booking_token=self.existing_booking,
             transaction_type__iexact="Full",
         )
         self.assertEqual(full_payments.count(), 1)
         payment = full_payments.first()
-        self.assertEqual(payment.transaction_number, "V1-TRANS-002")
-        self.assertEqual(payment.transaction_amount, 2600)
+        self.assertEqual(payment.transaction_number, "V1-TRANS-001")
+        self.assertEqual(payment.transaction_amount, 2400)
 
     def test_v1_payment_endpoint_rejects_duplicate_approved_stage(self):
         Payment.objects.create(
             transaction_number="APPROVED-FULL-001",
             transaction_type="Full",
             transaction_amount=2400,
-            payment_status="Approved",
+            payment_status=PAYMENT_STATUS_APPROVED,
             booking_token=self.existing_booking,
         )
 
@@ -1102,7 +1458,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
             transaction_number="MIN-001",
             transaction_type="Minimum",
             transaction_amount=240,
-            payment_status="Pending",
+            payment_status=PAYMENT_STATUS_UNDER_REVIEW,
             booking_token=self.existing_booking,
         )
 
@@ -1146,7 +1502,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
             end_date=self.end_date + timedelta(days=10),
             total_price=1200,
             special_request="N/A",
-            booking_status="Paid",
+            booking_status=BOOKING_STATUS_HOLD,
             payment_type="Bank",
             order_by=other_customer,
             order_to=self.partner,
@@ -1156,7 +1512,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
             transaction_number="GLOBAL-TRANS-001",
             transaction_type="Full",
             transaction_amount=1200,
-            payment_status="Pending",
+            payment_status=PAYMENT_STATUS_UNDER_REVIEW,
             booking_token=other_booking,
         )
 
@@ -1264,8 +1620,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         )
 
     def test_v1_complaint_endpoint_creates_record_and_user_list_returns_it(self):
-        self.existing_booking.booking_status = "Pending"
-        self.existing_booking.save(update_fields=["booking_status"])
+        self._mark_ready_for_operator()
 
         response = self.client.post(
             f"/api/v1/bookings/{self.existing_booking.booking_number}/complaints/",
@@ -1288,8 +1643,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         self.assertEqual(list_response.data[0].get("booking_number"), self.existing_booking.booking_number)
 
     def test_v1_request_endpoint_creates_record_and_user_list_returns_it(self):
-        self.existing_booking.booking_status = "Completed"
-        self.existing_booking.save(update_fields=["booking_status"])
+        self._mark_in_fulfillment()
 
         response = self.client.post(
             f"/api/v1/bookings/{self.existing_booking.booking_number}/requests/",
@@ -1312,8 +1666,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         self.assertEqual(list_response.data[0].get("booking_number"), self.existing_booking.booking_number)
 
     def test_v1_review_endpoint_accepts_bearer_auth(self):
-        self.existing_booking.booking_status = "Completed"
-        self.existing_booking.save(update_fields=["booking_status"])
+        self._mark_ready_for_travel()
 
         response = self.client.post(
             f"/api/v1/bookings/{self.existing_booking.booking_number}/reviews/",
@@ -1331,8 +1684,9 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         )
 
     def test_v1_objection_response_endpoint_accepts_bearer_auth(self):
-        self.existing_booking.booking_status = "Objection"
-        self.existing_booking.save(update_fields=["booking_status"])
+        self._mark_ready_for_operator()
+        self.existing_booking.issue_status = ISSUE_STATUS_OPERATOR_OBJECTION
+        self.existing_booking.save(update_fields=["issue_status"])
         objection = BookingObjections.objects.create(
             remarks_or_reason="Passport photo is unclear.",
             objection_for_booking=self.existing_booking,
@@ -1356,7 +1710,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.existing_booking.refresh_from_db()
         objection.refresh_from_db()
-        self.assertEqual(self.existing_booking.booking_status, "Pending")
+        self.assertEqual(self.existing_booking.booking_status, BOOKING_STATUS_READY_FOR_OPERATOR)
         self.assertTrue(bool(objection.required_document_for_objection))
 
 
@@ -1399,8 +1753,75 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
             package_status="Active",
             package_provider=self.partner,
         )
+        self.existing_booking = Booking.objects.create(
+            booking_number="APPROVE-PAYMENT-BASE-001",
+            adults=2,
+            child=0,
+            infants=0,
+            sharing="Yes",
+            quad="0",
+            triple="0",
+            double="1",
+            single="0",
+            start_date=timezone.now() + timedelta(days=30),
+            end_date=timezone.now() + timedelta(days=36),
+            total_price=2400,
+            special_request="Approve payment baseline",
+            booking_status=BOOKING_STATUS_HOLD,
+            payment_type="Bank",
+            order_by=self.customer,
+            order_to=self.partner,
+            package_token=self.package,
+        )
 
-    def test_admin_can_reject_initial_payment_and_restore_booking_to_initialize(self):
+    def _create_payment(self, booking, *, stage, amount, status_value, suffix):
+        return Payment.objects.create(
+            transaction_number=f"{booking.booking_number}-{stage}-{suffix}",
+            transaction_type=stage,
+            transaction_amount=amount,
+            payment_status=status_value,
+            booking_token=booking,
+        )
+
+    def _approve_full(self, booking=None):
+        booking = booking or self.existing_booking
+        payment = self._create_payment(
+            booking,
+            stage="Full",
+            amount=float(booking.total_price),
+            status_value=PAYMENT_STATUS_APPROVED,
+            suffix="approved-full",
+        )
+        sync_booking_state(booking, save=True)
+        return payment
+
+    def _add_complete_passports(self, booking=None):
+        booking = booking or self.existing_booking
+        traveller_count = booking.adults + booking.child + booking.infants
+        booking_token = str(booking.pk).replace("-", "")[:8]
+        for index in range(traveller_count):
+            PassportValidity.objects.create(
+                first_name=f"Approve{index + 1}",
+                last_name="Traveler",
+                date_of_birth=aware_midnight("1990-01-10"),
+                passport_number=f"AP{booking_token}{index + 1:02d}",
+                passport_country="PK",
+                expiry_date=aware_midnight("2031-06-01"),
+                user_passport=SimpleUploadedFile(
+                    f"approve-passport-{index + 1}.jpg",
+                    b"passport-image",
+                    content_type="image/jpeg",
+                ),
+                user_photo=SimpleUploadedFile(
+                    f"approve-photo-{index + 1}.jpg",
+                    b"photo-image",
+                    content_type="image/jpeg",
+                ),
+                passport_for_booking_number=booking,
+            )
+        sync_booking_state(booking, save=True)
+
+    def test_admin_can_reject_initial_payment_and_keep_booking_on_hold(self):
         booking = Booking.objects.create(
             booking_number="APPROVE-PAYMENT-001",
             adults=2,
@@ -1415,7 +1836,7 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
             end_date=timezone.now() + timedelta(days=36),
             total_price=2400,
             special_request="Near Haram",
-            booking_status="Paid",
+            booking_status=BOOKING_STATUS_HOLD,
             payment_type="Bank",
             order_by=self.customer,
             order_to=self.partner,
@@ -1425,7 +1846,7 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
             transaction_number="APPROVE-PAYMENT-REF-001",
             transaction_type="Full",
             transaction_amount=2400,
-            payment_status="Pending",
+            payment_status=PAYMENT_STATUS_UNDER_REVIEW,
             booking_token=booking,
         )
 
@@ -1448,10 +1869,11 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         booking.refresh_from_db()
         payment.refresh_from_db()
-        self.assertEqual(booking.booking_status, "Initialize")
+        self.assertEqual(booking.booking_status, BOOKING_STATUS_HOLD)
         self.assertFalse(booking.is_payment_received)
-        self.assertEqual(payment.payment_status, "Rejected")
+        self.assertEqual(payment.payment_status, PAYMENT_STATUS_REJECTED)
         self.assertEqual(payment.review_message, "The receipt image is unreadable.")
+        self.assertIsNotNone(booking.payment_correction_expires_at)
         mocked_rejection_email.assert_called_once_with(
             self.customer.email,
             self.customer.name,
@@ -1475,7 +1897,7 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
             end_date=timezone.now() + timedelta(days=46),
             total_price=2400,
             special_request="Near Haram",
-            booking_status="Pending",
+            booking_status=BOOKING_STATUS_TRAVELER_DETAILS_PENDING,
             payment_type="Bank",
             order_by=self.customer,
             order_to=self.partner,
@@ -1486,14 +1908,15 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
             transaction_number="APPROVE-PAYMENT-MIN-002",
             transaction_type="Minimum",
             transaction_amount=240,
-            payment_status="Approved",
+            payment_status=PAYMENT_STATUS_APPROVED,
             booking_token=booking,
         )
+        self._add_complete_passports(booking)
         full_payment = Payment.objects.create(
             transaction_number="APPROVE-PAYMENT-FULL-002",
             transaction_type="Full",
             transaction_amount=2160,
-            payment_status="Pending",
+            payment_status=PAYMENT_STATUS_UNDER_REVIEW,
             booking_token=booking,
         )
 
@@ -1516,13 +1939,14 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         booking.refresh_from_db()
         full_payment.refresh_from_db()
-        self.assertEqual(booking.booking_status, "Pending")
+        self.assertEqual(booking.booking_status, BOOKING_STATUS_AWAITING_FINAL_PAYMENT)
         self.assertTrue(booking.is_payment_received)
-        self.assertEqual(full_payment.payment_status, "Rejected")
+        self.assertEqual(full_payment.payment_status, PAYMENT_STATUS_REJECTED)
         self.assertEqual(
             full_payment.review_message,
             "The transfer reference does not match the amount.",
         )
+        self.assertIsNotNone(booking.payment_correction_expires_at)
 
     def test_admin_can_approve_pending_full_payment_without_regressing_booking_status(self):
         booking = Booking.objects.create(
@@ -1539,7 +1963,7 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
             end_date=timezone.now() + timedelta(days=56),
             total_price=1200,
             special_request="None",
-            booking_status="Pending",
+            booking_status=BOOKING_STATUS_TRAVELER_DETAILS_PENDING,
             payment_type="Bank",
             order_by=self.customer,
             order_to=self.partner,
@@ -1550,14 +1974,15 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
             transaction_number="APPROVE-PAYMENT-MIN-003",
             transaction_type="Minimum",
             transaction_amount=120,
-            payment_status="Approved",
+            payment_status=PAYMENT_STATUS_APPROVED,
             booking_token=booking,
         )
+        self._add_complete_passports(booking)
         full_payment = Payment.objects.create(
             transaction_number="APPROVE-PAYMENT-FULL-003",
             transaction_type="Full",
             transaction_amount=1080,
-            payment_status="Pending",
+            payment_status=PAYMENT_STATUS_UNDER_REVIEW,
             booking_token=booking,
         )
 
@@ -1579,15 +2004,15 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         booking.refresh_from_db()
         full_payment.refresh_from_db()
-        self.assertEqual(booking.booking_status, "Pending")
+        self.assertEqual(booking.booking_status, BOOKING_STATUS_READY_FOR_OPERATOR)
         self.assertTrue(booking.is_payment_received)
-        self.assertEqual(full_payment.payment_status, "Approved")
+        self.assertEqual(full_payment.payment_status, PAYMENT_STATUS_APPROVED)
         self.assertIsNone(full_payment.review_message)
         mocked_verified_email.assert_called_once()
         mocked_notify_user.assert_called_once()
         mocked_preparation_email.assert_not_called()
 
-    def test_user_can_resubmit_rejected_initial_payment_and_restore_booking_to_paid(self):
+    def test_user_can_resubmit_rejected_initial_payment_and_return_booking_to_hold(self):
         booking = Booking.objects.create(
             booking_number="APPROVE-PAYMENT-004",
             adults=1,
@@ -1602,7 +2027,7 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
             end_date=timezone.now() + timedelta(days=41),
             total_price=1200,
             special_request="Window seat",
-            booking_status="Initialize",
+            booking_status=BOOKING_STATUS_HOLD,
             payment_type="Bank",
             order_by=self.customer,
             order_to=self.partner,
@@ -1613,7 +2038,7 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
             transaction_number="APPROVE-PAYMENT-REF-004",
             transaction_type="Full",
             transaction_amount=1200,
-            payment_status="Rejected",
+            payment_status=PAYMENT_STATUS_REJECTED,
             review_message="Old receipt",
             booking_token=booking,
         )
@@ -1634,9 +2059,56 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         booking.refresh_from_db()
         payment.refresh_from_db()
-        self.assertEqual(booking.booking_status, "Paid")
-        self.assertEqual(payment.payment_status, "Pending")
+        self.assertEqual(booking.booking_status, BOOKING_STATUS_HOLD)
+        self.assertEqual(payment.payment_status, PAYMENT_STATUS_UNDER_REVIEW)
         self.assertIsNone(payment.review_message)
+
+    def test_full_payment_approval_without_minimum_unlocks_the_correct_lifecycle_states(self):
+        self._approve_full()
+        self.existing_booking.refresh_from_db()
+        self.assertEqual(
+            self.existing_booking.booking_status,
+            BOOKING_STATUS_TRAVELER_DETAILS_PENDING,
+        )
+
+        detail_response = self.client.get(
+            f"/api/v1/bookings/{self.existing_booking.booking_number}/",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+        self.assertEqual(detail_response.status_code, status.HTTP_200_OK)
+        self.assertTrue(detail_response.data.get("operator_visible"))
+        self.assertFalse(detail_response.data.get("client_can_submit_minimum_payment"))
+        self.assertFalse(detail_response.data.get("client_can_submit_full_payment"))
+        self.assertTrue(detail_response.data.get("client_can_edit_travellers"))
+        self.assertEqual(detail_response.data.get("client_workflow_stage"), "traveler_details")
+        self.assertEqual(detail_response.data.get("client_workflow_step"), 3)
+
+        self._add_complete_passports()
+        self.existing_booking.refresh_from_db()
+        self.assertEqual(self.existing_booking.booking_status, BOOKING_STATUS_READY_FOR_OPERATOR)
+
+        detail_response = self.client.get(
+            f"/api/v1/bookings/{self.existing_booking.booking_number}/",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+        self.assertEqual(detail_response.status_code, status.HTTP_200_OK)
+        self.assertTrue(detail_response.data.get("operator_visible"))
+        self.assertTrue(detail_response.data.get("operator_can_act"))
+        self.assertFalse(detail_response.data.get("client_can_edit_travellers"))
+        self.assertFalse(detail_response.data.get("client_can_submit_full_payment"))
+        self.assertEqual(detail_response.data.get("client_workflow_stage"), "booking_status")
+        self.assertEqual(detail_response.data.get("client_workflow_step"), 5)
+
+    def test_ready_for_travel_auto_completes_after_end_date_without_document_recheck(self):
+        self.existing_booking.booking_status = BOOKING_STATUS_READY_FOR_TRAVEL
+        self.existing_booking.start_date = timezone.now() - timedelta(days=7)
+        self.existing_booking.end_date = timezone.now() - timedelta(days=1)
+        self.existing_booking.save(update_fields=["booking_status", "start_date", "end_date"])
+
+        sync_booking_state(self.existing_booking, save=True)
+        self.existing_booking.refresh_from_db()
+
+        self.assertEqual(self.existing_booking.booking_status, BOOKING_STATUS_COMPLETED)
 
     def test_admin_review_queue_includes_pending_full_payment_bookings(self):
         booking = Booking.objects.create(
@@ -1653,7 +2125,7 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
             end_date=timezone.now() + timedelta(days=51),
             total_price=1200,
             special_request="Aisle seat",
-            booking_status="Pending",
+            booking_status=BOOKING_STATUS_TRAVELER_DETAILS_PENDING,
             payment_type="Bank",
             order_by=self.customer,
             order_to=self.partner,
@@ -1664,14 +2136,15 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
             transaction_number="APPROVE-PAYMENT-MIN-005",
             transaction_type="Minimum",
             transaction_amount=120,
-            payment_status="Approved",
+            payment_status=PAYMENT_STATUS_APPROVED,
             booking_token=booking,
         )
+        self._add_complete_passports(booking)
         Payment.objects.create(
             transaction_number="APPROVE-PAYMENT-FULL-005",
             transaction_type="Full",
             transaction_amount=1080,
-            payment_status="Pending",
+            payment_status=PAYMENT_STATUS_UNDER_REVIEW,
             booking_token=booking,
         )
 
@@ -1679,8 +2152,181 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
         response = self.client.get("/management/fetch_all_paid_bookings/")
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        booking_numbers = [item["booking_number"] for item in response.data]
+        booking_numbers = [item["booking_number"] for item in response.data.get("results", [])]
         self.assertIn(booking.booking_number, booking_numbers)
+
+    def test_admin_review_queue_supports_server_side_queue_and_date_filters(self):
+        target_order_time = timezone.now() - timedelta(days=2)
+
+        minimum_booking = Booking.objects.create(
+            booking_number="APPROVE-PAYMENT-QUEUE-MIN",
+            adults=1,
+            child=0,
+            infants=0,
+            sharing="Yes",
+            quad="0",
+            triple="0",
+            double="1",
+            single="0",
+            start_date=timezone.now() + timedelta(days=25),
+            end_date=timezone.now() + timedelta(days=31),
+            total_price=900,
+            special_request="Minimum queue",
+            booking_status=BOOKING_STATUS_HOLD,
+            payment_type="Bank",
+            order_by=self.customer,
+            order_to=self.partner,
+            package_token=self.package,
+        )
+        self._create_payment(
+            minimum_booking,
+            stage="Minimum",
+            amount=90,
+            status_value=PAYMENT_STATUS_UNDER_REVIEW,
+            suffix="queue-minimum",
+        )
+
+        full_booking = Booking.objects.create(
+            booking_number="APPROVE-PAYMENT-QUEUE-FULL",
+            adults=1,
+            child=0,
+            infants=0,
+            sharing="Yes",
+            quad="0",
+            triple="0",
+            double="1",
+            single="0",
+            start_date=timezone.now() + timedelta(days=45),
+            end_date=timezone.now() + timedelta(days=51),
+            total_price=1500,
+            special_request="Full queue",
+            booking_status=BOOKING_STATUS_TRAVELER_DETAILS_PENDING,
+            payment_type="Bank",
+            order_by=self.customer,
+            order_to=self.partner,
+            package_token=self.package,
+            is_payment_received=True,
+        )
+        full_booking.order_time = target_order_time
+        full_booking.save(update_fields=["order_time"])
+        self._create_payment(
+            full_booking,
+            stage="Minimum",
+            amount=150,
+            status_value=PAYMENT_STATUS_APPROVED,
+            suffix="queue-full-minimum",
+        )
+        self._create_payment(
+            full_booking,
+            stage="Full",
+            amount=1350,
+            status_value=PAYMENT_STATUS_UNDER_REVIEW,
+            suffix="queue-full-review",
+        )
+
+        approved_booking = Booking.objects.create(
+            booking_number="APPROVE-PAYMENT-QUEUE-APPROVED",
+            adults=1,
+            child=0,
+            infants=0,
+            sharing="Yes",
+            quad="0",
+            triple="0",
+            double="1",
+            single="0",
+            start_date=timezone.now() + timedelta(days=55),
+            end_date=timezone.now() + timedelta(days=61),
+            total_price=1100,
+            special_request="Approved queue",
+            booking_status=BOOKING_STATUS_TRAVELER_DETAILS_PENDING,
+            payment_type="Bank",
+            order_by=self.customer,
+            order_to=self.partner,
+            package_token=self.package,
+            is_payment_received=True,
+        )
+        self._create_payment(
+            approved_booking,
+            stage="Full",
+            amount=1100,
+            status_value=PAYMENT_STATUS_APPROVED,
+            suffix="queue-approved",
+        )
+
+        self.client.force_authenticate(user=self.admin_user)
+        response = self.client.get(
+            "/management/fetch_all_paid_bookings/",
+            {
+                "payment_queue": "full_under_review",
+                "order_date": target_order_time.date().isoformat(),
+                "page": 1,
+                "page_size": 1,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 1)
+        self.assertEqual(len(response.data.get("results") or []), 1)
+        self.assertEqual(
+            response.data.get("results")[0].get("booking_number"),
+            full_booking.booking_number,
+        )
+        self.assertEqual(
+            response.data.get("meta", {}).get("queue_counts", {}).get("full_under_review"),
+            1,
+        )
+        self.assertEqual(response.data.get("meta", {}).get("total_requests"), 1)
+        self.assertEqual(
+            float(response.data.get("meta", {}).get("total_amount")),
+            float(full_booking.total_price),
+        )
+
+    def test_admin_review_queue_supports_exact_booking_lookup_for_settlement_detail(self):
+        booking = Booking.objects.create(
+            booking_number="APPROVE-PAYMENT-QUEUE-LOOKUP",
+            adults=1,
+            child=0,
+            infants=0,
+            sharing="Yes",
+            quad="0",
+            triple="0",
+            double="1",
+            single="0",
+            start_date=timezone.now() + timedelta(days=65),
+            end_date=timezone.now() + timedelta(days=71),
+            total_price=1300,
+            special_request="Lookup queue",
+            booking_status=BOOKING_STATUS_TRAVELER_DETAILS_PENDING,
+            payment_type="Bank",
+            order_by=self.customer,
+            order_to=self.partner,
+            package_token=self.package,
+            is_payment_received=True,
+        )
+        self._create_payment(
+            booking,
+            stage="Full",
+            amount=1300,
+            status_value=PAYMENT_STATUS_APPROVED,
+            suffix="queue-lookup-approved",
+        )
+
+        self.client.force_authenticate(user=self.admin_user)
+        response = self.client.get(
+            "/management/fetch_all_paid_bookings/",
+            {
+                "booking_number": booking.booking_number,
+                "page": 1,
+                "page_size": 1,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 1)
+        self.assertEqual(
+            response.data.get("results")[0].get("booking_number"),
+            booking.booking_number,
+        )
 
 
 class ManagePartnerBookingViewsTests(APITransactionTestCase):
@@ -1763,6 +2409,80 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         force_authenticate(request, user=self.admin_user)
         return request
 
+    def _create_stage_payment(self, booking, *, stage, amount, status_value, suffix):
+        return Payment.objects.create(
+            transaction_number=f"{booking.booking_number}-{stage}-{suffix}",
+            transaction_type=stage,
+            transaction_amount=amount,
+            payment_status=status_value,
+            booking_token=booking,
+        )
+
+    def _mark_ready_for_operator(self, booking):
+        self._create_stage_payment(
+            booking,
+            stage="Minimum",
+            amount=max(float(booking.total_price) * 0.1, 1),
+            status_value=PAYMENT_STATUS_APPROVED,
+            suffix="partner-ready-minimum",
+        )
+        traveller_count = booking.adults + booking.child + booking.infants
+        booking_token = str(booking.pk).replace("-", "")[:8]
+        for index in range(traveller_count):
+            PassportValidity.objects.create(
+                first_name=f"Partner{index + 1}",
+                last_name="Traveler",
+                date_of_birth=aware_midnight("1990-01-10"),
+                passport_number=f"PT{booking_token}{index + 1:02d}",
+                passport_country="PK",
+                expiry_date=aware_midnight("2031-06-01"),
+                user_passport=SimpleUploadedFile(
+                    f"partner-passport-{index + 1}.jpg",
+                    b"passport-image",
+                    content_type="image/jpeg",
+                ),
+                user_photo=SimpleUploadedFile(
+                    f"partner-photo-{index + 1}.jpg",
+                    b"photo-image",
+                    content_type="image/jpeg",
+                ),
+                passport_for_booking_number=booking,
+            )
+        self._create_stage_payment(
+            booking,
+            stage="Full",
+            amount=float(booking.total_price),
+            status_value=PAYMENT_STATUS_APPROVED,
+            suffix="partner-ready-full",
+        )
+        sync_booking_state(booking, save=True)
+        booking.refresh_from_db()
+        return booking
+
+    def _mark_in_fulfillment(self, booking):
+        booking = self._mark_ready_for_operator(booking)
+        booking.booking_status = BOOKING_STATUS_IN_FULFILLMENT
+        booking.save(update_fields=["booking_status"])
+        sync_booking_state(booking, save=True)
+        booking.refresh_from_db()
+        return booking
+
+    def _mark_ready_for_travel(self, booking):
+        booking = self._mark_in_fulfillment(booking)
+        DocumentsStatus.objects.update_or_create(
+            status_for_booking=booking,
+            defaults={
+                "is_visa_completed": True,
+                "is_airline_completed": True,
+                "is_airline_detail_completed": True,
+                "is_hotel_completed": True,
+                "is_transport_completed": True,
+            },
+        )
+        sync_booking_state(booking, save=True)
+        booking.refresh_from_db()
+        return booking
+
     def _create_complaint(
         self,
         *,
@@ -1786,19 +2506,20 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         )
 
     def test_booking_list_returns_paginated_empty_payload(self):
-        self._create_booking(
+        booking = self._create_booking(
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-ACTIVE-001",
-            booking_status="Active",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
         )
+        self._mark_in_fulfillment(booking)
 
         request = self._authenticated_request(
             self.factory.get(
                 "/bookings/get_all_booking_detail_for_partner/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
-                    "booking_status": "Pending",
+                    "workflow_bucket": "READY",
                     "page": 1,
                     "page_size": 10,
                 },
@@ -1811,18 +2532,19 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertEqual(response.data.get("results"), [])
 
     def test_booking_list_accepts_partner_token_without_authorization_header(self):
-        self._create_booking(
+        booking = self._create_booking(
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-ACTIVE-002",
-            booking_status="Active",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
         )
+        self._mark_in_fulfillment(booking)
 
         request = self.factory.get(
             "/bookings/get_all_booking_detail_for_partner/",
             {
                 "partner_session_token": self.partner_a.partner_session_token,
-                "booking_status": "Active",
+                "workflow_bucket": "FULFILLMENT",
                 "page": 1,
                 "page_size": 10,
             },
@@ -1832,27 +2554,29 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data.get("count"), 1)
 
-    def test_booking_list_filters_by_booking_number(self):
+    def test_booking_list_filters_by_booking_number_prefix(self):
         matching_booking = self._create_booking(
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-FILTER-001",
-            booking_status="Active",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
         )
-        self._create_booking(
+        self._mark_in_fulfillment(matching_booking)
+        other_booking = self._create_booking(
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-FILTER-999",
-            booking_status="Active",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
         )
+        self._mark_in_fulfillment(other_booking)
 
         request = self._authenticated_request(
             self.factory.get(
                 "/bookings/get_all_booking_detail_for_partner/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
-                    "booking_status": "Active",
-                    "booking_number": "001",
+                    "workflow_bucket": "FULFILLMENT",
+                    "booking_number": "BK-FILTER-0",
                     "page": 1,
                     "page_size": 10,
                 },
@@ -1866,6 +2590,99 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
             response.data.get("results")[0].get("booking_number"),
             matching_booking.booking_number,
         )
+
+    def test_booking_list_raw_status_filter_hides_non_visible_hold_bookings_for_partner(self):
+        self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-HIDDEN-HOLD-001",
+            booking_status=BOOKING_STATUS_HOLD,
+        )
+
+        request = self.factory.get(
+            "/bookings/get_all_booking_detail_for_partner/",
+            {
+                "partner_session_token": self.partner_a.partner_session_token,
+                "booking_status": BOOKING_STATUS_HOLD,
+                "page": 1,
+                "page_size": 10,
+            },
+        )
+
+        response = GetBookingShortDetailForPartnersView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 0)
+        self.assertEqual(response.data.get("results"), [])
+
+    def test_booking_list_raw_status_filter_allows_staff_override_for_hidden_bookings(self):
+        hidden_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-HIDDEN-HOLD-STAFF-001",
+            booking_status=BOOKING_STATUS_HOLD,
+        )
+
+        request = self._authenticated_request(
+            self.factory.get(
+                "/bookings/get_all_booking_detail_for_partner/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "booking_status": BOOKING_STATUS_HOLD,
+                    "page": 1,
+                    "page_size": 10,
+                },
+            )
+        )
+
+        response = GetBookingShortDetailForPartnersView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 1)
+        self.assertEqual(
+            response.data.get("results")[0].get("booking_number"),
+            hidden_booking.booking_number,
+        )
+
+    def test_partner_detail_hides_non_visible_booking_for_partner(self):
+        hidden_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-DETAIL-HIDDEN-001",
+            booking_status=BOOKING_STATUS_HOLD,
+        )
+
+        request = self.factory.get(
+            "/bookings/get_booking_detail_by_booking_number/",
+            {
+                "partner_session_token": self.partner_a.partner_session_token,
+                "booking_number": hidden_booking.booking_number,
+            },
+        )
+
+        response = GetBookingDetailByBookingNumberForPartnerView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_staff_can_fetch_non_visible_partner_booking_detail(self):
+        hidden_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-DETAIL-HIDDEN-STAFF-001",
+            booking_status=BOOKING_STATUS_HOLD,
+        )
+
+        request = self._authenticated_request(
+            self.factory.get(
+                "/bookings/get_booking_detail_by_booking_number/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "booking_number": hidden_booking.booking_number,
+                },
+            )
+        )
+
+        response = GetBookingDetailByBookingNumberForPartnerView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("booking_number"), hidden_booking.booking_number)
+        self.assertFalse(response.data.get("operator_visible"))
 
     def test_complaints_list_returns_paginated_empty_payload(self):
         request = self._authenticated_request(
@@ -1889,13 +2706,13 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-CMP-A-001",
-            booking_status="Active",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
         )
         booking_b = self._create_booking(
             partner=self.partner_b,
             package=self.package_b,
             booking_number="BK-CMP-B-001",
-            booking_status="Active",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
         )
 
         own_complaint = self._create_complaint(
@@ -1937,7 +2754,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-CMP-FILTER-001",
-            booking_status="Active",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
         )
         matched_complaint = self._create_complaint(
             partner=self.partner_a,
@@ -1981,7 +2798,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-CMP-TRANSITION-001",
-            booking_status="Active",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
         )
         complaint = self._create_complaint(
             partner=self.partner_a,
@@ -2014,7 +2831,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
             partner=self.partner_b,
             package=self.package_b,
             booking_number="BK-CMP-SCOPE-001",
-            booking_status="Active",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
         )
         complaint = self._create_complaint(
             partner=self.partner_b,
@@ -2047,7 +2864,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-CMP-SEQUENCE-001",
-            booking_status="Active",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
         )
         complaint = self._create_complaint(
             partner=self.partner_a,
@@ -2084,7 +2901,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-DOC-INVALID-001",
-            booking_status="Active",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
         )
         upload_file = SimpleUploadedFile(
             "sample.pdf",
@@ -2109,6 +2926,50 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("Invalid document_for", response.data.get("message", ""))
         mocked_send_booking_documents.assert_not_called()
+
+    def test_delete_booking_documents_rejects_completed_booking(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-DOC-COMPLETE-001",
+            booking_status=BOOKING_STATUS_READY_FOR_TRAVEL,
+        )
+        booking = self._mark_ready_for_travel(booking)
+        booking.booking_status = BOOKING_STATUS_COMPLETED
+        booking.save(update_fields=["booking_status"])
+        booking.refresh_from_db()
+
+        document = BookingDocuments.objects.create(
+            document_link=SimpleUploadedFile(
+                "completed-visa.pdf",
+                b"%PDF-1.4 completed",
+                content_type="application/pdf",
+            ),
+            document_for_booking_token=booking,
+            document_for="eVisa",
+        )
+
+        request = self._authenticated_request(
+            self.factory.delete(
+                "/bookings/delete_booking_documents/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "booking_number": booking.booking_number,
+                    "document_id": str(document.document_id),
+                },
+                format="json",
+            )
+        )
+
+        response = DeleteBookingDocumentsView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn(
+            "Only bookings that are in fulfillment or ready for travel can perform this task.",
+            response.data.get("message", ""),
+        )
+        self.assertTrue(
+            BookingDocuments.objects.filter(document_id=document.document_id).exists()
+        )
 
     def test_hotel_transport_post_requires_booking_number(self):
         request = self._authenticated_request(
@@ -2139,7 +3000,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-DETAIL-INVALID-001",
-            booking_status="Active",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
         )
 
         request = self._authenticated_request(
@@ -2171,13 +3032,13 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-AIRLINE-A-001",
-            booking_status="Active",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
         )
         booking_b = self._create_booking(
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-AIRLINE-B-001",
-            booking_status="Active",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
         )
 
         own_airline = BookingAirlineDetail.objects.create(
@@ -2224,8 +3085,9 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
             partner=self.partner_b,
             package=self.package_b,
             booking_number="BK-OTHER-001",
-            booking_status="Completed",
+            booking_status=BOOKING_STATUS_READY_FOR_TRAVEL,
         )
+        self._mark_ready_for_travel(other_partner_booking)
 
         request = self._authenticated_request(
             self.factory.put(
@@ -2243,21 +3105,23 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertEqual(response.data.get("message"), "Booking detail not found.")
 
         other_partner_booking.refresh_from_db()
-        self.assertEqual(other_partner_booking.booking_status, "Completed")
+        self.assertEqual(other_partner_booking.booking_status, BOOKING_STATUS_READY_FOR_TRAVEL)
 
     def test_report_booking_requires_passport_for_same_booking(self):
         partner_booking = self._create_booking(
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-A-REPORT-001",
-            booking_status="Completed",
+            booking_status=BOOKING_STATUS_READY_FOR_TRAVEL,
         )
         other_booking = self._create_booking(
             partner=self.partner_b,
             package=self.package_b,
             booking_number="BK-B-REPORT-001",
-            booking_status="Completed",
+            booking_status=BOOKING_STATUS_READY_FOR_TRAVEL,
         )
+        self._mark_ready_for_travel(partner_booking)
+        self._mark_ready_for_travel(other_booking)
         unrelated_passport = PassportValidity.objects.create(
             passport_for_booking_number=other_booking
         )
@@ -2283,8 +3147,51 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         partner_booking.refresh_from_db()
         unrelated_passport.refresh_from_db()
-        self.assertEqual(partner_booking.booking_status, "Completed")
+        self.assertEqual(partner_booking.booking_status, BOOKING_STATUS_READY_FOR_TRAVEL)
         self.assertFalse(unrelated_passport.report_rabbit)
+
+    def test_report_booking_marks_issue_status_and_serializes_reported_traveler(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-REPORT-SERIALIZED-001",
+            booking_status=BOOKING_STATUS_READY_FOR_TRAVEL,
+        )
+        booking = self._mark_ready_for_travel(booking)
+        passport = PassportValidity.objects.filter(
+            passport_for_booking_number=booking
+        ).first()
+        self.assertIsNotNone(passport)
+
+        request = self._authenticated_request(
+            self.factory.put(
+                "/bookings/update_booking_status_into_report_rabbit/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "booking_number": booking.booking_number,
+                    "passport_id": str(passport.passport_id),
+                },
+                format="json",
+            )
+        )
+
+        response = ReportBookingView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("issue_status"), ISSUE_STATUS_REPORTED)
+
+        serialized_travelers = response.data.get("traveller_detail") or []
+        self.assertTrue(
+            any(
+                str(traveler.get("passport_id")) == str(passport.passport_id)
+                and traveler.get("report_rabbit") is True
+                for traveler in serialized_travelers
+            )
+        )
+
+        booking.refresh_from_db()
+        passport.refresh_from_db()
+        self.assertEqual(booking.issue_status, ISSUE_STATUS_REPORTED)
+        self.assertTrue(passport.report_rabbit)
 
     @patch("booking.manage_partner_booking.send_objection_email")
     def test_take_action_sends_email_only_for_objection(self, mocked_send_objection):
@@ -2292,14 +3199,16 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-A-PENDING-001",
-            booking_status="Pending",
+            booking_status=BOOKING_STATUS_READY_FOR_OPERATOR,
         )
         pending_booking_objection = self._create_booking(
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-A-PENDING-002",
-            booking_status="Pending",
+            booking_status=BOOKING_STATUS_READY_FOR_OPERATOR,
         )
+        self._mark_ready_for_operator(pending_booking_active)
+        self._mark_ready_for_operator(pending_booking_objection)
 
         active_request = self._authenticated_request(
             self.factory.put(
@@ -2308,7 +3217,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": pending_booking_active.booking_number,
                     "partner_remarks": "All good",
-                    "booking_status": "Active",
+                    "booking_status": "IN_FULFILLMENT",
                 },
                 format="json",
             )
@@ -2324,7 +3233,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": pending_booking_objection.booking_number,
                     "partner_remarks": "Missing docs",
-                    "booking_status": "Objection",
+                    "booking_status": "OPERATOR_OBJECTION",
                 },
                 format="json",
             )
@@ -2343,7 +3252,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-CMP-OVERALL-001",
-            booking_status="Active",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
         )
         self._create_complaint(
             partner=self.partner_a,
@@ -2390,18 +3299,42 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertIn("Invalid year", response.data.get("message", ""))
 
     def test_overall_booking_statistics_include_all_booking_status_choices(self):
-        self._create_booking(
+        visible_view_only_booking = self._create_booking(
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-STATS-PASSPORT-001",
-            booking_status="Passport_Validation",
+            booking_status=BOOKING_STATUS_HOLD,
         )
-        self._create_booking(
+        self._create_stage_payment(
+            visible_view_only_booking,
+            stage="Minimum",
+            amount=max(float(visible_view_only_booking.total_price) * 0.1, 1),
+            status_value=PAYMENT_STATUS_APPROVED,
+            suffix="stats-visible-view-only",
+        )
+        sync_booking_state(visible_view_only_booking, save=True)
+
+        visible_history_booking = self._create_booking(
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-STATS-CANCEL-001",
-            booking_status="Cancel",
+            booking_status=BOOKING_STATUS_HOLD,
         )
+        self._mark_ready_for_operator(visible_history_booking)
+        visible_history_booking.booking_status = BOOKING_STATUS_CANCELLED
+        visible_history_booking.save(update_fields=["booking_status"])
+        sync_booking_state(visible_history_booking, save=True)
+
+        visible_issue_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-STATS-ISSUE-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(visible_issue_booking)
+        visible_issue_booking.issue_status = ISSUE_STATUS_OPERATOR_OBJECTION
+        visible_issue_booking.save(update_fields=["issue_status"])
+        sync_booking_state(visible_issue_booking, save=True)
 
         request = self._authenticated_request(
             self.factory.get(
@@ -2412,10 +3345,16 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         response = GetPartnersOverallBookingStatisticsView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertIn("Passport_Validation", response.data)
-        self.assertIn("Cancel", response.data)
-        self.assertEqual(response.data.get("Passport_Validation"), 1)
-        self.assertEqual(response.data.get("Cancel"), 1)
+        self.assertIn(BOOKING_STATUS_TRAVELER_DETAILS_PENDING, response.data)
+        self.assertIn(BOOKING_STATUS_CANCELLED, response.data)
+        self.assertEqual(response.data.get(BOOKING_STATUS_TRAVELER_DETAILS_PENDING), 1)
+        self.assertEqual(response.data.get(BOOKING_STATUS_CANCELLED), 1)
+        self.assertIn(WORKFLOW_BUCKET_VIEW_ONLY, response.data)
+        self.assertIn(WORKFLOW_BUCKET_ISSUES, response.data)
+        self.assertIn(WORKFLOW_BUCKET_HISTORY, response.data)
+        self.assertEqual(response.data.get(WORKFLOW_BUCKET_VIEW_ONLY), 1)
+        self.assertEqual(response.data.get(WORKFLOW_BUCKET_ISSUES), 1)
+        self.assertEqual(response.data.get(WORKFLOW_BUCKET_HISTORY), 1)
 
     def test_receivable_payment_statistics_returns_paginated_empty_payload(self):
         request = self._authenticated_request(
@@ -2439,13 +3378,13 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-REC-A-001",
-            booking_status="Completed",
+            booking_status=BOOKING_STATUS_COMPLETED,
         )
         partner_b_booking = self._create_booking(
             partner=self.partner_b,
             package=self.package_b,
             booking_number="BK-REC-B-001",
-            booking_status="Completed",
+            booking_status=BOOKING_STATUS_COMPLETED,
         )
 
         PartnersBookingPayment.objects.create(
@@ -2488,24 +3427,82 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertEqual(results[0].get("partner_session_token"), self.partner_a.partner_session_token)
         self.assertEqual(float(results[0].get("receivable_amount")), 1000.0)
 
+    def test_admin_partner_receivables_endpoint_paginates_and_returns_summary_totals(self):
+        partner_a_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-REC-ADMIN-A-001",
+            booking_status=BOOKING_STATUS_COMPLETED,
+        )
+        partner_b_booking = self._create_booking(
+            partner=self.partner_b,
+            package=self.package_b,
+            booking_number="BK-REC-ADMIN-B-001",
+            booking_status=BOOKING_STATUS_COMPLETED,
+        )
+
+        PartnersBookingPayment.objects.create(
+            receivable_amount=1000.0,
+            pending_amount=100.0,
+            processed_amount=10.0,
+            payment_status="NotPaid",
+            payment_for_partner=self.partner_a,
+            payment_for_package=self.package_a,
+            payment_for_booking=partner_a_booking,
+        )
+        PartnersBookingPayment.objects.create(
+            receivable_amount=500.0,
+            pending_amount=50.0,
+            processed_amount=20.0,
+            payment_status="NotPaid",
+            payment_for_partner=self.partner_b,
+            payment_for_package=self.package_b,
+            payment_for_booking=partner_b_booking,
+        )
+
+        self.client.force_authenticate(user=self.admin_user)
+        response = self.client.get(
+            "/management/fetch_all_partner_receive_able_payments_details/",
+            {
+                "page": 1,
+                "page_size": 1,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 2)
+        self.assertEqual(len(response.data.get("results") or []), 1)
+        self.assertEqual(
+            float(response.data.get("meta", {}).get("total_receivable")),
+            1500.0,
+        )
+        self.assertEqual(
+            float(response.data.get("meta", {}).get("total_pending")),
+            150.0,
+        )
+        self.assertEqual(
+            float(response.data.get("meta", {}).get("total_processed")),
+            30.0,
+        )
+
     def test_overall_rating_distribution_normalizes_decimal_ratings(self):
         booking_one = self._create_booking(
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-RATING-001",
-            booking_status="Completed",
+            booking_status=BOOKING_STATUS_COMPLETED,
         )
         booking_two = self._create_booking(
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-RATING-002",
-            booking_status="Completed",
+            booking_status=BOOKING_STATUS_COMPLETED,
         )
         booking_three = self._create_booking(
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-RATING-003",
-            booking_status="Completed",
+            booking_status=BOOKING_STATUS_COMPLETED,
         )
 
         BookingRatingAndReview.objects.create(
@@ -2560,20 +3557,21 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertEqual(package_response.data.get("total_package_star_4"), 1)
         self.assertEqual(package_response.data.get("total_package_star_3"), 0)
 
-    def test_rating_submission_supports_closed_booking_and_validates_stars(self):
-        closed_booking = self._create_booking(
+    def test_rating_submission_supports_completed_booking_and_validates_stars(self):
+        completed_booking = self._create_booking(
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-RATING-CLOSED-001",
-            booking_status="Closed",
+            booking_status=BOOKING_STATUS_READY_FOR_TRAVEL,
         )
+        self._mark_ready_for_travel(completed_booking)
 
         invalid_request = self._authenticated_request(
             self.factory.post(
                 "/bookings/rating_and_review/",
                 {
                     "session_token": self.customer.session_token,
-                    "booking_number": closed_booking.booking_number,
+                    "booking_number": completed_booking.booking_number,
                     "huz_concierge": 5,
                     "huz_support": 5,
                     "huz_platform": 5,
@@ -2594,7 +3592,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
                 "/bookings/rating_and_review/",
                 {
                     "session_token": self.customer.session_token,
-                    "booking_number": closed_booking.booking_number,
+                    "booking_number": completed_booking.booking_number,
                     "huz_concierge": 5,
                     "huz_support": 5,
                     "huz_platform": 5,
@@ -2610,20 +3608,21 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         valid_response = BookingRatingAndReviewView.as_view()(valid_request)
         self.assertEqual(valid_response.status_code, status.HTTP_201_CREATED)
 
-    def test_complaint_submission_supports_closed_booking_status(self):
-        closed_booking = self._create_booking(
+    def test_complaint_submission_supports_completed_booking_status(self):
+        completed_booking = self._create_booking(
             partner=self.partner_a,
             package=self.package_a,
             booking_number="BK-COMPLAINT-CLOSED-001",
-            booking_status="Closed",
+            booking_status=BOOKING_STATUS_READY_FOR_TRAVEL,
         )
+        self._mark_ready_for_travel(completed_booking)
 
         request = self._authenticated_request(
             self.factory.post(
                 "/bookings/raise_complaint_booking_wise/",
                 {
                     "session_token": self.customer.session_token,
-                    "booking_number": closed_booking.booking_number,
+                    "booking_number": completed_booking.booking_number,
                     "complaint_title": "Need follow-up",
                     "complaint_message": "Issue details",
                 },

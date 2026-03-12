@@ -589,6 +589,111 @@ class PackageManagementWebsiteViewTests(APITransactionTestCase):
 
         self.assertIn(self.ranged_package.huz_token, returned_tokens)
 
+    def test_website_list_filters_by_makkah_hotel_distance(self):
+        close_start = timezone.now() + timedelta(days=45)
+        close_end = close_start + timedelta(days=7)
+        close_package = HuzBasicDetail.objects.create(
+            huz_token="website-package-token-close-makkah",
+            package_type="Umrah",
+            package_name="Close Makkah Hotel Package",
+            start_date=close_start,
+            end_date=close_end,
+            description="Walkable Makkah stay",
+            package_status="Active",
+            package_provider=self.partner,
+        )
+        HuzPackageDateRange.objects.create(
+            start_date=close_start,
+            end_date=close_end,
+            group_capacity=8,
+            package_validity=close_start - timedelta(days=2),
+            date_range_for_package=close_package,
+        )
+        HuzHotelDetail.objects.create(
+            hotel_city="Makkah",
+            hotel_name="Close Haram Hotel",
+            hotel_rating="5 Star",
+            room_sharing_type="Double",
+            hotel_distance="3",
+            distance_type="KM",
+            hotel_for_package=close_package,
+        )
+
+        response = self._request_website_packages(
+            package_type="Umrah",
+            makkah_hotel_distance="5",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.data.get("results") or []
+        returned_tokens = {item.get("huz_token") for item in results}
+
+        self.assertIn(close_package.huz_token, returned_tokens)
+        self.assertNotIn(self.ranged_package.huz_token, returned_tokens)
+
+    def test_website_search_filters_by_madinah_hotel_distance(self):
+        close_start = timezone.now() + timedelta(days=50)
+        close_end = close_start + timedelta(days=8)
+        close_package = HuzBasicDetail.objects.create(
+            huz_token="website-package-token-close-madinah",
+            package_type="Umrah",
+            package_name="Close Madinah Hotel Package",
+            start_date=close_start,
+            end_date=close_end,
+            description="Near Masjid Nabawi",
+            package_status="Active",
+            package_provider=self.partner,
+        )
+        HuzPackageDateRange.objects.create(
+            start_date=close_start,
+            end_date=close_end,
+            group_capacity=6,
+            package_validity=close_start - timedelta(days=2),
+            date_range_for_package=close_package,
+        )
+        HuzAirlineDetail.objects.create(
+            airline_name="Saudia",
+            ticket_type="Economy",
+            flight_from="Karachi",
+            flight_to="Jeddah",
+            return_flight_from="Jeddah",
+            return_flight_to="Karachi",
+            is_return_flight_included=True,
+            airline_for_package=close_package,
+        )
+        HuzHotelDetail.objects.create(
+            hotel_city="Madinah",
+            hotel_name="Close Nabawi Hotel",
+            hotel_rating="5 Star",
+            room_sharing_type="Double",
+            hotel_distance="2",
+            distance_type="KM",
+            hotel_for_package=close_package,
+        )
+        HuzHotelDetail.objects.create(
+            hotel_city="Madinah",
+            hotel_name="Far Nabawi Hotel",
+            hotel_rating="4 Star",
+            room_sharing_type="Quad",
+            hotel_distance="7",
+            distance_type="KM",
+            hotel_for_package=self.ranged_package,
+        )
+
+        response = self._request_website_search(
+            package_type="Umrah",
+            flight_from="Karachi",
+            start_date=(timezone.now() + timedelta(days=20)).date().isoformat(),
+            madinah_hotel_distance="3",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.data.get("results") or []
+        returned_tokens = {item.get("huz_token") for item in results}
+
+        self.assertIn(close_package.huz_token, returned_tokens)
+        self.assertNotIn(self.ranged_package.huz_token, returned_tokens)
+
     def test_website_list_excludes_packages_after_booking_validity_passes(self):
         expired_start = timezone.now() + timedelta(days=4)
         expired_end = expired_start + timedelta(days=7)

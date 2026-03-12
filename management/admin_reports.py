@@ -8,11 +8,35 @@ from drf_yasg import openapi
 from django.db.models import Prefetch
 from partners.models import PartnerProfile, HuzBasicDetail, BusinessProfile, PartnerMailingDetail
 from booking.models import BookingRatingAndReview, Booking, BookingComplaints
+from booking.statuses import (
+    BOOKING_STATUS_AWAITING_FINAL_PAYMENT,
+    BOOKING_STATUS_CHOICES,
+    BOOKING_STATUS_COMPLETED,
+    BOOKING_STATUS_IN_FULFILLMENT,
+    BOOKING_STATUS_READY_FOR_OPERATOR,
+    BOOKING_STATUS_READY_FOR_TRAVEL,
+    BOOKING_STATUS_TRAVELER_DETAILS_PENDING,
+)
 from common.models import UserProfile
 from django.db.models import Count, Sum, F
 from common.logs_file import logger
 
 SUPPORTED_PACKAGE_TYPES = ("Hajj", "Umrah")
+REPORT_OPERATOR_ACTIVITY_STATUSES = (
+    BOOKING_STATUS_READY_FOR_OPERATOR,
+    BOOKING_STATUS_IN_FULFILLMENT,
+    BOOKING_STATUS_READY_FOR_TRAVEL,
+    BOOKING_STATUS_COMPLETED,
+)
+REPORT_BOOKING_VALUE_STATUSES = (
+    BOOKING_STATUS_TRAVELER_DETAILS_PENDING,
+    BOOKING_STATUS_AWAITING_FINAL_PAYMENT,
+    BOOKING_STATUS_READY_FOR_OPERATOR,
+    BOOKING_STATUS_IN_FULFILLMENT,
+    BOOKING_STATUS_READY_FOR_TRAVEL,
+    BOOKING_STATUS_COMPLETED,
+)
+REPORT_ALL_BOOKING_STATUSES = tuple(status_name for status_name, _ in BOOKING_STATUS_CHOICES)
 
 
 def _parse_date_filters(request):
@@ -356,7 +380,7 @@ class TopOperatorsWithTravelerAPIView(APIView):
             if not partner_ids:
                 return Response([], status=status.HTTP_200_OK)
 
-            valid_statuses = ['Objection', 'objection', 'Active', 'active', 'Completed', 'completed', 'Closed', 'closed', 'Report', 'report']
+            valid_statuses = REPORT_OPERATOR_ACTIVITY_STATUSES
             # Filter bookings based on the start_date and end_date if provided
             if start_date and end_date:
                 bookings_queryset = Booking.objects.filter(
@@ -490,7 +514,7 @@ class TopOperatorsWithBookingAPIView(APIView):
             if not partner_ids:
                 return Response([], status=status.HTTP_200_OK)
 
-            valid_statuses = ['Objection', 'objection', 'Active', 'active', 'Completed', 'completed', 'Closed', 'closed']
+            valid_statuses = REPORT_OPERATOR_ACTIVITY_STATUSES
             # Filter bookings based on the start_date and end_date if provided
             if start_date and end_date:
                 bookings_queryset = Booking.objects.filter(
@@ -624,7 +648,7 @@ class TopOperatorsWithBusinessAPIView(APIView):
             if not partner_ids:
                 return Response([], status=status.HTTP_200_OK)
 
-            valid_statuses = ['Pending', 'pending', 'Confirm', 'confirm', 'Objection', 'objection', 'Active', 'active', 'Completed', 'completed', 'Closed', 'closed']
+            valid_statuses = REPORT_BOOKING_VALUE_STATUSES
             # Filter bookings based on the start_date and end_date if provided
             if start_date and end_date:
                 bookings_queryset = Booking.objects.filter(
@@ -1100,8 +1124,7 @@ class BookingWithEachAirlineAPIView(APIView):
             partner_ids = queryset.values_list('package_provider__huz_id', flat=True)
 
             # Define valid booking statuses
-            valid_statuses = ['Confirm', 'confirm', 'Objection', 'objection', 'Active', 'active',
-                              'Completed', 'completed', 'Closed', 'closed']
+            valid_statuses = REPORT_OPERATOR_ACTIVITY_STATUSES
 
             # Filter bookings based on the start_date and end_date if provided
             bookings_queryset = Booking.objects.filter(package_token__in=partner_ids, booking_status__in=valid_statuses)
@@ -1164,15 +1187,15 @@ class BookingStatusCountAPIView(APIView):
                 description="Booking status counts",
                 examples={
                     "application/json": {
-                        "initialize": 5,
-                        "Passport_Validation": 2,
-                        "paid": 8,
-                        "confirm": 12,
-                        "pending": 3,
-                        "active": 4,
-                        "completed": 7,
-                        "closed": 2,
-                        "objection": 1,
+                        "HOLD": 5,
+                        "TRAVELER_DETAILS_PENDING": 2,
+                        "AWAITING_FINAL_PAYMENT": 8,
+                        "READY_FOR_OPERATOR": 12,
+                        "IN_FULFILLMENT": 3,
+                        "READY_FOR_TRAVEL": 4,
+                        "COMPLETED": 7,
+                        "CANCELLED": 2,
+                        "EXPIRED": 1,
                     }
                 }
             ),
@@ -1207,10 +1230,7 @@ class BookingStatusCountAPIView(APIView):
             partner_ids = queryset.values_list('partner_id', flat=True)
 
             # Define valid booking statuses
-            valid_statuses = [
-                'Initialize', 'Passport_Validation', 'Paid', 'Confirm', 'Pending', 'Active',
-                'Completed', 'Closed', 'Objection', 'Report', 'Rejected'
-            ]
+            valid_statuses = REPORT_ALL_BOOKING_STATUSES
 
             # Filter bookings based on the query parameters
             bookings_queryset = Booking.objects.filter(order_to__in=partner_ids, booking_status__in=valid_statuses)
@@ -1450,52 +1470,44 @@ class BookingTypeStatusCountWithPriceAPIView(APIView):
                 examples={
                     "application/json": {
                         "Hajj": {
-                            "Initialize": 0,
-                            "Initialize_price": 0,
-                            "Passport_Validation": 0,
-                            "Passport_Validation_price": 0,
-                            "Paid": 0,
-                            "Paid_price": 0,
-                            "Confirm": 0,
-                            "Confirm_price": 0,
-                            "Pending": 0,
-                            "Pending_price": 0,
-                            "Active": 0,
-                            "Active_price": 0,
-                            "Completed": 0,
-                            "Completed_price": 0,
-                            "Closed": 0,
-                            "Closed_price": 0,
-                            "Objection": 0,
-                            "Objection_price": 0,
-                            "Report": 0,
-                            "Report_price": 0,
-                            "Rejected": 0,
-                            "Rejected_price": 0,
+                            "HOLD": 0,
+                            "HOLD_price": 0,
+                            "TRAVELER_DETAILS_PENDING": 0,
+                            "TRAVELER_DETAILS_PENDING_price": 0,
+                            "AWAITING_FINAL_PAYMENT": 0,
+                            "AWAITING_FINAL_PAYMENT_price": 0,
+                            "READY_FOR_OPERATOR": 0,
+                            "READY_FOR_OPERATOR_price": 0,
+                            "IN_FULFILLMENT": 0,
+                            "IN_FULFILLMENT_price": 0,
+                            "READY_FOR_TRAVEL": 0,
+                            "READY_FOR_TRAVEL_price": 0,
+                            "COMPLETED": 0,
+                            "COMPLETED_price": 0,
+                            "CANCELLED": 0,
+                            "CANCELLED_price": 0,
+                            "EXPIRED": 0,
+                            "EXPIRED_price": 0,
                         },
                         "Umrah": {
-                            "Initialize": 0,
-                            "Initialize_price": 0,
-                            "Passport_Validation": 0,
-                            "Passport_Validation_price": 0,
-                            "Paid": 0,
-                            "Paid_price": 0,
-                            "Confirm": 0,
-                            "Confirm_price": 0,
-                            "Pending": 0,
-                            "Pending_price": 0,
-                            "Active": 0,
-                            "Active_price": 0,
-                            "Completed": 0,
-                            "Completed_price": 0,
-                            "Closed": 0,
-                            "Closed_price": 0,
-                            "Objection": 0,
-                            "Objection_price": 0,
-                            "Report": 0,
-                            "Report_price": 0,
-                            "Rejected": 0,
-                            "Rejected_price": 0,
+                            "HOLD": 0,
+                            "HOLD_price": 0,
+                            "TRAVELER_DETAILS_PENDING": 0,
+                            "TRAVELER_DETAILS_PENDING_price": 0,
+                            "AWAITING_FINAL_PAYMENT": 0,
+                            "AWAITING_FINAL_PAYMENT_price": 0,
+                            "READY_FOR_OPERATOR": 0,
+                            "READY_FOR_OPERATOR_price": 0,
+                            "IN_FULFILLMENT": 0,
+                            "IN_FULFILLMENT_price": 0,
+                            "READY_FOR_TRAVEL": 0,
+                            "READY_FOR_TRAVEL_price": 0,
+                            "COMPLETED": 0,
+                            "COMPLETED_price": 0,
+                            "CANCELLED": 0,
+                            "CANCELLED_price": 0,
+                            "EXPIRED": 0,
+                            "EXPIRED_price": 0,
                         },
                     }
                 }

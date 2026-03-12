@@ -12,7 +12,12 @@ from common.logs_file import logger
 from common.models import UserProfile
 from partners.models import PartnerProfile, HuzBasicDetail
 from .models import BookingRequest, Booking, PassportValidity, BookingObjections, DocumentsStatus, Payment, UserRequiredDocuments, BookingRatingAndReview, BookingComplaints
-from .serializers import BookingRequestSerializer, ShortBookingSerializer, DetailBookingSerializer, BookingComplaintsSerializer
+from .serializers import (
+    BookingRequestSerializer,
+    ShortBookingSerializer,
+    LegacyDetailBookingSerializer,
+    BookingComplaintsSerializer,
+)
 from .request_serializers import (
     BookingCreateRequestSerializer,
     BookingPaymentCreateRequestSerializer,
@@ -27,9 +32,26 @@ from .services import (
     get_user_bookings_queryset,
     remove_booking_for_user,
     record_booking_payment,
+    record_booking_payment_photo_uploads,
     update_booking_payment,
     validate_passport as create_passport_validation,
     update_passport_validation,
+)
+from .statuses import (
+    BOOKING_STATUS_AWAITING_FINAL_PAYMENT,
+    BOOKING_STATUS_COMPLETED,
+    BOOKING_STATUS_HOLD,
+    BOOKING_STATUS_IN_FULFILLMENT,
+    BOOKING_STATUS_READY_FOR_OPERATOR,
+    BOOKING_STATUS_READY_FOR_TRAVEL,
+    BOOKING_STATUS_TRAVELER_DETAILS_PENDING,
+    ISSUE_STATUS_NONE,
+    ISSUE_STATUS_OPERATOR_OBJECTION,
+)
+from .workflow import (
+    booking_allows_client_traveller_updates,
+    normalize_booking_status,
+    sync_booking_state,
 )
 from .manage_partner_booking import get_partner_bookings_queryset
 import random
@@ -87,7 +109,7 @@ class ManageBookingsView(APIView):
             }
         ),
         responses={
-            201: openapi.Response(description="Booking created successfully.", schema=DetailBookingSerializer),
+            201: openapi.Response(description="Booking created successfully.", schema=LegacyDetailBookingSerializer),
             400: "Bad Request: Missing or invalid input data",
             401: "Unauthorized: Admin permissions required",
             404: "Not Found: User, Partner, or Package not found.",
@@ -99,7 +121,7 @@ class ManageBookingsView(APIView):
             input_serializer = BookingCreateRequestSerializer(data=request.data)
             validated_data = validate_serializer_or_raise(input_serializer)
             booking, created = create_booking(validated_data)
-            serialized_booking = DetailBookingSerializer(booking)
+            serialized_booking = LegacyDetailBookingSerializer(booking)
             return Response(
                 serialized_booking.data,
                 status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
@@ -139,7 +161,7 @@ class ManageBookingsView(APIView):
                       'special_request', 'payment_type']
         ),
         responses={
-            200: openapi.Response('Booking updated successfully', DetailBookingSerializer),
+            200: openapi.Response('Booking updated successfully', LegacyDetailBookingSerializer),
             400: "Bad Request: Missing or invalid input data",
             401: "Unauthorized: Admin permissions required",
             404: "Not Found: User, Partner, or Package not found.",
@@ -162,8 +184,8 @@ class ManageBookingsView(APIView):
             if not booking:
                 return Response({"message": "Booking not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            # Ensure booking status is "Initialize"
-            if booking.booking_status != "Initialize":
+            sync_booking_state(booking, save=True)
+            if normalize_booking_status(booking.booking_status) != BOOKING_STATUS_HOLD:
                 return Response(
                     {"message": "Oops, this request cannot be processed. Please contact the support team."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -193,7 +215,7 @@ class ManageBookingsView(APIView):
 
             with transaction.atomic():
                 updated_booking = serializer.save()
-                serialized_booking = DetailBookingSerializer(updated_booking)
+                serialized_booking = LegacyDetailBookingSerializer(updated_booking)
                 return Response(serialized_booking.data, status=status.HTTP_200_OK)
 
         except Exception as e:
@@ -232,7 +254,7 @@ class ManageBookingsView(APIView):
             openapi.Parameter('booking_number', openapi.IN_QUERY, description="Booking number", type=openapi.TYPE_STRING, required=True)
         ],
         responses={
-            200: DetailBookingSerializer(many=False),
+            200: LegacyDetailBookingSerializer(many=False),
             400: "Bad Request: Missing or invalid input data",
             401: "Unauthorized: Admin permissions required",
             404: "Not Found: User, Partner, or Package not found.",
@@ -259,7 +281,7 @@ class ManageBookingsView(APIView):
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Serialize and return booking data
-            serialized_package = DetailBookingSerializer(booking)
+            serialized_package = LegacyDetailBookingSerializer(booking)
             return Response(serialized_package.data, status=status.HTTP_200_OK)
 
         except Exception as e:
@@ -328,7 +350,7 @@ class ManagePassportValidityView(APIView):
             }
         ),
         responses={
-            201: openapi.Response(description="Passport validity request created", schema=DetailBookingSerializer),
+            201: openapi.Response(description="Passport validity request created", schema=LegacyDetailBookingSerializer),
             400: openapi.Response(description="Bad request (validation error or other issues)"),
             401: "Unauthorized: Admin permissions required",
             404: openapi.Response(description="User or booking not found"),
@@ -341,7 +363,7 @@ class ManagePassportValidityView(APIView):
             input_serializer = PassportValidityCreateRequestSerializer(data=request.data)
             validated_data = validate_serializer_or_raise(input_serializer)
             booking_detail = create_passport_validation(validated_data)
-            serialized_booking = DetailBookingSerializer(booking_detail)
+            serialized_booking = LegacyDetailBookingSerializer(booking_detail)
             return Response(serialized_booking.data, status=status.HTTP_201_CREATED)
 
         except APIException:
@@ -369,7 +391,7 @@ class ManagePassportValidityView(APIView):
             }
         ),
         responses={
-            200: openapi.Response(description="Passport validity updated successfully", schema=DetailBookingSerializer),
+            200: openapi.Response(description="Passport validity updated successfully", schema=LegacyDetailBookingSerializer),
             400: openapi.Response(description="Bad request (validation error or other issues)"),
             401: "Unauthorized: Admin permissions required",
             404: openapi.Response(description="User or booking not found"),
@@ -382,7 +404,7 @@ class ManagePassportValidityView(APIView):
             input_serializer = PassportValidityUpdateRequestSerializer(data=request.data)
             validated_data = validate_serializer_or_raise(input_serializer)
             booking_detail = update_passport_validation(validated_data)
-            serialized_booking = DetailBookingSerializer(booking_detail)
+            serialized_booking = LegacyDetailBookingSerializer(booking_detail)
             return Response(serialized_booking.data, status=status.HTTP_200_OK)
 
         except APIException:
@@ -401,7 +423,7 @@ class GetAllBookingsByUserView(APIView):
             openapi.Parameter('session_token', openapi.IN_QUERY, description="Session token of the user", type=openapi.TYPE_STRING, required=True)
         ],
         responses={
-            200: openapi.Response('Successful retrieval of booking details', DetailBookingSerializer(many=True)),
+            200: openapi.Response('Successful retrieval of booking details', LegacyDetailBookingSerializer(many=True)),
             400: "Bad Request: Missing or invalid input data",
             401: "Unauthorized: Admin permissions required",
             404: "Not Found: User, Partner, or Package not found.",
@@ -418,7 +440,7 @@ class GetAllBookingsByUserView(APIView):
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Serialize the booking details
-            serialized_bookings = DetailBookingSerializer(
+            serialized_bookings = LegacyDetailBookingSerializer(
                 bookings,
                 many=True,
                 context={"request": request},
@@ -450,7 +472,7 @@ class PaidAmountByTransactionNumberView(APIView):
             required=['session_token', 'booking_number', 'transaction_number', 'transaction_amount']
         ),
         responses={
-            201: openapi.Response('Payment transaction created successfully', DetailBookingSerializer),
+            201: openapi.Response('Payment transaction created successfully', LegacyDetailBookingSerializer),
             400: "Bad Request: Missing or invalid input data",
             401: "Unauthorized: Admin permissions required",
             404: "Not Found: User, Partner, or Package not found.",
@@ -463,7 +485,7 @@ class PaidAmountByTransactionNumberView(APIView):
             input_serializer = BookingPaymentCreateRequestSerializer(data=request.data)
             validated_data = validate_serializer_or_raise(input_serializer)
             booking_detail = record_booking_payment(validated_data)
-            serialized_booking = DetailBookingSerializer(booking_detail)
+            serialized_booking = LegacyDetailBookingSerializer(booking_detail)
             return Response(serialized_booking.data, status=status.HTTP_201_CREATED)
 
         except APIException:
@@ -488,7 +510,7 @@ class PaidAmountByTransactionNumberView(APIView):
             required=['payment_id', 'session_token', 'booking_number', 'transaction_number', 'transaction_amount']
         ),
         responses={
-            200: openapi.Response('Payment transaction updated successfully', DetailBookingSerializer),
+            200: openapi.Response('Payment transaction updated successfully', LegacyDetailBookingSerializer),
             400: "Bad Request: Missing or invalid input data",
             401: "Unauthorized: Admin permissions required",
             404: "Not Found: User, Partner, or Package not found.",
@@ -500,7 +522,7 @@ class PaidAmountByTransactionNumberView(APIView):
             input_serializer = BookingPaymentUpdateRequestSerializer(data=request.data)
             validated_data = validate_serializer_or_raise(input_serializer)
             booking_detail = update_booking_payment(validated_data)
-            serialized_booking = DetailBookingSerializer(booking_detail)
+            serialized_booking = LegacyDetailBookingSerializer(booking_detail)
             return Response(serialized_booking.data, status=status.HTTP_200_OK)
 
         except APIException:
@@ -525,7 +547,7 @@ class PaidAmountTransactionPhotoView(APIView):
             openapi.Parameter('transaction_type', openapi.IN_FORM, type=openapi.TYPE_NUMBER, description='Transaction type: full or minimum', required=True)
         ],
         responses={
-            201: openapi.Response('Transaction photo uploaded and payment transaction created successfully', DetailBookingSerializer(many=False)),
+            201: openapi.Response('Transaction photo uploaded and payment transaction created successfully', LegacyDetailBookingSerializer(many=False)),
             400: "Bad Request: Missing or invalid input data",
             401: "Unauthorized: Admin permissions required",
             404: "Not Found: User, Partner, or Package not found.",
@@ -539,65 +561,18 @@ class PaidAmountTransactionPhotoView(APIView):
         # Validate required files and session token
         if not all([files, session_token]):
             return Response({"message": "Missing file or required information."}, status=status.HTTP_400_BAD_REQUEST)
-        min_start_date = datetime.now().date() + timedelta(days=10)
-        data = request.data
-        required_fields = ['session_token', 'booking_number', 'transaction_amount', 'transaction_type']
-        # Validating required fields
-        error_response = validate_required_fields(required_fields, data)
-        if error_response:
-            return error_response
-
-        # Validate each file
-        for file in files:
-            if not check_file_format_and_size(file):
-                return Response({"message": "Invalid file format or size."}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Find the user by session token
-        user = UserProfile.objects.filter(session_token=session_token).first()
-        if not user:
-            return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        # Find the booking detail by user and booking number
-        booking_detail = Booking.objects.filter(order_by=user, start_date__gte=min_start_date, booking_number=data.get('booking_number')).first()
-        if not booking_detail:
-            return Response({"message": "Booking detail not found or expire."}, status=status.HTTP_404_NOT_FOUND)
-
-        package_detail = HuzBasicDetail.objects.filter(huz_id=booking_detail.package_token.huz_id).first()
-        if not package_detail:
-            return Response({"message": "Package detail not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        check_payment = Payment.objects.filter(booking_token=booking_detail).first()
-
-        # Remove session_token and booking_number from data
-        for key in ['session_token', 'booking_number']:
-            data.pop(key, None)
-
         try:
-            with transaction.atomic():
-                # Save each file and create payment record
-                for file in files:
-                    file_path = save_file_in_directory(file)
-                    Payment.objects.create(
-                        transaction_photo=file_path,
-                        transaction_type=data.get('transaction_type'),
-                        transaction_amount=data.get('transaction_amount'),
-                        booking_token=booking_detail
-                    )
-                if not check_payment:
-                    # Update booking status
-                    booking_detail.booking_status = "Paid"
-                    booking_detail.save()
-
-                    user_new_booking_email(user.email, user.name, package_detail.package_type,
-                                           package_detail.package_name,
-                                           booking_detail.booking_number, booking_detail.adults, booking_detail.child,
-                                           booking_detail.infants,
-                                           booking_detail.start_date, booking_detail.total_price,
-                                           data.get('transaction_amount'))
-
-                # Serialize the updated booking detail
-                serialized_booking = DetailBookingSerializer(booking_detail)
-                return Response(serialized_booking.data, status=status.HTTP_201_CREATED)
+            validated_data = {
+                "session_token": request.data.get("session_token"),
+                "booking_number": request.data.get("booking_number"),
+                "transaction_amount": request.data.get("transaction_amount"),
+                "transaction_type": request.data.get("transaction_type"),
+                "transaction_number": request.data.get("transaction_number"),
+                "payment_id": request.data.get("payment_id"),
+            }
+            booking_detail = record_booking_payment_photo_uploads(validated_data, files)
+            serialized_booking = LegacyDetailBookingSerializer(booking_detail, context={"request": request})
+            return Response(serialized_booking.data, status=status.HTTP_201_CREATED)
         except Exception as e:
             # Log the exception and return an error response
             logger.error(f"Post - PaidAmountTransactionPhotoView: {str(e)}")
@@ -676,7 +651,7 @@ class ManageUserPassportView(APIView):
             openapi.Parameter('booking_number', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description='Booking number'),
         ],
         responses={
-            201: openapi.Response('Passport uploaded successfully.', DetailBookingSerializer(many=False)),
+            201: openapi.Response('Passport uploaded successfully.', LegacyDetailBookingSerializer(many=False)),
             400: "Bad Request: Invalid file format or size, or missing required information.",
             401: "Unauthorized: Admin permissions required",
             404: "Not Found: User, booking detail, or package detail not found.",
@@ -709,8 +684,8 @@ class ManageUserPassportView(APIView):
         if not booking_detail:
             return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        # Check booking status
-        if booking_detail.booking_status in ["Initialize", "Paid"]:
+        sync_booking_state(booking_detail, save=True)
+        if not booking_allows_client_traveller_updates(booking_detail):
             return Response({"message": "Payment issue. Please resolve payment first."}, status=status.HTTP_409_CONFLICT)
 
         # Find the package detail by huz_id
@@ -739,10 +714,7 @@ class ManageUserPassportView(APIView):
             if not traveller_status.exists():
                 return Response({"message": "No Traveller information found."}, status=status.HTTP_404_NOT_FOUND)
             is_completed = _booking_passports_are_complete(booking_detail)
-            # Update the booking status if all documents are completed
-            if is_completed:
-                booking_detail.booking_status = "Pending"
-                booking_detail.save()
+            sync_booking_state(booking_detail, save=True)
 
             # Send new order notification email to partner
             partner_profile = PartnerProfile.objects.filter(partner_session_token=booking_detail.order_to).first()
@@ -759,7 +731,7 @@ class ManageUserPassportView(APIView):
                                  )
 
             # Serialize and return booking details
-            serialized_booking = DetailBookingSerializer(booking_detail)
+            serialized_booking = LegacyDetailBookingSerializer(booking_detail)
             return Response(serialized_booking.data, status=status.HTTP_201_CREATED)
 
         except Exception as e:
@@ -781,7 +753,7 @@ class ManageUserPassportPhotoView(APIView):
             openapi.Parameter('booking_number', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description='Booking number'),
         ],
         responses={
-            201: openapi.Response('Passport uploaded successfully.', DetailBookingSerializer(many=False)),
+            201: openapi.Response('Passport uploaded successfully.', LegacyDetailBookingSerializer(many=False)),
             400: "Bad Request: Invalid file format or size, or missing required information.",
             401: "Unauthorized: Admin permissions required",
             404: "Not Found: User, booking detail, or package detail not found.",
@@ -814,8 +786,8 @@ class ManageUserPassportPhotoView(APIView):
         if not booking_detail:
             return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        # Check booking status
-        if booking_detail.booking_status in ["Initialize", "Paid"]:
+        sync_booking_state(booking_detail, save=True)
+        if not booking_allows_client_traveller_updates(booking_detail):
             return Response({"message": "Payment issue. Please resolve payment first."}, status=status.HTTP_409_CONFLICT)
 
         # Find the package detail by huz_id
@@ -841,10 +813,7 @@ class ManageUserPassportPhotoView(APIView):
             if not traveller_status.exists():
                 return Response({"message": "No Traveller information found."}, status=status.HTTP_404_NOT_FOUND)
             is_completed = _booking_passports_are_complete(booking_detail)
-            # Update the booking status if all documents are completed
-            if is_completed:
-                booking_detail.booking_status = "Pending"
-                booking_detail.save()
+            sync_booking_state(booking_detail, save=True)
 
             # Send new order notification email to partner
             partner_profile = PartnerProfile.objects.filter(partner_session_token=booking_detail.order_to).first()
@@ -861,7 +830,7 @@ class ManageUserPassportPhotoView(APIView):
                                  )
 
             # Serialize and return booking details
-            serialized_booking = DetailBookingSerializer(booking_detail)
+            serialized_booking = LegacyDetailBookingSerializer(booking_detail)
             return Response(serialized_booking.data, status=status.HTTP_201_CREATED)
 
         except Exception as e:
@@ -884,7 +853,7 @@ class ManageUserRequiredDocumentsView(APIView):
             openapi.Parameter('booking_number', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description='Booking number'),
         ],
         responses={
-            201: openapi.Response('Documents uploaded successfully.', DetailBookingSerializer(many=False)),
+            201: openapi.Response('Documents uploaded successfully.', LegacyDetailBookingSerializer(many=False)),
             400: "Bad Request: Invalid file format or size, or missing required information.",
             401: "Unauthorized: Admin permissions required",
             404: "Not Found: User, booking detail, or package detail not found.",
@@ -918,11 +887,8 @@ class ManageUserRequiredDocumentsView(APIView):
         if not booking_detail:
             return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        # Check the booking status
-        if booking_detail.booking_status == "Initialize":
-            return Response({"message": "Payment is pending, please submit payment first."}, status=status.HTTP_409_CONFLICT)
-
-        if booking_detail.booking_status == "Paid":
+        sync_booking_state(booking_detail, save=True)
+        if not booking_allows_client_traveller_updates(booking_detail):
             return Response({"message": "Payment is not verified. Please wait."}, status=status.HTTP_409_CONFLICT)
 
         # Find the package detail by huz_id
@@ -956,8 +922,7 @@ class ManageUserRequiredDocumentsView(APIView):
                 if doc_status:
                     doc_status.is_user_passport_completed = True
                     doc_status.save()
-                booking_detail.booking_status = "Pending"
-                booking_detail.save()
+                sync_booking_state(booking_detail, save=True)
 
                 # Send new order notification email to partner
                 partner_profile = PartnerProfile.objects.filter(partner_session_token=booking_detail.order_to).first()
@@ -974,7 +939,7 @@ class ManageUserRequiredDocumentsView(APIView):
                                      )
 
             # Serialize booking details and return response
-            serialized_booking = DetailBookingSerializer(booking_detail)
+            serialized_booking = LegacyDetailBookingSerializer(booking_detail)
             return Response(serialized_booking.data, status=status.HTTP_201_CREATED)
 
         except Exception as e:
@@ -1063,7 +1028,7 @@ class BookingRatingAndReviewView(APIView):
             },
         ),
         responses={
-            201: openapi.Response('Rating and review submitted successfully.', DetailBookingSerializer(many=False)),
+            201: openapi.Response('Rating and review submitted successfully.', LegacyDetailBookingSerializer(many=False)),
             400: 'Bad Request: Missing required data fields or invalid input format.',
             401: "Unauthorized: Admin permissions required",
             404: 'Not Found:: User, booking detail, package provider, or package detail not found, or review already exists.',
@@ -1113,9 +1078,8 @@ class BookingRatingAndReviewView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            statuss = ["Completed", "Closed", "Close"]
-            # Check if the booking status allows for submitting reviews
-            if booking_detail.booking_status not in statuss:
+            sync_booking_state(booking_detail, save=True)
+            if booking_detail.booking_status not in [BOOKING_STATUS_READY_FOR_TRAVEL, BOOKING_STATUS_COMPLETED]:
                 return Response({"message": "Reviews and ratings can only be submitted after your booking is completed or closed."}, status=status.HTTP_409_CONFLICT)
 
             # Submit the rating and review within a transaction
@@ -1136,7 +1100,7 @@ class BookingRatingAndReviewView(APIView):
                 )
 
                 # Update the booking status if review submission is successful
-                serialized_package = DetailBookingSerializer(booking_detail)
+                serialized_package = LegacyDetailBookingSerializer(booking_detail)
                 return Response(serialized_package.data, status=status.HTTP_201_CREATED)
 
         except Exception as e:
@@ -1165,7 +1129,7 @@ class BookingComplaintsView(APIView):
             400: 'Bad Request: Missing required data fields, invalid file format, or size limit exceeded.',
             401: 'Unauthorized: Admin permissions required',
             404: 'Not Found:User, booking detail, package provider, or package detail not found.',
-            409: 'Conflict: Complaint can only be raised when the booking status is Pending, Complete, Active, or Closed.',
+            409: 'Conflict: Complaint can only be raised once the booking reaches operator readiness, fulfillment, ready-for-travel, or completion.',
             500: 'Server error: Internal server error.'
         },
     )
@@ -1210,9 +1174,15 @@ class BookingComplaintsView(APIView):
                 return Response({"message": "Package detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Check if the booking status allows for raising a complaint
-            if booking_detail.booking_status not in ["Pending", "Completed", "Active", "Closed", "Close"]:
+            sync_booking_state(booking_detail, save=True)
+            if booking_detail.booking_status not in [
+                BOOKING_STATUS_READY_FOR_OPERATOR,
+                BOOKING_STATUS_IN_FULFILLMENT,
+                BOOKING_STATUS_READY_FOR_TRAVEL,
+                BOOKING_STATUS_COMPLETED,
+            ]:
                 return Response({
-                                    "message": "Complaint can only be raised when the booking status is Pending, Complete, Active, or Closed."},
+                                    "message": "Complaint can only be raised once the booking reaches operator readiness, fulfillment, ready-for-travel, or completion."},
                                 status=status.HTTP_409_CONFLICT)
 
             with transaction.atomic():
@@ -1360,9 +1330,9 @@ class ObjectionResponseView(APIView):
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            # Ensure the booking status is 'Objection'
-            if booking_detail.booking_status != "Objection":
-                return Response({"message": "Invalid booking status. Booking status should be 'Objection'."}, status=status.HTTP_400_BAD_REQUEST)
+            sync_booking_state(booking_detail, save=True)
+            if booking_detail.issue_status != ISSUE_STATUS_OPERATOR_OBJECTION:
+                return Response({"message": "Invalid booking status. Booking status should be 'OPERATOR_OBJECTION'."}, status=status.HTTP_400_BAD_REQUEST)
 
             # Find the objection detail associated with the booking detail and objection ID
             objection_detail = BookingObjections.objects.filter(objection_id=objection_id, objection_for_booking=booking_detail).first()
@@ -1375,12 +1345,12 @@ class ObjectionResponseView(APIView):
             objection_detail.client_remarks = client_remarks
             objection_detail.save()
 
-            # Update the booking status to 'Pending'
-            booking_detail.booking_status = "Pending"
-            booking_detail.save()
+            booking_detail.issue_status = ISSUE_STATUS_NONE
+            booking_detail.save(update_fields=["issue_status"])
+            sync_booking_state(booking_detail, save=True)
 
             # Serialize the updated booking detail and return the response
-            serialized_booking = DetailBookingSerializer(booking_detail)
+            serialized_booking = LegacyDetailBookingSerializer(booking_detail)
             return Response(serialized_booking.data, status=status.HTTP_201_CREATED)
 
         except Exception as e:
@@ -1407,7 +1377,7 @@ class ManageHotelCheckIn(APIView):
             },
         ),
         responses={
-            201: openapi.Response(description="Booking check-in status updated successfully", schema=DetailBookingSerializer),
+            201: openapi.Response(description="Booking check-in status updated successfully", schema=LegacyDetailBookingSerializer),
             400: openapi.Response(description="Bad Request - Missing or invalid fields"),
             401: 'Unauthorized: Admin permissions required',
             404: openapi.Response(description="Not Found - User, partner, or booking detail not found"),
@@ -1443,9 +1413,10 @@ class ManageHotelCheckIn(APIView):
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            if booking_detail.booking_status != "Completed":
+            sync_booking_state(booking_detail, save=True)
+            if booking_detail.booking_status not in [BOOKING_STATUS_READY_FOR_TRAVEL, BOOKING_STATUS_COMPLETED]:
                 return Response(
-                    {"message": "Check-in can only be managed when the booking status is 'Completed'."},
+                    {"message": "Check-in can only be managed when the booking is ready for travel or completed."},
                     status=status.HTTP_409_CONFLICT
                 )
             # Update booking check-in status for Makkah and Madinah
@@ -1455,7 +1426,7 @@ class ManageHotelCheckIn(APIView):
 
             # Serialize booking details and return within an atomic transaction
             with transaction.atomic():
-                serialized_booking = DetailBookingSerializer(booking_detail)
+                serialized_booking = LegacyDetailBookingSerializer(booking_detail, context={"request": request})
                 return Response(serialized_booking.data, status=status.HTTP_201_CREATED)
 
         except Exception as e:
@@ -1487,7 +1458,7 @@ class BookingRequestView(APIView):
             400: 'Bad Request: Missing required data fields, invalid file format, or size limit exceeded.',
             401: 'Unauthorized: Admin permissions required',
             404: 'Not Found:User, booking detail, package provider, or package detail not found.',
-            409: 'Conflict: Request can only be raised when the booking status is Completed or Closed.',
+            409: 'Conflict: Request can only be raised when the booking is in fulfillment, ready for travel, or completed.',
             500: 'Server error: Internal server error.'
         },
     )
@@ -1525,10 +1496,14 @@ class BookingRequestView(APIView):
             if not package_detail:
                 return Response({"message": "Package detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            # Check if the booking status allows for raising a complaint
-            if booking_detail.booking_status not in ["Completed", "Active", "Closed"]:
+            sync_booking_state(booking_detail, save=True)
+            if booking_detail.booking_status not in [
+                BOOKING_STATUS_READY_FOR_TRAVEL,
+                BOOKING_STATUS_COMPLETED,
+                BOOKING_STATUS_IN_FULFILLMENT,
+            ]:
                 return Response(
-                    {"message": "Request can only be raised when the booking status is Completed, Active or Closed."},
+                    {"message": "Request can only be raised when the booking is in fulfillment, ready for travel, or completed."},
                     status=status.HTTP_409_CONFLICT)
 
             # Submit the complaint within a transaction

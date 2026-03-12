@@ -3,24 +3,11 @@ import uuid
 from django.utils import timezone
 from common.models import UserProfile
 from partners.models import PartnerProfile, HuzBasicDetail
+from .statuses import BOOKING_STATUS_CHOICES, ISSUE_STATUS_CHOICES, ISSUE_STATUS_NONE, PAYMENT_STATUS_CHOICES
 
 
 class Booking(models.Model):
-    # Define choices for booking status
-    BOOKING_TYPE = [
-        ('Initialize', 'initialize'),
-        ('Passport_Validation', 'passport_Validation'),
-        ('Paid', 'paid'),
-        ('Confirm', 'confirm'),
-        ('Pending', 'pending'),
-        ('Active', 'active'),
-        ('Completed', 'completed'),
-        ('Closed', 'closed'),
-        ('Objection', 'objection'),
-        ('Report', 'report'),
-        ('Cancel', 'cancel'),
-        ('Rejected', 'rejected')
-    ]
+    BOOKING_TYPE = BOOKING_STATUS_CHOICES
 
     # Define choices for payment type
     PAYMENT_TYPE = [
@@ -46,7 +33,15 @@ class Booking(models.Model):
     special_request = models.TextField(null=True)
 
     # Current status of the booking
-    booking_status = models.CharField(max_length=20, choices=BOOKING_TYPE)
+    booking_status = models.CharField(max_length=40, choices=BOOKING_TYPE)
+    issue_status = models.CharField(
+        max_length=32,
+        choices=ISSUE_STATUS_CHOICES,
+        default=ISSUE_STATUS_NONE,
+    )
+    hold_expires_at = models.DateTimeField(null=True, blank=True)
+    payment_correction_expires_at = models.DateTimeField(null=True, blank=True)
+    status_changed_at = models.DateTimeField(default=timezone.now)
 
     # Time when the order was placed
     order_time = models.DateTimeField(default=timezone.now)
@@ -74,6 +69,9 @@ class Booking(models.Model):
             models.Index(fields=['order_to', 'booking_status'], name='booking_partner_status_idx'),
             models.Index(fields=['package_token', 'booking_status'], name='booking_package_status_idx'),
             models.Index(fields=['start_date'], name='booking_start_date_idx'),
+            models.Index(fields=['order_by', 'order_time'], name='booking_user_time_idx'),
+            models.Index(fields=['order_to', 'order_time'], name='booking_partner_time_idx'),
+            models.Index(fields=['order_to', 'booking_number'], name='booking_partner_number_idx'),
         ]
 
     def __str__(self):
@@ -110,7 +108,7 @@ class Payment(models.Model):
     # Amount of the transaction
     transaction_amount = models.FloatField()
     transaction_time = models.DateTimeField(default=timezone.now)
-    payment_status = models.CharField(max_length=50, null=True)
+    payment_status = models.CharField(max_length=50, null=True, choices=PAYMENT_STATUS_CHOICES)
     review_message = models.TextField(null=True, blank=True)
     # Reference to the related booking
     booking_token = models.ForeignKey(Booking, related_name='booking_token', on_delete=models.SET_NULL, null=True)

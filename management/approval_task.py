@@ -5,10 +5,12 @@ from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from rest_framework.permissions import IsAdminUser
 from django.db import transaction
-from django.db.models import Max, Prefetch, Q
+from django.db.models import Max, Prefetch, Q, Sum
 from django.core.cache import cache
 from datetime import timedelta
+from django.utils.dateparse import parse_date
 from common.models import UserProfile
+from common.pagination import CustomPagination
 from common.serializers import UserProfileSerializer
 from partners.models import (
     PartnerProfile,
@@ -33,7 +35,20 @@ from common.utility import (
 )
 from booking.flow_utils import get_expected_traveller_count
 from booking.models import Booking, PartnersBookingPayment, Payment, PassportValidity
-from booking.serializers import DetailBookingSerializer, PartnersBookingPaymentSerializer, AdminPaidBookingSerializer
+from booking.querysets import annotate_booking_payment_statuses
+from booking.serializers import LegacyDetailBookingSerializer, PartnersBookingPaymentSerializer, AdminPaidBookingSerializer
+from booking.statuses import (
+    BOOKING_STATUS_AWAITING_FINAL_PAYMENT,
+    BOOKING_STATUS_COMPLETED,
+    BOOKING_STATUS_HOLD,
+    BOOKING_STATUS_READY_FOR_TRAVEL,
+    BOOKING_STATUS_READY_FOR_OPERATOR,
+    BOOKING_STATUS_TRAVELER_DETAILS_PENDING,
+    PAYMENT_STATUS_APPROVED,
+    PAYMENT_STATUS_REJECTED,
+    PAYMENT_STATUS_UNDER_REVIEW,
+)
+from booking.workflow import get_payment_stage_status, sync_booking_state
 from django.utils import timezone
 
 
@@ -69,7 +84,22 @@ HOTEL_AMENITY_FIELDS = (
 )
 MAX_MASTER_HOTEL_IMAGES = 6
 MAX_MASTER_HOTEL_IMAGE_SIZE_BYTES = 5 * 1024 * 1024
-PAYMENT_REVIEWABLE_BOOKING_STATUSES = {"Paid", "Confirm", "Passport_Validation", "Pending"}
+PAYMENT_REVIEWABLE_BOOKING_STATUSES = {
+    BOOKING_STATUS_HOLD,
+    BOOKING_STATUS_TRAVELER_DETAILS_PENDING,
+    BOOKING_STATUS_AWAITING_FINAL_PAYMENT,
+    BOOKING_STATUS_READY_FOR_OPERATOR,
+}
+PAYMENT_REVIEW_QUEUE_MINIMUM_UNDER_REVIEW = "minimum_under_review"
+PAYMENT_REVIEW_QUEUE_FULL_UNDER_REVIEW = "full_under_review"
+PAYMENT_REVIEW_QUEUE_REJECTED_CORRECTIONS = "rejected_corrections"
+PAYMENT_REVIEW_QUEUE_APPROVED_HISTORY = "approved_history"
+PAYMENT_REVIEW_QUEUE_VALUES = {
+    PAYMENT_REVIEW_QUEUE_MINIMUM_UNDER_REVIEW,
+    PAYMENT_REVIEW_QUEUE_FULL_UNDER_REVIEW,
+    PAYMENT_REVIEW_QUEUE_REJECTED_CORRECTIONS,
+    PAYMENT_REVIEW_QUEUE_APPROVED_HISTORY,
+}
 
 
 def _invalidate_management_cache():
@@ -127,11 +157,77 @@ def _notify_user_about_payment_update(user, booking_number, title, message):
         logger.error("Failed to send push notification for booking %s: %s", booking_number, str(exc))
 
 
+def _parse_optional_management_date(raw_value, *, field_name):
+    normalized_value = str(raw_value or "").strip()
+    if not normalized_value:
+        return None, None
+
+    parsed_value = parse_date(normalized_value)
+    if parsed_value is None:
+        return None, Response(
+            {"message": f"Invalid {field_name}. Expected YYYY-MM-DD."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    return parsed_value, None
+
+
+def _build_payment_review_queue_filters(*, now=None):
+    now = now or timezone.now()
+    minimum_under_review = Q(annotated_minimum_payment_status=PAYMENT_STATUS_UNDER_REVIEW)
+    full_under_review_core = Q(annotated_full_payment_status=PAYMENT_STATUS_UNDER_REVIEW)
+    rejected_corrections_core = (
+        Q(payment_correction_expires_at__isnull=False)
+        & Q(payment_correction_expires_at__gt=now)
+        & (
+            Q(annotated_minimum_payment_status=PAYMENT_STATUS_REJECTED)
+            | Q(annotated_full_payment_status=PAYMENT_STATUS_REJECTED)
+        )
+    )
+    approved_history_core = (
+        Q(annotated_minimum_payment_status=PAYMENT_STATUS_APPROVED)
+        | Q(annotated_full_payment_status=PAYMENT_STATUS_APPROVED)
+    )
+
+    return {
+        PAYMENT_REVIEW_QUEUE_MINIMUM_UNDER_REVIEW: minimum_under_review,
+        PAYMENT_REVIEW_QUEUE_FULL_UNDER_REVIEW: ~minimum_under_review & full_under_review_core,
+        PAYMENT_REVIEW_QUEUE_REJECTED_CORRECTIONS: (
+            ~minimum_under_review
+            & ~full_under_review_core
+            & rejected_corrections_core
+        ),
+        PAYMENT_REVIEW_QUEUE_APPROVED_HISTORY: (
+            ~minimum_under_review
+            & ~full_under_review_core
+            & ~rejected_corrections_core
+            & approved_history_core
+        ),
+    }
+
+
+def _combine_queue_filters(queue_filters):
+    combined_filter = None
+    for queue_filter in queue_filters.values():
+        combined_filter = queue_filter if combined_filter is None else combined_filter | queue_filter
+    return combined_filter or Q(pk__in=[])
+
+
+def _build_paginated_response(request, queryset, serializer_class, *, meta=None):
+    paginator = CustomPagination()
+    page = paginator.paginate_queryset(queryset, request)
+    serializer = serializer_class(page, many=True, context={"request": request})
+    response = paginator.get_paginated_response(serializer.data)
+    if meta is not None:
+        response.data["meta"] = meta
+    return response
+
+
 def _has_approved_payment_for_stage(booking, transaction_type):
     return Payment.objects.filter(
         booking_token=booking,
         transaction_type__iexact=transaction_type,
-        payment_status__iexact="Approved",
+        payment_status__iexact=PAYMENT_STATUS_APPROVED,
     ).exists()
 
 
@@ -940,7 +1036,7 @@ class ApproveBookingPaymentView(APIView):
             required=['session_token', 'booking_number']
         ),
         responses={
-            200: openapi.Response('Booking status updated successfully', DetailBookingSerializer(many=False)),
+            200: openapi.Response('Booking status updated successfully', LegacyDetailBookingSerializer(many=False)),
             400: "Bad Request: Missing or invalid input data.",
             401: "Unauthorized: Admin permissions required",
             404: "Not Found: Booking detail or user detail not found.",
@@ -977,6 +1073,7 @@ class ApproveBookingPaymentView(APIView):
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
+            sync_booking_state(booking_detail, save=True)
             current_status = (booking_detail.booking_status or "").strip()
             if current_status not in PAYMENT_REVIEWABLE_BOOKING_STATUSES:
                 return Response(
@@ -988,39 +1085,30 @@ class ApproveBookingPaymentView(APIView):
             if payment_id:
                 check_payment = payment_queryset.filter(payment_id=payment_id).first()
             else:
-                check_payment = payment_queryset.exclude(payment_status="Approved").order_by('-transaction_time').first()
+                check_payment = payment_queryset.exclude(payment_status=PAYMENT_STATUS_APPROVED).order_by('-transaction_time').first()
                 if not check_payment:
                     check_payment = payment_queryset.order_by('-transaction_time').first()
 
             if not check_payment:
                 return Response({"message": "Payment record not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            normalized_payment_status = str(check_payment.payment_status or "").strip().lower()
+            normalized_payment_status = str(check_payment.payment_status or "").strip().upper()
 
             if decision == "approve":
-                if normalized_payment_status == "rejected":
+                if normalized_payment_status == PAYMENT_STATUS_REJECTED:
                     return Response(
                         {"message": "Rejected payment must be resubmitted before it can be approved."},
                         status=status.HTTP_409_CONFLICT,
                     )
 
-                payment_already_approved = normalized_payment_status == "approved"
+                payment_already_approved = normalized_payment_status == PAYMENT_STATUS_APPROVED
                 if not payment_already_approved:
-                    check_payment.payment_status = "Approved"
+                    check_payment.payment_status = PAYMENT_STATUS_APPROVED
                     check_payment.review_message = None
                     check_payment.save(update_fields=['payment_status', 'review_message'])
 
-                transitioned_to_confirm = False
-                if current_status == "Paid":
-                    booking_already_confirmed = booking_detail.is_payment_received
-                    if not booking_already_confirmed:
-                        booking_detail.booking_status = "Confirm"
-                        booking_detail.is_payment_received = True
-                        booking_detail.save(update_fields=['booking_status', 'is_payment_received'])
-                        transitioned_to_confirm = True
-                elif not booking_detail.is_payment_received:
-                    booking_detail.is_payment_received = True
-                    booking_detail.save(update_fields=['is_payment_received'])
+                booking_detail.payment_correction_expires_at = None
+                booking_detail.save(update_fields=["payment_correction_expires_at"])
 
                 # Create only missing PassportValidity records to keep endpoint idempotent.
                 required_passports = get_expected_traveller_count(booking_detail)
@@ -1031,6 +1119,7 @@ class ApproveBookingPaymentView(APIView):
                         [PassportValidity(passport_for_booking_number=booking_detail) for _ in range(missing_passports)]
                     )
 
+                sync_booking_state(booking_detail, save=True)
                 if not payment_already_approved:
                     send_payment_verification_email(user.email, user.name, booking_number)
                     _notify_user_about_payment_update(
@@ -1039,34 +1128,26 @@ class ApproveBookingPaymentView(APIView):
                         "Payment approved",
                         f"Your payment for booking {booking_number} has been approved.",
                     )
-
-                if transitioned_to_confirm:
-                    preparation_email(user.email, user.name, booking_detail.package_token.package_type)
+                    if booking_detail.booking_status in {
+                        BOOKING_STATUS_READY_FOR_TRAVEL,
+                        BOOKING_STATUS_COMPLETED,
+                    }:
+                        preparation_email(user.email, user.name, booking_detail.package_token.package_type)
             else:
                 rejection_note = review_message or "Please upload a clearer or corrected payment proof and submit it again."
 
-                if normalized_payment_status == "approved":
+                if normalized_payment_status == PAYMENT_STATUS_APPROVED:
                     return Response(
                         {"message": "Approved payments cannot be rejected."},
                         status=status.HTTP_409_CONFLICT,
                     )
 
-                check_payment.payment_status = "Rejected"
+                check_payment.payment_status = PAYMENT_STATUS_REJECTED
                 check_payment.review_message = rejection_note
                 check_payment.save(update_fields=['payment_status', 'review_message'])
-
-                has_approved_minimum_payment = _has_approved_payment_for_stage(booking_detail, "Minimum")
-                if not has_approved_minimum_payment:
-                    next_status = "Initialize"
-                    update_fields = []
-                    if booking_detail.booking_status != next_status:
-                        booking_detail.booking_status = next_status
-                        update_fields.append("booking_status")
-                    if booking_detail.is_payment_received:
-                        booking_detail.is_payment_received = False
-                        update_fields.append("is_payment_received")
-                    if update_fields:
-                        booking_detail.save(update_fields=update_fields)
+                booking_detail.payment_correction_expires_at = timezone.now() + timedelta(hours=2)
+                booking_detail.save(update_fields=["payment_correction_expires_at"])
+                sync_booking_state(booking_detail, save=True)
 
                 send_payment_rejection_email(user.email, user.name, booking_number, rejection_note)
                 _notify_user_about_payment_update(
@@ -1077,7 +1158,7 @@ class ApproveBookingPaymentView(APIView):
                 )
 
             # Serialize the updated booking detail and return response
-            serialized_booking = DetailBookingSerializer(booking_detail)
+            serialized_booking = LegacyDetailBookingSerializer(booking_detail)
             _invalidate_management_cache()
             return Response(serialized_booking.data, status=status.HTTP_200_OK)
 
@@ -1101,13 +1182,27 @@ class FetchPaidBookingView(APIView):
     )
     def get(self, request):
         try:
-            cached_payload = cache.get(CACHE_KEY_PAID_BOOKINGS)
-            if cached_payload is not None:
-                return Response(cached_payload, status=status.HTTP_200_OK)
+            payment_queue = str(request.query_params.get("payment_queue") or "").strip().lower()
+            if payment_queue and payment_queue not in PAYMENT_REVIEW_QUEUE_VALUES:
+                return Response(
+                    {
+                        "message": "Invalid payment_queue. Must be one of: "
+                        + ", ".join(sorted(PAYMENT_REVIEW_QUEUE_VALUES))
+                        + "."
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            booking_number = str(request.query_params.get("booking_number") or "").strip()
+            order_date, order_date_error = _parse_optional_management_date(
+                request.query_params.get("order_date"),
+                field_name="order_date",
+            )
+            if order_date_error is not None:
+                return order_date_error
 
             booking_details_qs = Booking.objects.filter(
-                booking_status__in=PAYMENT_REVIEWABLE_BOOKING_STATUSES,
-                booking_token__payment_status__iexact="Pending",
+                booking_token__isnull=False,
             ).select_related(
                 'order_to',
                 'order_by',
@@ -1141,20 +1236,42 @@ class FetchPaidBookingView(APIView):
                     ),
                 ),
                 'booking_token',
-            ).order_by('-order_time').distinct()
+            ).order_by('-order_time')
 
-            booking_details = list(booking_details_qs)
+            if booking_number:
+                booking_details_qs = booking_details_qs.filter(booking_number=booking_number)
+            if order_date is not None:
+                booking_details_qs = booking_details_qs.filter(order_time__date=order_date)
 
-            # Check if any bookings were found
-            if booking_details:
-                # Serialize the booking details
-                serialized_booking = AdminPaidBookingSerializer(booking_details, many=True)
-                response_payload = serialized_booking.data
-                cache.set(CACHE_KEY_PAID_BOOKINGS, response_payload, MANAGEMENT_CACHE_TIMEOUT_SECONDS)
-                return Response(response_payload, status=status.HTTP_200_OK)
+            annotated_queryset = annotate_booking_payment_statuses(booking_details_qs)
+            queue_filters = _build_payment_review_queue_filters(now=timezone.now())
+            reviewable_queryset = annotated_queryset.filter(_combine_queue_filters(queue_filters))
+            queue_counts = {
+                queue_key: reviewable_queryset.filter(queue_filter).count()
+                for queue_key, queue_filter in queue_filters.items()
+            }
 
-            # Return response if no bookings were found
-            return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
+            filtered_queryset = (
+                reviewable_queryset.filter(queue_filters[payment_queue])
+                if payment_queue
+                else reviewable_queryset
+            )
+            total_amount = (
+                filtered_queryset.aggregate(total_amount=Sum("total_price")).get("total_amount") or 0
+            )
+
+            return _build_paginated_response(
+                request,
+                filtered_queryset,
+                AdminPaidBookingSerializer,
+                meta={
+                    "payment_queue": payment_queue or None,
+                    "order_date": order_date.isoformat() if order_date is not None else None,
+                    "total_requests": reviewable_queryset.count(),
+                    "queue_counts": queue_counts,
+                    "total_amount": float(total_amount),
+                },
+            )
 
         except Exception as e:
             # Log the exception and return an error response
@@ -1220,7 +1337,7 @@ class GetPartnerReceiveAblePaymentsView(APIView):
     permission_classes = [IsAdminUser]
 
     @swagger_auto_schema(
-        operation_description="Fetch all bookings payment which are not 'Paid' to partners",
+        operation_description="Fetch all partner receivable booking payments that are not yet transferred.",
         responses={
             200: openapi.Response('Successfully retrieved partner receive able details', PartnersBookingPaymentSerializer(many=True)),
             401: "Unauthorized: Admin permissions required",
@@ -1230,10 +1347,6 @@ class GetPartnerReceiveAblePaymentsView(APIView):
     )
     def get(self, request):
         try:
-            cached_payload = cache.get(CACHE_KEY_PARTNER_RECEIVABLES)
-            if cached_payload is not None:
-                return Response(cached_payload, status=status.HTTP_200_OK)
-
             receive_able_qs = PartnersBookingPayment.objects.filter(payment_status="NotPaid").select_related(
                 'payment_for_partner',
                 'payment_for_booking',
@@ -1251,23 +1364,27 @@ class GetPartnerReceiveAblePaymentsView(APIView):
                         'contact_number',
                     ),
                 )
+            ).order_by("-create_date")
+            summary = receive_able_qs.aggregate(
+                total_receivable=Sum("receivable_amount"),
+                total_pending=Sum("pending_amount"),
+                total_processed=Sum("processed_amount"),
             )
-            receive_able_details = list(receive_able_qs)
 
-            # Check if any bookings were found
-            if receive_able_details:
-                # Serialize the booking details
-                serialized_booking = PartnersBookingPaymentSerializer(receive_able_details, many=True)
-                response_payload = serialized_booking.data
-                cache.set(CACHE_KEY_PARTNER_RECEIVABLES, response_payload, MANAGEMENT_CACHE_TIMEOUT_SECONDS)
-                return Response(response_payload, status=status.HTTP_200_OK)
-
-            # Return response if no bookings were found
-            return Response({"message": "Payment detail not found."}, status=status.HTTP_404_NOT_FOUND)
+            return _build_paginated_response(
+                request,
+                receive_able_qs,
+                PartnersBookingPaymentSerializer,
+                meta={
+                    "total_receivable": float(summary.get("total_receivable") or 0),
+                    "total_pending": float(summary.get("total_pending") or 0),
+                    "total_processed": float(summary.get("total_processed") or 0),
+                },
+            )
 
         except Exception as e:
             # Log the exception and return an error response
-            logger.error(f"Error in FetchPaidBookingView: {str(e)}")
+            logger.error(f"Error in GetPartnerReceiveAblePaymentsView: {str(e)}")
             return Response({"message": "Failed to fetch booking details. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
@@ -1319,9 +1436,9 @@ class ManagePartnerReceiveAblePaymentView(APIView):
             return Response({"message": "Booking not found with the provided details."},
                             status=status.HTTP_404_NOT_FOUND)
 
-        # Ensure the booking status is either "Completed" or "Closed"
-        if booking_detail.booking_status not in ["Completed", "Closed"]:
-            return Response({"message": "Only completed or closed case payments can be processed."},
+        # Ensure partner payouts only process after fulfillment has reached the travel-ready or completed stage
+        if booking_detail.booking_status not in [BOOKING_STATUS_READY_FOR_TRAVEL, BOOKING_STATUS_COMPLETED]:
+            return Response({"message": "Only ready-for-travel or completed booking payments can be processed."},
                             status=status.HTTP_400_BAD_REQUEST)
 
         # Retrieve the receivable payment details for the partner and booking
