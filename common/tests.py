@@ -1,13 +1,20 @@
+import importlib
 from unittest.mock import Mock, patch
 
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.db import connection
+from django.test import SimpleTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
+from django.urls import clear_url_caches
 from uuid import uuid4
 from rest_framework import status
 from rest_framework.test import APIRequestFactory, APITestCase, force_authenticate
 
 from .models import MailingDetail, UserBankAccount, UserProfile, UserTransactionHistory, Wallet
-from .user_profile import SendOTPSMSAPIView
+from .serializers import UserProfileSerializer
+from .user_profile import CreateMemberProfileView, SendOTPSMSAPIView
+from huz import urls as huz_urls
 
 
 class SendOTPSMSAPIViewThrottleTests(APITestCase):
@@ -50,6 +57,76 @@ class SendOTPSMSAPIViewThrottleTests(APITestCase):
         throttled_response = view(throttled_request)
 
         self.assertEqual(throttled_response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+
+class CreateMemberProfileViewTransactionTests(APITestCase):
+    def setUp(self):
+        self.factory = APIRequestFactory()
+        self.admin_user = get_user_model().objects.create_user(
+            username="member-create-admin",
+            password="pass123",
+            is_staff=True,
+            is_superuser=True,
+        )
+
+    @patch("common.user_profile.save_notification", return_value="Success")
+    def test_create_member_profile_rejects_unsupported_country_before_persisting_user(
+        self,
+        _mocked_save_notification,
+    ):
+        request = self.factory.post(
+            "/common/manage_user_account/",
+            {
+                "phone_number": "+11234567890",
+                "name": "Test User",
+                "email": "unsupported-country@example.com",
+                "user_type": "user",
+            },
+            format="json",
+        )
+        force_authenticate(request, user=self.admin_user)
+
+        response = CreateMemberProfileView.as_view()(request)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data.get("message"),
+            "Sending OTP to this country is not allowed.",
+        )
+        self.assertFalse(
+            UserProfile.objects.filter(email="unsupported-country@example.com").exists()
+        )
+        self.assertEqual(Wallet.objects.count(), 0)
+
+    @patch("common.user_profile.save_notification", return_value="Success")
+    @patch("common.user_profile.send_sms_gateway_request")
+    def test_create_member_profile_rolls_back_when_sms_delivery_fails(
+        self,
+        mocked_send_sms_gateway_request,
+        _mocked_save_notification,
+    ):
+        mocked_send_sms_gateway_request.return_value = Mock(status_code=500)
+        request = self.factory.post(
+            "/common/manage_user_account/",
+            {
+                "phone_number": "+921234567890",
+                "name": "Test User",
+                "email": "sms-failure@example.com",
+                "user_type": "user",
+            },
+            format="json",
+        )
+        force_authenticate(request, user=self.admin_user)
+
+        response = CreateMemberProfileView.as_view()(request)
+
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertEqual(
+            response.data.get("message"),
+            "Failed to send OTP. Please try again later.",
+        )
+        self.assertFalse(UserProfile.objects.filter(email="sms-failure@example.com").exists())
+        self.assertEqual(Wallet.objects.count(), 0)
 
 
 class CurrentUserApiV1Tests(APITestCase):
@@ -185,3 +262,55 @@ class CurrentUserApiV1Tests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.wallet.refresh_from_db()
         self.assertEqual(self.wallet.wallet_amount, 3800)
+
+
+class PublicUrlExposureTests(SimpleTestCase):
+    def _reload_urlconf(self):
+        clear_url_caches()
+        return importlib.reload(huz_urls)
+
+    @override_settings(ENABLE_API_DOCS=False, SERVE_MEDIA_AND_STATIC_FROM_DJANGO=False)
+    def test_public_docs_and_asset_routes_are_disabled_by_default(self):
+        self.addCleanup(self._reload_urlconf)
+        module = self._reload_urlconf()
+        routes = {str(pattern.pattern) for pattern in module.urlpatterns}
+
+        self.assertNotIn("huz_swagger/", routes)
+        self.assertNotIn("huz_redoc/", routes)
+        self.assertFalse(any(route.startswith("^media/") for route in routes))
+        self.assertFalse(any(route.startswith("^static/") for route in routes))
+
+    @override_settings(ENABLE_API_DOCS=True, SERVE_MEDIA_AND_STATIC_FROM_DJANGO=True)
+    def test_public_docs_and_asset_routes_can_be_enabled_explicitly(self):
+        self.addCleanup(self._reload_urlconf)
+        module = self._reload_urlconf()
+        routes = {str(pattern.pattern) for pattern in module.urlpatterns}
+
+        self.assertIn("huz_swagger/", routes)
+        self.assertIn("huz_redoc/", routes)
+        self.assertTrue(any(route.startswith("^media/") for route in routes))
+        self.assertTrue(any(route.startswith("^static/") for route in routes))
+
+
+class UserProfileSerializerQueryTests(APITestCase):
+    def test_wallet_amount_uses_prefetched_wallet_relation(self):
+        user = UserProfile.objects.create(
+            session_token=f"wallet-prefetch-session-{uuid4().hex[:8]}",
+            name="Wallet Prefetch User",
+            country_code="+1",
+            phone_number="9998887777",
+            email="wallet-prefetch@example.com",
+            user_type="user",
+        )
+        wallet = Wallet.objects.create(
+            wallet_code=f"wallet-prefetch-{uuid4().hex[:8]}",
+            wallet_amount=3210,
+            wallet_session=user,
+        )
+        prefetched_user = UserProfile.objects.prefetch_related("wallet_session").get(pk=user.pk)
+
+        with CaptureQueriesContext(connection) as queries:
+            data = UserProfileSerializer(prefetched_user).data
+
+        self.assertEqual(len(queries), 0)
+        self.assertEqual(data.get("wallet_amount"), wallet.wallet_amount)

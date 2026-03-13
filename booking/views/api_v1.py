@@ -1,6 +1,7 @@
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from random import randint
+from time import perf_counter
 
 from django.db import transaction
 from rest_framework import status
@@ -9,6 +10,7 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 
+from common.logs_file import logger
 from common.utility import check_file_format_and_size, save_file_in_directory, send_complaint_email
 
 from .bookings import _payload_with_user_session
@@ -19,7 +21,12 @@ from ..request_serializers import (
     PassportValidityUpdateRequestSerializer,
     validate_serializer_or_raise,
 )
-from ..serializers import BookingComplaintsSerializer, BookingRequestSerializer, DetailBookingSerializer
+from ..serializers import (
+    BookingComplaintsSerializer,
+    BookingMutationSerializer,
+    BookingRequestSerializer,
+    DetailBookingSerializer,
+)
 from ..models import BookingComplaints, BookingObjections, BookingRatingAndReview, BookingRequest
 from ..services import (
     get_booking_by_identifier_for_user,
@@ -113,6 +120,7 @@ class BookingViewSet(BaseBookingViewSet):
         )
 
         payload["booking_number"] = booking.booking_number
+        request_started_at = perf_counter()
         if request.method.lower() == "post":
             input_serializer = BookingPaymentCreateRequestSerializer(data=payload)
             validated_data = validate_serializer_or_raise(input_serializer)
@@ -124,8 +132,18 @@ class BookingViewSet(BaseBookingViewSet):
             updated_booking = update_booking_payment(validated_data)
             response_status = status.HTTP_200_OK
 
-        serializer = DetailBookingSerializer(updated_booking, context={"request": request})
-        return Response(serializer.data, status=response_status)
+        serializer_started_at = perf_counter()
+        serializer = BookingMutationSerializer(updated_booking, context={"request": request})
+        response_payload = serializer.data
+        serializer_duration_ms = (perf_counter() - serializer_started_at) * 1000
+        logger.info(
+            "booking.api event=payment_mutation duration_ms=%.2f serializer_duration_ms=%.2f booking_number=%s method=%s",
+            (perf_counter() - request_started_at) * 1000,
+            serializer_duration_ms,
+            updated_booking.booking_number,
+            request.method.lower(),
+        )
+        return Response(response_payload, status=response_status)
 
     @action(detail=True, methods=["post", "put"], url_path="passports")
     def passports(self, request, pk=None):

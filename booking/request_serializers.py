@@ -72,6 +72,11 @@ class DateOrDateTimeField(serializers.Field):
         return value
 
 
+class BookingTravelerBreakdownItemSerializer(serializers.Serializer):
+    traveler_type = serializers.CharField()
+    room_type = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+
 class BookingCreateRequestSerializer(serializers.Serializer):
     session_token = serializers.CharField()
     partner_session_token = serializers.CharField()
@@ -88,6 +93,7 @@ class BookingCreateRequestSerializer(serializers.Serializer):
     start_date = DateOrDateTimeField()
     end_date = DateOrDateTimeField()
     total_price = serializers.FloatField()
+    traveler_breakdown = BookingTravelerBreakdownItemSerializer(many=True)
     special_request = serializers.CharField(allow_blank=True, allow_null=True)
     payment_type = serializers.ChoiceField(choices=[choice[0] for choice in Booking.PAYMENT_TYPE])
 

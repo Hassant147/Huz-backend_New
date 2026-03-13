@@ -1,16 +1,20 @@
 from datetime import timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import random
 from pathlib import Path
+from time import perf_counter
 from uuid import UUID
 from uuid import uuid4
 
 from django.db import IntegrityError, transaction
 from django.core.files.storage import default_storage
-from django.db.models import Q
+from django.db.models import Q, Sum
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.exceptions import APIException
 
+from common.logs_file import logger
 from common.models import UserProfile
 from common.utility import check_file_format_and_size, user_new_booking_email
 from partners.models import HuzBasicDetail, HuzPackageDateRange, PartnerProfile
@@ -37,6 +41,7 @@ from .workflow import (
     PAYMENT_REVIEWABLE_STATUSES,
     booking_allows_client_traveller_updates,
     booking_passports_are_complete,
+    get_booking_payments,
     get_payment_stage_status,
     normalize_booking_status,
     sync_booking_state,
@@ -46,6 +51,56 @@ PAYMENT_STAGE_ALIASES = {
     "full": "Full",
     "minimum": "Minimum",
     "min": "Minimum",
+}
+BOOKING_NUMBER_RETRY_ATTEMPTS = 5
+CURRENCY_QUANTUM = Decimal("0.01")
+MINIMUM_PAYMENT_RATE = Decimal("0.10")
+MINIMUM_PAYMENT_FLOOR = Decimal("1.00")
+TRAVELER_TYPE_ADULT = "Adult"
+TRAVELER_TYPE_CHILD_WITH_BED = "Child (5-11)"
+TRAVELER_TYPE_CHILD_NO_BED = "Child (2-5)"
+TRAVELER_TYPE_INFANT = "Infant"
+TRAVELER_TYPE_ALIASES = {
+    "adult": TRAVELER_TYPE_ADULT,
+    "child (5-11)": TRAVELER_TYPE_CHILD_WITH_BED,
+    "child 5-11": TRAVELER_TYPE_CHILD_WITH_BED,
+    "child_5_11": TRAVELER_TYPE_CHILD_WITH_BED,
+    "child_with_bed": TRAVELER_TYPE_CHILD_WITH_BED,
+    "child (2-5)": TRAVELER_TYPE_CHILD_NO_BED,
+    "child 2-5": TRAVELER_TYPE_CHILD_NO_BED,
+    "child_2_5": TRAVELER_TYPE_CHILD_NO_BED,
+    "child_no_bed": TRAVELER_TYPE_CHILD_NO_BED,
+    "infant": TRAVELER_TYPE_INFANT,
+}
+ROOM_TYPE_SINGLE = "Single(1 bed)"
+ROOM_TYPE_DOUBLE = "Double(2 bed)"
+ROOM_TYPE_TRIPLE = "Triple(3 bed)"
+ROOM_TYPE_QUAD = "Quad(4 bed)"
+ROOM_TYPE_SHARING = "Sharing"
+ROOM_TYPE_ALIASES = {
+    "single": ROOM_TYPE_SINGLE,
+    "single(1 bed)": ROOM_TYPE_SINGLE,
+    "double": ROOM_TYPE_DOUBLE,
+    "double(2 bed)": ROOM_TYPE_DOUBLE,
+    "triple": ROOM_TYPE_TRIPLE,
+    "triple(3 bed)": ROOM_TYPE_TRIPLE,
+    "quad": ROOM_TYPE_QUAD,
+    "quad(4 bed)": ROOM_TYPE_QUAD,
+    "sharing": ROOM_TYPE_SHARING,
+}
+ROOM_PRICE_FIELDS = {
+    ROOM_TYPE_SINGLE: "cost_for_single",
+    ROOM_TYPE_DOUBLE: "cost_for_double",
+    ROOM_TYPE_TRIPLE: "cost_for_triple",
+    ROOM_TYPE_QUAD: "cost_for_quad",
+    ROOM_TYPE_SHARING: "cost_for_sharing",
+}
+ROOM_COUNT_FIELDS = {
+    ROOM_TYPE_SINGLE: "single",
+    ROOM_TYPE_DOUBLE: "double",
+    ROOM_TYPE_TRIPLE: "triple",
+    ROOM_TYPE_QUAD: "quad",
+    ROOM_TYPE_SHARING: "sharing",
 }
 
 
@@ -57,6 +112,261 @@ class BookingServiceError(APIException):
         if status_code is not None:
             self.status_code = status_code
         super().__init__({"message": detail or self.default_detail})
+
+
+def _format_performance_context(context):
+    parts = []
+    for key, value in context.items():
+        if value in (None, ""):
+            continue
+        parts.append(f"{key}={value}")
+    return " ".join(parts)
+
+
+def _log_booking_performance(event, started_at, **context):
+    logger.info(
+        "booking.performance event=%s duration_ms=%.2f %s",
+        event,
+        (perf_counter() - started_at) * 1000,
+        _format_performance_context(context),
+    )
+
+
+def _quantize_amount(value):
+    return Decimal(value).quantize(CURRENCY_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+def _to_decimal_amount(value, *, field_name="amount"):
+    try:
+        parsed_value = Decimal(str(value or 0))
+    except (InvalidOperation, TypeError, ValueError):
+        raise BookingServiceError(
+            f"{field_name} must be a valid amount.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    return _quantize_amount(parsed_value)
+
+
+def _format_amount_for_message(value):
+    normalized_amount = _quantize_amount(value)
+    if normalized_amount == normalized_amount.to_integral():
+        return str(normalized_amount.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    return f"{normalized_amount:.2f}"
+
+
+def _amounts_match(left, right):
+    return _quantize_amount(left) == _quantize_amount(right)
+
+
+def _normalize_traveler_type(value):
+    return TRAVELER_TYPE_ALIASES.get(str(value or "").strip().lower(), "")
+
+
+def _normalize_room_type(value):
+    normalized_value = str(value or "").strip().lower()
+    if not normalized_value:
+        return ""
+    return ROOM_TYPE_ALIASES.get(normalized_value, "")
+
+
+def _normalize_room_count(value, *, field_name):
+    try:
+        normalized_value = int(str(value or 0).strip())
+    except (TypeError, ValueError):
+        raise BookingServiceError(
+            f"{field_name} must be a valid whole number.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if normalized_value < 0:
+        raise BookingServiceError(
+            f"{field_name} cannot be negative.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    return normalized_value
+
+
+def _derive_booking_commercials(package, traveler_breakdown):
+    if not isinstance(traveler_breakdown, list) or not traveler_breakdown:
+        raise BookingServiceError(
+            "traveler_breakdown must include at least one traveler.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    room_prices = {
+        room_type: _to_decimal_amount(getattr(package, field_name, 0), field_name=field_name)
+        for room_type, field_name in ROOM_PRICE_FIELDS.items()
+    }
+    child_no_bed_price = _to_decimal_amount(
+        getattr(package, "cost_for_child", 0),
+        field_name="cost_for_child",
+    )
+    infant_price = _to_decimal_amount(
+        getattr(package, "cost_for_infants", 0),
+        field_name="cost_for_infants",
+    )
+    child_with_bed_discount = _to_decimal_amount(
+        getattr(package, "discount_if_child_with_bed", 0),
+        field_name="discount_if_child_with_bed",
+    )
+
+    summary = {
+        "adults": 0,
+        "child": 0,
+        "infants": 0,
+        "sharing": 0,
+        "quad": 0,
+        "triple": 0,
+        "double": 0,
+        "single": 0,
+        "traveller_count": 0,
+        "total_price": Decimal("0.00"),
+    }
+
+    for index, traveler in enumerate(traveler_breakdown, start=1):
+        traveler_type = _normalize_traveler_type(traveler.get("traveler_type"))
+        raw_room_type = traveler.get("room_type")
+        room_type = _normalize_room_type(raw_room_type)
+
+        if not traveler_type:
+            raise BookingServiceError(
+                f"traveler_breakdown[{index}] has an unsupported traveler_type.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        if str(raw_room_type or "").strip() and not room_type:
+            raise BookingServiceError(
+                f"traveler_breakdown[{index}] has an unsupported room_type.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+
+        summary["traveller_count"] += 1
+
+        if traveler_type == TRAVELER_TYPE_ADULT:
+            if not room_type:
+                raise BookingServiceError(
+                    f"traveler_breakdown[{index}] requires a room_type for adults.",
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                )
+            summary["adults"] += 1
+            summary[ROOM_COUNT_FIELDS[room_type]] += 1
+            summary["total_price"] += room_prices[room_type]
+            continue
+
+        if traveler_type == TRAVELER_TYPE_CHILD_WITH_BED:
+            if not room_type:
+                raise BookingServiceError(
+                    f"traveler_breakdown[{index}] requires a room_type for children with bed.",
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                )
+            summary["child"] += 1
+            summary[ROOM_COUNT_FIELDS[room_type]] += 1
+            summary["total_price"] += max(
+                room_prices[room_type] - child_with_bed_discount,
+                Decimal("0.00"),
+            )
+            continue
+
+        if room_type:
+            raise BookingServiceError(
+                f"traveler_breakdown[{index}] must not set room_type for no-bed travelers.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if traveler_type == TRAVELER_TYPE_CHILD_NO_BED:
+            summary["child"] += 1
+            summary["total_price"] += child_no_bed_price
+            continue
+
+        summary["infants"] += 1
+        summary["total_price"] += infant_price
+
+    if summary["traveller_count"] <= 0:
+        raise BookingServiceError(
+            "At least one traveller is required to create a booking.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    summary["total_price"] = _quantize_amount(summary["total_price"])
+    return summary
+
+
+def _validate_booking_breakdown_matches_request(validated_data, derived_summary):
+    for field_name in ("adults", "child", "infants"):
+        submitted_value = _get_non_negative_traveller_count(validated_data, field_name)
+        if submitted_value != derived_summary[field_name]:
+            raise BookingServiceError(
+                "Booking traveller summary does not match the submitted traveler breakdown.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+
+    for field_name in ("sharing", "quad", "triple", "double", "single"):
+        submitted_value = _normalize_room_count(validated_data.get(field_name), field_name=field_name)
+        if submitted_value != derived_summary[field_name]:
+            raise BookingServiceError(
+                "Booking room allocation does not match the submitted traveler breakdown.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+
+    submitted_total_price = _to_decimal_amount(validated_data.get("total_price"), field_name="total_price")
+    if not _amounts_match(submitted_total_price, derived_summary["total_price"]):
+        raise BookingServiceError(
+            "Submitted total_price does not match the server-calculated booking total.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+
+def get_total_approved_payment_amount_decimal(booking, *, exclude_payment_id=None):
+    total_amount = Decimal("0.00")
+    excluded_payment_id = str(exclude_payment_id or "").strip()
+
+    for payment in get_booking_payments(booking):
+        if excluded_payment_id and str(getattr(payment, "payment_id", "")) == excluded_payment_id:
+            continue
+        if _is_payment_approved(payment):
+            total_amount += _to_decimal_amount(
+                getattr(payment, "transaction_amount", 0),
+                field_name="transaction_amount",
+            )
+
+    return _quantize_amount(total_amount)
+
+
+def get_expected_payment_amount(booking, payment_stage, *, exclude_payment_id=None):
+    normalized_stage = _normalize_payment_stage(payment_stage)
+    total_price = _to_decimal_amount(getattr(booking, "total_price", 0), field_name="total_price")
+
+    if normalized_stage == "Minimum":
+        return max(_quantize_amount(total_price * MINIMUM_PAYMENT_RATE), MINIMUM_PAYMENT_FLOOR)
+
+    approved_amount = get_total_approved_payment_amount_decimal(
+        booking,
+        exclude_payment_id=exclude_payment_id,
+    )
+    remaining_amount = total_price - approved_amount
+    if remaining_amount < Decimal("0.00"):
+        remaining_amount = Decimal("0.00")
+    return _quantize_amount(remaining_amount)
+
+
+def validate_booking_payment_amount(booking, payment_stage, transaction_amount, *, exclude_payment_id=None):
+    normalized_stage = _normalize_payment_stage(payment_stage)
+    submitted_amount = _to_decimal_amount(transaction_amount, field_name="transaction_amount")
+    expected_amount = get_expected_payment_amount(
+        booking,
+        normalized_stage,
+        exclude_payment_id=exclude_payment_id,
+    )
+
+    if not _amounts_match(submitted_amount, expected_amount):
+        stage_label = "minimum" if normalized_stage == "Minimum" else "full"
+        raise BookingServiceError(
+            f"{stage_label.capitalize()} payment amount must be {_format_amount_for_message(expected_amount)} for this booking.",
+            status_code=status.HTTP_409_CONFLICT,
+        )
+
+    return float(submitted_amount)
 
 
 def _get_user_by_session_token(session_token):
@@ -246,9 +556,15 @@ def _validate_booking_window_is_open(
 
 
 def _count_travellers_for_queryset(queryset):
-    return sum(
-        (int(adults or 0) + int(child or 0) + int(infants or 0))
-        for adults, child, infants in queryset.values_list("adults", "child", "infants")
+    totals = queryset.aggregate(
+        adults_total=Coalesce(Sum("adults"), 0),
+        child_total=Coalesce(Sum("child"), 0),
+        infants_total=Coalesce(Sum("infants"), 0),
+    )
+    return (
+        int(totals.get("adults_total") or 0)
+        + int(totals.get("child_total") or 0)
+        + int(totals.get("infants_total") or 0)
     )
 
 
@@ -372,8 +688,8 @@ def _get_payment_stage_queryset(booking, payment_stage, *, lock_for_update=False
     return queryset
 
 
-def _update_booking_status_for_passport_progress(booking):
-    return sync_booking_state(booking, save=True)
+def _update_booking_status_for_passport_progress(user_profile, booking):
+    return _reload_booking_detail_for_user(user_profile, sync_booking_state(booking, save=True))
 
 
 def _booking_passports_are_complete(booking):
@@ -382,6 +698,11 @@ def _booking_passports_are_complete(booking):
 
 def _attach_passport_files(passport, validated_data):
     update_fields = []
+    booking_number = getattr(
+        getattr(passport, "passport_for_booking_number", None),
+        "booking_number",
+        "",
+    )
 
     for field_name in ("user_passport", "user_photo"):
         uploaded_file = validated_data.get(field_name)
@@ -396,7 +717,15 @@ def _attach_passport_files(passport, validated_data):
 
         extension = Path(uploaded_file.name).suffix.lower()
         safe_name = f"passport_uploads/{uuid4().hex}{extension}"
+        file_save_started_at = perf_counter()
         stored_path = default_storage.save(safe_name, uploaded_file)
+        _log_booking_performance(
+            "passport_file_save",
+            file_save_started_at,
+            booking_number=booking_number,
+            field_name=field_name,
+            size_bytes=getattr(uploaded_file, "size", 0),
+        )
         existing_file = getattr(passport, field_name, None)
         if passport.pk and existing_file:
             existing_file.delete(save=False)
@@ -472,6 +801,12 @@ def _upsert_payment_record(
         transaction_number,
         payment_id=getattr(payment, "payment_id", None),
     )
+    validated_transaction_amount = validate_booking_payment_amount(
+        booking,
+        payment_stage,
+        transaction_amount,
+        exclude_payment_id=getattr(payment, "payment_id", None),
+    )
 
     update_fields = [
         "transaction_number",
@@ -484,7 +819,7 @@ def _upsert_payment_record(
     if payment:
         payment.transaction_number = normalized_transaction_number or payment.transaction_number
         payment.transaction_type = payment_stage
-        payment.transaction_amount = transaction_amount
+        payment.transaction_amount = validated_transaction_amount
         payment.payment_status = PAYMENT_STATUS_UNDER_REVIEW
         payment.review_message = None
         payment.transaction_time = timezone.now()
@@ -492,7 +827,7 @@ def _upsert_payment_record(
         payment = Payment(
             transaction_number=normalized_transaction_number or None,
             transaction_type=payment_stage,
-            transaction_amount=transaction_amount,
+            transaction_amount=validated_transaction_amount,
             payment_status=PAYMENT_STATUS_UNDER_REVIEW,
             review_message=None,
             booking_token=booking,
@@ -501,7 +836,15 @@ def _upsert_payment_record(
     if uploaded_file is not None:
         extension = Path(uploaded_file.name).suffix.lower()
         safe_name = f"payment_uploads/{uuid4().hex}{extension}"
+        file_save_started_at = perf_counter()
         stored_path = default_storage.save(safe_name, uploaded_file)
+        _log_booking_performance(
+            "payment_file_save",
+            file_save_started_at,
+            booking_number=getattr(booking, "booking_number", ""),
+            payment_stage=payment_stage,
+            size_bytes=getattr(uploaded_file, "size", 0),
+        )
         if payment.pk and payment.transaction_photo:
             payment.transaction_photo.delete(save=False)
         payment.transaction_photo = stored_path
@@ -530,6 +873,7 @@ def get_booking_by_identifier_for_user(
     must_be_future=False,
     lock_for_update=False,
     persist_state=False,
+    include_detail_relations=False,
 ):
     lookup = Q(booking_number=str(identifier))
     try:
@@ -537,7 +881,10 @@ def get_booking_by_identifier_for_user(
     except (TypeError, ValueError):
         pass
 
-    queryset = Booking.objects.filter(order_by=user_profile).filter(lookup)
+    if include_detail_relations:
+        queryset = _get_user_booking_detail_queryset(user_profile).filter(lookup)
+    else:
+        queryset = Booking.objects.filter(order_by=user_profile).filter(lookup)
     if lock_for_update:
         queryset = queryset.select_for_update()
     if must_be_future:
@@ -600,6 +947,35 @@ def generate_unique_booking_number():
             return booking_number
 
 
+def _is_booking_number_collision(exc):
+    normalized_message = str(exc).lower()
+    return "booking_number" in normalized_message and (
+        "duplicate" in normalized_message or "unique" in normalized_message
+    )
+
+
+def _get_user_booking_detail_queryset(user_profile):
+    return get_partner_bookings_queryset(include_detail_relations=True).filter(order_by=user_profile)
+
+
+def _get_user_booking_mutation_queryset(user_profile):
+    return (
+        Booking.objects.select_related("order_by", "order_to", "package_token")
+        .prefetch_related("order_to__company_of_partner", "booking_token")
+        .filter(order_by=user_profile)
+    )
+
+
+def _reload_booking_detail_for_user(user_profile, booking):
+    detailed_booking = _get_user_booking_detail_queryset(user_profile).filter(pk=booking.pk).first()
+    return detailed_booking or booking
+
+
+def _reload_booking_mutation_for_user(user_profile, booking):
+    summarized_booking = _get_user_booking_mutation_queryset(user_profile).filter(pk=booking.pk).first()
+    return summarized_booking or booking
+
+
 def get_user_bookings_queryset(user_profile):
     return (
         get_partner_bookings_queryset(include_detail_relations=False)
@@ -648,8 +1024,13 @@ def create_booking(validated_data):
     partner = _get_partner_by_session_token(validated_data["partner_session_token"])
     package = _get_package_by_huz_token(validated_data["huz_token"])
     _validate_package_partner(package, partner)
+    derived_booking_summary = _derive_booking_commercials(
+        package,
+        validated_data.get("traveler_breakdown") or [],
+    )
+    _validate_booking_breakdown_matches_request(validated_data, derived_booking_summary)
 
-    requested_traveller_count = _get_requested_traveller_count(validated_data)
+    requested_traveller_count = derived_booking_summary["traveller_count"]
     package_date_range = _resolve_package_date_range(
         package,
         start_date=validated_data["start_date"],
@@ -670,17 +1051,17 @@ def create_booking(validated_data):
     )
 
     booking_fields = {
-        "adults": validated_data["adults"],
-        "child": validated_data.get("child", 0),
-        "infants": validated_data.get("infants", 0),
-        "sharing": validated_data["sharing"],
-        "quad": validated_data["quad"],
-        "triple": validated_data["triple"],
-        "double": validated_data["double"],
-        "single": validated_data["single"],
+        "adults": derived_booking_summary["adults"],
+        "child": derived_booking_summary["child"],
+        "infants": derived_booking_summary["infants"],
+        "sharing": str(derived_booking_summary["sharing"]),
+        "quad": str(derived_booking_summary["quad"]),
+        "triple": str(derived_booking_summary["triple"]),
+        "double": str(derived_booking_summary["double"]),
+        "single": str(derived_booking_summary["single"]),
         "start_date": canonical_start_date,
         "end_date": canonical_end_date,
-        "total_price": validated_data["total_price"],
+        "total_price": float(derived_booking_summary["total_price"]),
         "special_request": validated_data.get("special_request"),
         "booking_status": BOOKING_STATUS_HOLD,
         "hold_expires_at": timezone.now() + timedelta(minutes=15),
@@ -724,7 +1105,10 @@ def create_booking(validated_data):
                     resumable_booking.save(update_fields=updated_fields)
 
             DocumentsStatus.objects.get_or_create(status_for_booking=resumable_booking)
-            return sync_booking_state(resumable_booking, save=True), False
+            return _reload_booking_mutation_for_user(
+                user,
+                sync_booking_state(resumable_booking, save=True),
+            ), False
 
         _validate_package_range_capacity(
             package=package,
@@ -734,12 +1118,29 @@ def create_booking(validated_data):
             requested_traveller_count=requested_traveller_count,
         )
 
-        booking = Booking.objects.create(
-            booking_number=generate_unique_booking_number(),
-            **booking_fields,
-        )
+        booking = None
+        last_collision_error = None
+        for _ in range(BOOKING_NUMBER_RETRY_ATTEMPTS):
+            try:
+                with transaction.atomic():
+                    booking = Booking.objects.create(
+                        booking_number=generate_unique_booking_number(),
+                        **booking_fields,
+                    )
+                break
+            except IntegrityError as exc:
+                if not _is_booking_number_collision(exc):
+                    raise
+                last_collision_error = exc
+
+        if booking is None:
+            raise BookingServiceError(
+                "Unable to generate a unique booking number. Please try again.",
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            ) from last_collision_error
+
         DocumentsStatus.objects.get_or_create(status_for_booking=booking)
-        return sync_booking_state(booking, save=True), True
+        return _reload_booking_mutation_for_user(user, sync_booking_state(booking, save=True)), True
 
 
 def record_booking_payment(validated_data):
@@ -770,26 +1171,35 @@ def record_booking_payment(validated_data):
         sync_booking_state(booking, save=True)
 
         if not has_existing_payment:
-            user_new_booking_email(
-                user.email,
-                user.name,
-                package.package_type,
-                package.package_name,
-                booking.booking_number,
-                booking.adults,
-                booking.child,
-                booking.infants,
-                booking.start_date,
-                booking.total_price,
-                validated_data["transaction_amount"],
-            )
+            email_started_at = perf_counter()
+            try:
+                user_new_booking_email(
+                    user.email,
+                    user.name,
+                    package.package_type,
+                    package.package_name,
+                    booking.booking_number,
+                    booking.adults,
+                    booking.child,
+                    booking.infants,
+                    booking.start_date,
+                    booking.total_price,
+                    validated_data["transaction_amount"],
+                )
+            finally:
+                _log_booking_performance(
+                    "user_new_booking_email",
+                    email_started_at,
+                    booking_number=booking.booking_number,
+                    payment_stage=payment_stage,
+                )
 
-        return sync_booking_state(booking, save=True)
+        return _reload_booking_mutation_for_user(user, sync_booking_state(booking, save=True))
 
 
 def update_booking_payment(validated_data):
     with transaction.atomic():
-        _, booking = _get_booking_for_user(
+        user, booking = _get_booking_for_user(
             validated_data["session_token"],
             validated_data["booking_number"],
             must_be_future=False,
@@ -807,7 +1217,7 @@ def update_booking_payment(validated_data):
         booking.hold_expires_at = None
         booking.payment_correction_expires_at = None
         booking.save(update_fields=["hold_expires_at", "payment_correction_expires_at"])
-        return sync_booking_state(booking, save=True)
+        return _reload_booking_mutation_for_user(user, sync_booking_state(booking, save=True))
 
 
 def record_booking_payment_photo_uploads(validated_data, files):
@@ -838,26 +1248,35 @@ def record_booking_payment_photo_uploads(validated_data, files):
         sync_booking_state(booking, save=True)
 
         if not has_existing_payment:
-            user_new_booking_email(
-                user.email,
-                user.name,
-                package.package_type,
-                package.package_name,
-                booking.booking_number,
-                booking.adults,
-                booking.child,
-                booking.infants,
-                booking.start_date,
-                booking.total_price,
-                validated_data["transaction_amount"],
-            )
+            email_started_at = perf_counter()
+            try:
+                user_new_booking_email(
+                    user.email,
+                    user.name,
+                    package.package_type,
+                    package.package_name,
+                    booking.booking_number,
+                    booking.adults,
+                    booking.child,
+                    booking.infants,
+                    booking.start_date,
+                    booking.total_price,
+                    validated_data["transaction_amount"],
+                )
+            finally:
+                _log_booking_performance(
+                    "user_new_booking_email",
+                    email_started_at,
+                    booking_number=booking.booking_number,
+                    payment_stage=payment_stage,
+                )
 
-        return sync_booking_state(booking, save=True)
+        return _reload_booking_mutation_for_user(user, sync_booking_state(booking, save=True))
 
 
 def validate_passport(validated_data):
     with transaction.atomic():
-        _, booking = _get_booking_for_user(
+        user, booking = _get_booking_for_user(
             validated_data["session_token"],
             validated_data["booking_number"],
             must_be_future=False,
@@ -917,12 +1336,12 @@ def validate_passport(validated_data):
         else:
             passport.save()
 
-        return _update_booking_status_for_passport_progress(booking)
+        return _update_booking_status_for_passport_progress(user, booking)
 
 
 def update_passport_validation(validated_data):
     with transaction.atomic():
-        _, booking = _get_booking_for_user(
+        user, booking = _get_booking_for_user(
             validated_data["session_token"],
             validated_data["booking_number"],
             must_be_future=False,
@@ -976,4 +1395,4 @@ def update_passport_validation(validated_data):
                 *upload_fields,
             ]
         )
-        return _update_booking_status_for_passport_progress(booking)
+        return _update_booking_status_for_passport_progress(user, booking)

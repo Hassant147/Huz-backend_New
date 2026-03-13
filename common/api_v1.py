@@ -234,8 +234,7 @@ class CurrentUserWalletWithdrawalsView(APIView):
 
         backup_str = (
             f"Name: {user.name}, "
-            f"Phone Number: {(user.country_code, user.phone_number)}, "
-            f"Session Token: {user.session_token}, "
+            f"Phone Number: {user.country_code}{user.phone_number}, "
             f"Bank Account #: {bank_detail.account_number}, "
             f"Account Title: {bank_detail.account_title}, "
             f"Bank Name: {bank_detail.bank_name}"

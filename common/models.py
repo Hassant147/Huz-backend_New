@@ -22,14 +22,6 @@ class UserOTP(models.Model):
         return str(self.otp_id)
 
 
-class SubscribeUser(models.Model):
-    sub_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    email = models.CharField(max_length=50)
-
-    def __str__(self):
-        return self.email
-
-
 class UserProfile(models.Model):
     # Choices for gender with additional options
     GENDER_CHOICES = [

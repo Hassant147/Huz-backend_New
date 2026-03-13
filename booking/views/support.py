@@ -14,8 +14,19 @@ class CurrentUserComplaintListView(APIView):
 
     def get(self, request):
         user = require_user_profile(request)
-        complaints = BookingComplaints.objects.filter(complaint_by_user=user).order_by(
-            "-complaint_time"
+        complaints = (
+            BookingComplaints.objects.select_related(
+                "complaint_by_user",
+                "complaint_for_partner",
+                "complaint_for_package",
+                "complaint_for_booking",
+            )
+            .prefetch_related(
+                "complaint_by_user__mailing_session",
+                "complaint_for_partner__company_of_partner",
+            )
+            .filter(complaint_by_user=user)
+            .order_by("-complaint_time")
         )
         serializer = BookingComplaintsSerializer(complaints, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
@@ -26,6 +37,19 @@ class CurrentUserRequestListView(APIView):
 
     def get(self, request):
         user = require_user_profile(request)
-        requests = BookingRequest.objects.filter(request_by_user=user).order_by("-created_at")
+        requests = (
+            BookingRequest.objects.select_related(
+                "request_by_user",
+                "request_for_partner",
+                "request_for_package",
+                "request_for_booking",
+            )
+            .prefetch_related(
+                "request_by_user__mailing_session",
+                "request_for_partner__company_of_partner",
+            )
+            .filter(request_by_user=user)
+            .order_by("-created_at")
+        )
         serializer = BookingRequestSerializer(requests, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)

@@ -4,7 +4,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal
 from common.authentication import (
     get_authenticated_partner_profile,
     is_authenticated_staff_user,
@@ -18,7 +18,6 @@ from partners.models import PartnerProfile, HuzBasicDetail
 from .models import Booking, BookingObjections, PassportValidity, DocumentsStatus, BookingDocuments, PartnersBookingPayment, BookingRatingAndReview, BookingComplaints, BookingAirlineDetail, BookingHotelAndTransport
 from .querysets import (
     annotate_effective_booking_status,
-    apply_partner_visibility_filter,
     build_partner_workflow_bucket_q,
     filter_partner_booking_queryset,
 )
@@ -133,8 +132,11 @@ COMPLETE_BOOKING_STATUS_FLAGS = (
 BOOKING_LIST_SELECT_RELATED = ("order_by", "order_to", "package_token")
 BOOKING_LIST_PREFETCH_RELATED = (
     "order_by__mailing_session",
+    "order_to__company_of_partner",
     "passport_for_booking_number",
     "booking_token",
+    "package_token__airline_for_package",
+    "package_token__transport_for_package",
 )
 BOOKING_STATS_PREFETCH_RELATED = (
     "passport_for_booking_number",
@@ -231,29 +233,23 @@ def normalize_complaint_status(value):
     return COMPLAINT_STATUS_NORMALIZER.get(normalized, "")
 
 
-def normalize_star_bucket(value):
-    try:
-        parsed_value = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-
-    if parsed_value < Decimal("1") or parsed_value > Decimal("5"):
-        return None
-
-    rounded = int(parsed_value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-    return max(1, min(5, rounded))
-
-
 def build_star_distribution(queryset, key_prefix):
-    distribution = {f"{key_prefix}_{star}": 0 for star in range(5, 0, -1)}
+    aggregate_keys = {}
+    aggregate_filters = (
+        (5, Q(partner_total_stars__gte=Decimal("4.5"), partner_total_stars__lte=Decimal("5.0"))),
+        (4, Q(partner_total_stars__gte=Decimal("3.5"), partner_total_stars__lt=Decimal("4.5"))),
+        (3, Q(partner_total_stars__gte=Decimal("2.5"), partner_total_stars__lt=Decimal("3.5"))),
+        (2, Q(partner_total_stars__gte=Decimal("1.5"), partner_total_stars__lt=Decimal("2.5"))),
+        (1, Q(partner_total_stars__gte=Decimal("1.0"), partner_total_stars__lt=Decimal("1.5"))),
+    )
+    for star, rating_filter in aggregate_filters:
+        aggregate_keys[f"star_{star}"] = Count("pk", filter=rating_filter)
 
-    for raw_star in queryset.values_list("partner_total_stars", flat=True):
-        normalized_star = normalize_star_bucket(raw_star)
-        if not normalized_star:
-            continue
-        distribution[f"{key_prefix}_{normalized_star}"] += 1
-
-    return distribution
+    aggregated_counts = queryset.aggregate(**aggregate_keys)
+    return {
+        f"{key_prefix}_{star}": int(aggregated_counts.get(f"star_{star}") or 0)
+        for star in range(5, 0, -1)
+    }
 
 
 def finalize_booking_if_all_documents_completed(booking_detail, doc, package_detail, partner):
@@ -1138,7 +1134,13 @@ class GetRatingPackageWiseView(APIView):
                 return Response({"message": "Package detail not found for the provided detail."}, status=status.HTTP_404_NOT_FOUND)
 
             # Retrieve ratings for the package
-            check_rating = BookingRatingAndReview.objects.filter(rating_for_package=package_detail)
+            check_rating = BookingRatingAndReview.objects.select_related(
+                "rating_by_user"
+            ).prefetch_related(
+                "rating_by_user__mailing_session"
+            ).filter(
+                rating_for_package=package_detail
+            )
 
             if check_rating.exists():
                 serialized_bookings = PartnerRatingSerializer(check_rating, many=True)
@@ -1325,6 +1327,10 @@ class GetPartnerComplaintsView(APIView):
                     'complaint_for_package',
                     'complaint_for_partner',
                 )
+                .prefetch_related(
+                    'complaint_by_user__mailing_session',
+                    'complaint_for_partner__company_of_partner',
+                )
                 .filter(complaint_for_partner=user)
                 .order_by('-complaint_time')
             )
@@ -1490,29 +1496,33 @@ class GetPartnersOverallBookingStatisticsView(APIView):
             bookings_queryset = annotate_effective_booking_status(
                 Booking.objects.filter(order_to=user)
             )
+            status_aliases = {
+                f"status_{index}": status_name
+                for index, (status_name, _) in enumerate(BOOKING_STATUS_CHOICES)
+            }
+            workflow_bucket_aliases = {
+                f"workflow_bucket_{index}": workflow_bucket
+                for index, workflow_bucket in enumerate(sorted(WORKFLOW_BUCKET_CHOICES))
+            }
+            aggregate_kwargs = {
+                alias: Count("pk", filter=Q(effective_booking_status=status_name))
+                for alias, status_name in status_aliases.items()
+            }
+            aggregate_kwargs.update(
+                {
+                    alias: Count("pk", filter=build_partner_workflow_bucket_q(workflow_bucket))
+                    for alias, workflow_bucket in workflow_bucket_aliases.items()
+                }
+            )
+            aggregate_counts = bookings_queryset.aggregate(**aggregate_kwargs)
             booking_status_counts = {
-                status_name: 0 for status_name, _ in BOOKING_STATUS_CHOICES
+                status_name: int(aggregate_counts.get(alias) or 0)
+                for alias, status_name in status_aliases.items()
             }
             workflow_bucket_counts = {
-                workflow_bucket: 0 for workflow_bucket in WORKFLOW_BUCKET_CHOICES
+                workflow_bucket: int(aggregate_counts.get(alias) or 0)
+                for alias, workflow_bucket in workflow_bucket_aliases.items()
             }
-
-            for status_row in (
-                bookings_queryset.values("effective_booking_status")
-                .annotate(total=Count("pk"))
-            ):
-                normalized_status = normalize_booking_status(status_row.get("effective_booking_status"))
-                if normalized_status:
-                    booking_status_counts[normalized_status] = status_row.get("total", 0)
-
-            visible_queryset = apply_partner_visibility_filter(
-                bookings_queryset,
-                allow_hidden=False,
-            )
-            for workflow_bucket in WORKFLOW_BUCKET_CHOICES:
-                workflow_bucket_counts[workflow_bucket] = visible_queryset.filter(
-                    build_partner_workflow_bucket_q(workflow_bucket)
-                ).count()
 
             return Response(
                 {

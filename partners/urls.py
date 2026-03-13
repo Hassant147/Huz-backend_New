@@ -1,10 +1,9 @@
-from django.urls import path, re_path
+from django.urls import path
 from . import (
     forgot_password,
     package_management,
     partner_accounts_and_transactions,
     partner_profile,
-    views,
 )
 from .views import operator_packages
 
@@ -45,7 +44,6 @@ urlpatterns = [
     # For Website only
     path('get_package_short_detail_for_web/', package_management.GetHuzShortPackageForWebsiteView.as_view()),
     path('get_package_detail_by_package_id_for_web/', package_management.GetHuzPackageDetailForWebsiteView.as_view()),
-    path('get_city_wise_packages_count/', package_management.GetPackageCountCitiesWiseForWebsiteView.as_view()),
     path('get_featured_packages/', package_management.GetHuzFeaturedPackageForWebsiteView.as_view()),
     path('get_package_detail_by_city_and_date/', package_management.GetSearchPackageByCityNDateView.as_view()),
 
@@ -54,16 +52,4 @@ urlpatterns = [
     path('manage_partner_withdraw_request/', partner_accounts_and_transactions.ManagePartnerWithdrawView.as_view()),
     path('get_partner_all_transaction_history/', partner_accounts_and_transactions.GetPartnerAllTransactionHistoryView.as_view()),
     path('get_partner_over_transaction_amount/', partner_accounts_and_transactions.GetPartnerTransactionOverallSummaryView.as_view()),
-
-
-    # path('partner_swagger/', schema_view.with_ui('swagger', cache_timeout=0), name='schema-swagger-ui'),
-    # path('partner_redoc/', schema_view.with_ui('redoc', cache_timeout=0), name='schema-redoc'),
-    # re_path(r'^swagger(?P<format>\.json|\.yaml)$', schema_view.without_ui(cache_timeout=0), name='schema-json'),
 ]
-
-# Include schema view for partner app
-# schema_url_patterns_partner = [
-#     path('swagger/', views.schema_view_partner.with_ui('swagger', cache_timeout=0), name='schema-swagger-ui-partner'),
-# ]
-#
-# urlpatterns += schema_url_patterns_partner  # Append schema URLs for partner app

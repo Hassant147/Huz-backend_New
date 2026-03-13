@@ -244,8 +244,7 @@ class ManagePartnerWithdrawView(APIView):
                 return Response({"message": "Insufficient wallet balance for withdrawal request."}, status=status.HTTP_409_CONFLICT)
 
             backup_str = (f"Name: {user.name}, "
-                          f"Phone Number: {user.country_code, user.phone_number}, "
-                          f"Partner Session Token: {user.partner_session_token}, "
+                          f"Phone Number: {user.country_code}{user.phone_number}, "
                           f"Bank Account #: {bank_detail.account_number}, "
                           f"Account Title: {bank_detail.account_title}, "
                           f"Bank Name: {bank_detail.bank_name}")
@@ -257,7 +256,6 @@ class ManagePartnerWithdrawView(APIView):
             data['withdraw_status'] = "Pending"
             data['withdraw_backup_detail'] = backup_str
 
-            print(data)
             # Serialize and save withdrawal request in a transaction
             serializer = PartnerWithdrawSerializer(data=data)
             if serializer.is_valid():

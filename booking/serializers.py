@@ -2,7 +2,7 @@ from datetime import datetime
 
 from django.utils import timezone
 from rest_framework import serializers
-from .models import CustomPackages, Booking, Payment, BookingRequest, PassportValidity, BookingObjections, PartnersBookingPayment, BookingDocuments, DocumentsStatus, BookingAirlineDetail, BookingHotelAndTransport, BookingRatingAndReview, BookingComplaints, UserRequiredDocuments
+from .models import Booking, Payment, BookingRequest, PassportValidity, BookingObjections, PartnersBookingPayment, BookingDocuments, DocumentsStatus, BookingAirlineDetail, BookingHotelAndTransport, BookingRatingAndReview, BookingComplaints, UserRequiredDocuments
 from common.models import UserProfile, MailingDetail
 from common.serializers import MailingDetailSerializer
 from partners.models import PartnerProfile, HuzBasicDetail, BusinessProfile, PartnerMailingDetail, HuzAirlineDetail
@@ -57,6 +57,34 @@ def _list_related_items(instance, relation_name):
 def _get_first_related_item(instance, relation_name):
     related_items = _list_related_items(instance, relation_name)
     return related_items[0] if related_items else None
+
+
+def _serialize_user_mailing_detail(user):
+    if not user:
+        return None
+
+    mailing_detail = _get_first_related_item(user, 'mailing_session')
+    if mailing_detail is None:
+        mailing_detail = MailingDetail.objects.filter(mailing_session=user).first()
+
+    if not mailing_detail:
+        return None
+
+    return MailingDetailSerializer(mailing_detail).data
+
+
+def _serialize_partner_company_detail(partner):
+    if not partner:
+        return None
+
+    company_detail = _get_first_related_item(partner, 'company_of_partner')
+    if company_detail is None:
+        company_detail = BusinessProfile.objects.filter(company_of_partner=partner).first()
+
+    if not company_detail:
+        return None
+
+    return ShortBusinessSerializer(company_detail).data
 
 
 def _get_datetime_sort_value(value):
@@ -192,9 +220,31 @@ class BookingWorkflowFieldsMixin(serializers.Serializer):
 
 
 class CurrentUserBookingListSerializer(BookingWorkflowFieldsMixin, serializers.ModelSerializer):
+    user_session_token = serializers.CharField(source="order_by.session_token", read_only=True)
     package_name = serializers.CharField(source="package_token.package_name", read_only=True)
     package_type = serializers.CharField(source="package_token.package_type", read_only=True)
     package_cost = serializers.CharField(source="package_token.package_base_cost", read_only=True)
+    mecca_nights = serializers.CharField(source="package_token.mecca_nights", read_only=True)
+    madinah_nights = serializers.CharField(source="package_token.madinah_nights", read_only=True)
+    company_detail = serializers.SerializerMethodField()
+    is_insurance_included = serializers.BooleanField(
+        source="package_token.is_insurance_included",
+        read_only=True,
+    )
+    is_breakfast_included = serializers.BooleanField(
+        source="package_token.is_breakfast_included",
+        read_only=True,
+    )
+    is_lunch_included = serializers.BooleanField(
+        source="package_token.is_lunch_included",
+        read_only=True,
+    )
+    is_dinner_included = serializers.BooleanField(
+        source="package_token.is_dinner_included",
+        read_only=True,
+    )
+    has_airline_detail = serializers.SerializerMethodField()
+    has_transport_detail = serializers.SerializerMethodField()
     partner_name = serializers.CharField(source="order_to.name", read_only=True)
     partner_session_token = serializers.CharField(source="order_to.partner_session_token", read_only=True)
 
@@ -203,6 +253,7 @@ class CurrentUserBookingListSerializer(BookingWorkflowFieldsMixin, serializers.M
         fields = (
             "booking_id",
             "booking_number",
+            "user_session_token",
             "adults",
             "child",
             "infants",
@@ -229,9 +280,102 @@ class CurrentUserBookingListSerializer(BookingWorkflowFieldsMixin, serializers.M
             "package_name",
             "package_type",
             "package_cost",
+            "mecca_nights",
+            "madinah_nights",
+            "company_detail",
+            "is_insurance_included",
+            "is_breakfast_included",
+            "is_lunch_included",
+            "is_dinner_included",
+            "has_airline_detail",
+            "has_transport_detail",
             "partner_name",
             "partner_session_token",
         )
+
+    def get_company_detail(self, obj):
+        return get_company_detail(obj)
+
+    def get_has_airline_detail(self, obj):
+        if not obj.package_token:
+            return False
+        return bool(_list_related_items(obj.package_token, "airline_for_package"))
+
+    def get_has_transport_detail(self, obj):
+        if not obj.package_token:
+            return False
+        return bool(_list_related_items(obj.package_token, "transport_for_package"))
+
+
+class BookingMutationSerializer(CurrentUserBookingListSerializer):
+    partner_session_token = serializers.CharField(source="order_to.partner_session_token", read_only=True)
+    partner_name = serializers.CharField(source="order_to.name", read_only=True)
+    huz_token = serializers.CharField(source="package_token.huz_token", read_only=True)
+    sharing = serializers.CharField(read_only=True)
+    quad = serializers.CharField(read_only=True)
+    triple = serializers.CharField(read_only=True)
+    double = serializers.CharField(read_only=True)
+    single = serializers.CharField(read_only=True)
+    special_request = serializers.CharField(read_only=True)
+    payment_detail = serializers.SerializerMethodField()
+    response_mode = serializers.SerializerMethodField()
+
+    class Meta(CurrentUserBookingListSerializer.Meta):
+        fields = (
+            "booking_id",
+            "booking_number",
+            "user_session_token",
+            "partner_session_token",
+            "partner_name",
+            "adults",
+            "child",
+            "infants",
+            "sharing",
+            "quad",
+            "triple",
+            "double",
+            "single",
+            "start_date",
+            "end_date",
+            "total_price",
+            "special_request",
+            "booking_status",
+            "issue_status",
+            "order_time",
+            "payment_type",
+            "hold_expires_at",
+            "payment_correction_expires_at",
+            "minimum_payment_status",
+            "full_payment_status",
+            "client_workflow_stage",
+            "client_workflow_step",
+            "operator_visible",
+            "operator_can_act",
+            "client_can_edit_travellers",
+            "client_can_submit_minimum_payment",
+            "client_can_submit_full_payment",
+            "remaining_amount_due",
+            "workflow_bucket",
+            "huz_token",
+            "package_name",
+            "package_type",
+            "package_cost",
+            "mecca_nights",
+            "madinah_nights",
+            "company_detail",
+            "is_insurance_included",
+            "is_breakfast_included",
+            "is_lunch_included",
+            "is_dinner_included",
+            "payment_detail",
+            "response_mode",
+        )
+
+    def get_payment_detail(self, obj):
+        return get_payment_detail(obj)
+
+    def get_response_mode(self, _obj):
+        return "mutation_summary"
 
 
 class PartnerBookingListSerializer(BookingWorkflowFieldsMixin, serializers.ModelSerializer):
@@ -656,11 +800,7 @@ class PartnerRatingSerializer(serializers.ModelSerializer):
         fields = ['partner_total_stars', 'partner_comment', 'rating_time', 'user_fullName', 'user_photo', 'user_address_detail']
 
     def get_user_address_detail(self, obj):
-        try:
-            company_detail = MailingDetail.objects.get(mailing_session=obj.rating_by_user.user_id)
-            return MailingDetailSerializer(company_detail).data
-        except MailingDetail.DoesNotExist:
-            return None
+        return _serialize_user_mailing_detail(obj.rating_by_user)
 
 
 class BookingComplaintsSerializer(serializers.ModelSerializer):
@@ -681,18 +821,10 @@ class BookingComplaintsSerializer(serializers.ModelSerializer):
                   'package_type', 'package_name', 'package_cost', 'booking_number', 'partner_contact_detail']
 
     def get_user_address_detail(self, obj):
-        try:
-            company_detail = MailingDetail.objects.get(mailing_session=obj.complaint_by_user)
-            return MailingDetailSerializer(company_detail).data
-        except MailingDetail.DoesNotExist:
-            return None
+        return _serialize_user_mailing_detail(obj.complaint_by_user)
 
     def get_partner_contact_detail(self, obj):
-        try:
-            company_detail = BusinessProfile.objects.get(company_of_partner=obj.complaint_for_partner)
-            return ShortBusinessSerializer(company_detail).data
-        except BusinessProfile.DoesNotExist:
-            return None
+        return _serialize_partner_company_detail(obj.complaint_for_partner)
 
 
 class PartnersBookingPaymentSerializer(serializers.ModelSerializer):
@@ -709,16 +841,7 @@ class PartnersBookingPaymentSerializer(serializers.ModelSerializer):
         fields = ['package_type', 'package_name', 'booking_number', 'payment_status', 'receivable_amount', 'pending_amount', 'processed_amount', 'processed_date', 'create_date', 'partner_contact_detail', 'partner_name', 'partner_session_token']
 
     def get_partner_contact_detail(self, obj):
-        if obj.payment_for_partner:
-            prefetched_company = _get_first_related_item(obj.payment_for_partner, 'company_of_partner')
-            if prefetched_company:
-                return ShortBusinessSerializer(prefetched_company).data
-
-        try:
-            company_detail = BusinessProfile.objects.get(company_of_partner=obj.payment_for_partner)
-            return ShortBusinessSerializer(company_detail).data
-        except BusinessProfile.DoesNotExist:
-            return None
+        return _serialize_partner_company_detail(obj.payment_for_partner)
 
 
 class BookingRequestSerializer(serializers.ModelSerializer):
@@ -739,27 +862,7 @@ class BookingRequestSerializer(serializers.ModelSerializer):
                   'package_type', 'package_name', 'package_cost', 'booking_number', 'partner_contact_detail']
 
     def get_user_address_detail(self, obj):
-        try:
-            company_detail = MailingDetail.objects.get(mailing_session=obj.request_by_user)
-            return MailingDetailSerializer(company_detail).data
-        except MailingDetail.DoesNotExist:
-            return None
+        return _serialize_user_mailing_detail(obj.request_by_user)
 
     def get_partner_contact_detail(self, obj):
-        try:
-            company_detail = BusinessProfile.objects.get(company_of_partner=obj.request_for_partner)
-            return ShortBusinessSerializer(company_detail).data
-        except BusinessProfile.DoesNotExist:
-            return None
-
-
-class CustomPackageSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = CustomPackages
-        fields = '__all__'
-
-    def validate(self, attrs):
-        # You can add any custom validation here if needed
-        if attrs['adults'] < 1:
-            raise serializers.ValidationError("Number of adults must be at least 1.")
-        return attrs
+        return _serialize_partner_company_detail(obj.request_for_partner)

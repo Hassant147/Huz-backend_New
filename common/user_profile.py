@@ -2,10 +2,10 @@ from rest_framework.views import APIView
 from rest_framework.permissions import IsAdminUser, AllowAny
 from rest_framework.response import Response
 from rest_framework import status, serializers
-from .models import UserProfile, Wallet, UserOTP, MailingDetail, SubscribeUser
-from .serializers import UserProfileSerializer, UserOTPSerializer, MailingDetailSerializer, SubscribeSerializer
+from .models import UserProfile, Wallet, UserOTP
+from .serializers import UserProfileSerializer, UserOTPSerializer
 import requests
-from .utility import random_six_digits, generate_token, save_notification, delete_file_from_directory, save_file_in_directory, check_photo_format_and_size, validate_required_fields, send_verification_email, new_user_welcome_email, user_subscribe_email
+from .utility import random_six_digits, generate_token, save_notification, delete_file_from_directory, save_file_in_directory, check_photo_format_and_size, validate_required_fields, send_verification_email, new_user_welcome_email
 from .logs_file import logger
 from .throttling import OTPAnonRateThrottle, OTPUserRateThrottle
 from datetime import datetime
@@ -25,6 +25,10 @@ SMS_GATEWAY_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 DEV_OTP_BYPASS_ENABLED = config('DEV_OTP_BYPASS_ENABLED', cast=bool, default=False)
 DEV_OTP_BYPASS_CODE = '123456'
 LOCAL_DEV_HOSTS = {'127.0.0.1', 'localhost'}
+
+
+class OTPDeliveryError(Exception):
+    pass
 
 
 def send_sms_gateway_request(url):
@@ -90,57 +94,6 @@ def user_exists_for_phone(phone_number):
         country_code=country_code,
         phone_number=local_phone_number,
     ).exists()
-
-
-class SubscribeAPIView(APIView):
-    permission_classes = [IsAdminUser]
-
-    @swagger_auto_schema(
-        operation_description="Subscribe a user with a valid email.",
-        request_body=SubscribeSerializer,
-        responses={
-            200: "Success: Successfully subscribed.",
-            400: "Bad Request: Invalid input data",
-            401: "Unauthorized: Admin permissions required",
-            500: "Server Error: Internal server error"
-        }
-    )
-    def post(self, request, *args, **kwargs):
-        try:
-            # Deserialize the incoming request data
-            serializer = SubscribeSerializer(data=request.data)
-
-            # Check if data is valid
-            if serializer.is_valid():
-                email = serializer.validated_data['email']
-
-                # Check if the email is already subscribed
-                if SubscribeUser.objects.filter(email=email).exists():
-                    return Response(
-                        {"error": "This email is already subscribed."},
-                        status=status.HTTP_400_BAD_REQUEST
-                    )
-
-                # Save the new subscription data
-                subscribe_user = SubscribeUser.objects.create(email=email)
-                if subscribe_user:
-                    user_subscribe_email(email)
-                return Response(
-                    {"message": "Successfully subscribed."},
-                    status=status.HTTP_201_CREATED
-                )
-            else:
-                logger.error("Subscribe: An unexpected error occurred: %s", str(serializer.errors))
-                # Return validation errors if serializer is not valid
-                return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-        except Exception as e:
-            # Handle unexpected errors
-            logger.error("Subscribe: An unexpected error occurred: %s", str(e))
-            return Response(
-                {"error": f"An unexpected error occurred: {str(e)}"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
 
 
 class SendOTPSMSAPIView(APIView):
@@ -403,6 +356,9 @@ class CreateMemberProfileView(APIView):
         country_code = phone_number[:-10]
         phone_number = phone_number[-10:]
 
+        if country_code != '+92':
+            return Response({"message": "Sending OTP to this country is not allowed."}, status=status.HTTP_400_BAD_REQUEST)
+
         # Generate session token
         key = int(phone_number) * 52955917
         token_key = str(country_code) + str(key)
@@ -425,34 +381,31 @@ class CreateMemberProfileView(APIView):
                 with transaction.atomic():
                     user = serializer.save()
                     self.handle_new_user_setup(user, data)
+
+                    if is_dev_otp_bypass_enabled(request):
+                        upsert_user_otp(phone_number_1, DEV_OTP_BYPASS_CODE)
+                        logger.warning("DEV OTP bypass enabled for signup flow on %s.", phone_number_1)
+                    else:
+                        otp_code = random_six_digits()
+                        sender = 'VTvOTP'
+                        otp_message = f'HajjUmrah.co One-Time Password: {otp_code}. Please do not share OTP with anyone.'
+                        API_Key = config('APIKey')
+                        url = f'https://api.veevotech.com/v3/sendsms?hash={API_Key}&receivernum={phone_number_1}&sendernum={sender}&textmessage={otp_message}'
+                        response = send_sms_gateway_request(url)
+                        if response.status_code != 200:
+                            raise OTPDeliveryError("Failed to send OTP. Please try again later.")
+                        upsert_user_otp(phone_number_1, otp_code)
+
                 serialized_user = UserProfileSerializer(user)
-                if country_code != '+92':
-                    return Response({"message": "Sending OTP to this country is not allowed."}, status=status.HTTP_400_BAD_REQUEST)
-
-                if is_dev_otp_bypass_enabled(request):
-                    upsert_user_otp(phone_number_1, DEV_OTP_BYPASS_CODE)
-                    logger.warning("DEV OTP bypass enabled for signup flow on %s.", phone_number_1)
-                    new_user_welcome_email(user.email, user.name)
-                    return Response(serialized_user.data, status=status.HTTP_201_CREATED)
-
-                otp_code = random_six_digits()
-                sender = 'VTvOTP'
-                otp_message = f'HajjUmrah.co One-Time Password: {otp_code}. Please do not share OTP with anyone.'
-                API_Key = config('APIKey')
-                url = f'https://api.veevotech.com/v3/sendsms?hash={API_Key}&receivernum={phone_number_1}&sendernum={sender}&textmessage={otp_message}'
-                response = send_sms_gateway_request(url)
-                if response.status_code == 200:
-                    upsert_user_otp(phone_number_1, otp_code)
-
-                    new_user_welcome_email(user.email, user.name)
-                    return Response(serialized_user.data, status=status.HTTP_201_CREATED)
-                else:
-                    return Response({"message": "Failed to send OTP. Please try again later."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                new_user_welcome_email(user.email, user.name)
+                return Response(serialized_user.data, status=status.HTTP_201_CREATED)
             else:
                 first_error_field = next(iter(serializer.errors))
                 first_error_message = f"{first_error_field}: {serializer.errors[first_error_field][0]}"
                 return Response({"message": first_error_message}, status=status.HTTP_400_BAD_REQUEST)
 
+        except OTPDeliveryError as e:
+            return Response({"message": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         except Exception as e:
             logger.error("CreateMemberProfileView: %s", str(e))
             return Response({"message": "Failed to create user. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -582,447 +535,3 @@ class UpdateFirebaseTokenView(APIView):
         except Exception as e:
             logger.error("UpdateFirebaseTokenView: %s", str(e))
             return Response({"message": "Failed to update firebase token. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-class UpdateUserNameView(APIView):
-    permission_classes = [IsAdminUser]
-
-    @swagger_auto_schema(
-        request_body=openapi.Schema(
-            type=openapi.TYPE_OBJECT,
-            properties={
-                'session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the user'),
-                'name': openapi.Schema(type=openapi.TYPE_STRING, description='New name for the user')
-            },
-            required=['session_token', 'name']
-        ),
-        responses={
-            200: openapi.Response("Success: User name updated successfully", UserProfileSerializer),
-            400: "Bad Request: Missing required information or user not recognized",
-            401: "Unauthorized: Admin permissions required",
-            404: "Not Found: User not recognized",
-            500: "Server Error: Internal server error"
-        },
-        operation_description="Update the name of a user"
-    )
-    def put(self, request, *args, **kwargs):
-        try:
-            # Extract the session_token and name from the request data
-            session_token = request.data.get('session_token')
-            name = request.data.get('name')
-
-            # Validate the presence of session_token and name
-            if not session_token or not name:
-                return Response({"message": "Missing user information or new name."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Retrieve the user profile associated with the session_token
-            user = UserProfile.objects.filter(session_token=session_token).first()
-            if not user:
-                return Response({"message": "User not recognized."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Update the user's name
-            user.name = name
-            user.save()
-
-            # Serialize the updated user profile
-            serialized_user = UserProfileSerializer(user)
-            return Response(serialized_user.data, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            # Log the error and return a server error response
-            logger.error("UpdateUserNameView: %s", str(e))
-            return Response({"message": "Failed to update new name. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-class UpdateUserGenderView(APIView):
-    permission_classes = [IsAdminUser]
-
-    @swagger_auto_schema(
-        request_body=openapi.Schema(
-            type=openapi.TYPE_OBJECT,
-            properties={
-                'session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the user'),
-                'user_gender': openapi.Schema(type=openapi.TYPE_STRING, description='Gender for the user', enum=GENDER_CHOICES)
-            },
-            required=['session_token', 'user_gender']
-        ),
-        responses={
-            200: openapi.Response("Success: User gender updated successfully", UserProfileSerializer),
-            400: "Bad Request: Missing required information or user not recognized",
-            401: "Unauthorized: Admin permissions required",
-            404: "Not Found: User not recognized",
-            500: "Server Error: Internal server error"
-        },
-        operation_description="Update the gender of a user"
-    )
-    def put(self, request, *args, **kwargs):
-        try:
-            # Extract the session_token and user_gender from the request data
-            session_token = request.data.get('session_token')
-            user_gender = request.data.get('user_gender')
-
-            # Validate the presence of session_token and user_gender
-            if not session_token or not user_gender:
-                return Response({"message": "Missing user gender or user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Validate that the user_gender is one of the allowed choices
-            if user_gender not in GENDER_CHOICES:
-                return Response({"message": "Invalid user gender choice."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Retrieve the user profile associated with the session_token
-            user = UserProfile.objects.filter(session_token=session_token).first()
-            if not user:
-                return Response({"message": "User not recognized."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Update the user's gender
-            user.user_gender = user_gender
-            user.save()
-
-            # Serialize the updated user profile
-            serialized_user = UserProfileSerializer(user)
-            return Response(serialized_user.data, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            # Log the error and return a server error response
-            logger.error("UpdateUserNameView: %s", str(e))
-            return Response({"message": "Failed to update user gender. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-class UpdateEmailAddressView(APIView):
-    permission_classes = [IsAdminUser]
-
-    @swagger_auto_schema(
-        request_body=openapi.Schema(
-            type=openapi.TYPE_OBJECT,
-            properties={
-                'session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the user'),
-                'email': openapi.Schema(type=openapi.TYPE_STRING, description='New email address for the user')
-            },
-            required=['session_token', 'email']
-        ),
-        responses={
-            200: openapi.Response("Success: User email updated successfully", UserProfileSerializer),
-            400: "Bad Request: Missing required information, invalid email format, or user not recognized",
-            401: "Unauthorized: Admin permissions required",
-            404: "Not Found: User not recognized",
-            500: "Server Error: Internal server error"
-        },
-        operation_description="Update the email address of a user"
-    )
-    def put(self, request, *args, **kwargs):
-        try:
-            # Extract the session_token and email from the request data
-            session_token = request.data.get('session_token')
-            email = request.data.get('email')
-
-            # Validate the presence of session_token and email
-            if not session_token or not email:
-                return Response({"message": "Missing user email or user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            serializer = UserProfileSerializer(data=request.data)
-            try:
-                # Validate the email format using serializer validation
-                serializer.validate_email(email)
-            except serializers.ValidationError as e:
-                return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Retrieve the user profile
-            user = UserProfile.objects.filter(session_token=session_token).first()
-            if not user:
-                return Response({"message": "User not recognized."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Update the user's email
-            user.email = email
-            user.save()
-            serialized_user = UserProfileSerializer(user)
-            return Response(serialized_user.data, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            logger.error("UpdateEmailAddressView: %s", str(e))
-            return Response({"message": "Failed to update user email. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-class ManageUserAddressView(APIView):
-    permission_classes = [IsAdminUser]
-
-    @swagger_auto_schema(
-        manual_parameters=[
-            openapi.Parameter('session_token', openapi.IN_QUERY, type=openapi.TYPE_STRING, required=True, description='Session token of the user'),
-        ],
-        responses={
-            200: openapi.Response("Success: Address details retrieved successfully", MailingDetailSerializer),
-            400: "Bad Request: Missing required information or user not recognized",
-            401: "Unauthorized: Admin permissions required",
-            404: "Not Found: Address details not found for the user",
-            500: "Server Error: Internal server error"
-        },
-        operation_description="Retrieve the address details of a user"
-    )
-    def get(self, request):
-        try:
-            # Extract session_token & validate
-            session_token = self.request.GET.get('session_token', None)
-            if not session_token:
-                return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Retrieving the user profile
-            user = UserProfile.objects.filter(session_token=session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Retrieve the address details associated with the user
-            address_detail = MailingDetail.objects.filter(mailing_session=user).first()
-            if not address_detail:
-                return Response({"message": "Address detail not exist."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Serialize the address detail
-            serialized_address = MailingDetailSerializer(address_detail)
-            return Response(serialized_address.data, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            # Log the error and return a server error response
-            logger.error("Get - ManageUserAddressView: %s", str(e))
-            return Response({"message": "Failed to fetch address detail. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @swagger_auto_schema(
-        request_body=openapi.Schema(
-            type=openapi.TYPE_OBJECT,
-            properties={
-                'session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the user'),
-                'street_address': openapi.Schema(type=openapi.TYPE_STRING, description='Street address'),
-                'address_line2': openapi.Schema(type=openapi.TYPE_STRING, description='Address line 2'),
-                'city': openapi.Schema(type=openapi.TYPE_STRING, description='City'),
-                'state': openapi.Schema(type=openapi.TYPE_STRING, description='State'),
-                'country': openapi.Schema(type=openapi.TYPE_STRING, description='Country'),
-                'postal_code': openapi.Schema(type=openapi.TYPE_STRING, description='Postal code')
-            },
-            required=['session_token', 'street_address', 'city', 'state', 'country', 'postal_code']
-        ),
-        responses={
-            201: openapi.Response("Created: Address details saved successfully", MailingDetailSerializer),
-            400: "Bad Request: Missing required information or invalid data format",
-            401: "Unauthorized: Admin permissions required",
-            404: "Not Found: User not recognized",
-            409: "Conflict: Address detail already exists for the user",
-            500: "Server Error: Internal server error"
-        },
-        operation_description="Save address details for a user"
-    )
-    def post(self, request, *args, **kwargs):
-        try:
-            data = request.data
-            session_token = data.get('session_token')
-
-            # Validate session_token presence
-            if not session_token:
-                return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Validate required fields
-            required_fields = ['street_address', 'city', 'state', 'country', 'postal_code']
-            error_response = validate_required_fields(required_fields, data)
-            if error_response:
-                return error_response
-
-            # Retrieve user profile
-            user = UserProfile.objects.filter(session_token=session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."},
-                                status=status.HTTP_404_NOT_FOUND)
-
-            # Check if address detail already exists for the user
-            if MailingDetail.objects.filter(mailing_session=user).exists():
-                return Response({"message": "Address detail already exists."}, status=status.HTTP_409_CONFLICT)
-
-            # Serialize and save mailing detail
-            serializer = MailingDetailSerializer(data=data)
-            if serializer.is_valid():
-                user.is_address_exist = True
-                user.save()
-                serializer.save(mailing_session=user)
-                return Response(serializer.data, status=status.HTTP_201_CREATED)
-            else:
-                # Extracting first error message with field name
-                first_error_field = next(iter(serializer.errors))
-                first_error_message = f"{first_error_field}: {serializer.errors[first_error_field][0]}"
-                return Response({"message": first_error_message}, status=status.HTTP_400_BAD_REQUEST)
-
-        except KeyError as e:
-            # Handle missing key error
-            logger.error(f"Missing key error in Post - ManageUserAddressView: {str(e)}")
-            return Response({"message": f"Missing key: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
-
-        except Exception as e:
-            # Log the error and return a server error response
-            logger.error("Post - ManageUserAddressView: %s", str(e))
-            return Response({"message": "Failed to add address detail. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-    @swagger_auto_schema(
-        request_body=openapi.Schema(
-            type=openapi.TYPE_OBJECT,
-            properties={
-                'session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the user'),
-                'address_id': openapi.Schema(type=openapi.TYPE_INTEGER, description='ID of the address detail'),
-                'street_address': openapi.Schema(type=openapi.TYPE_STRING, description='Street address'),
-                'address_line2': openapi.Schema(type=openapi.TYPE_STRING, description='Address line 2'),
-                'city': openapi.Schema(type=openapi.TYPE_STRING, description='City'),
-                'state': openapi.Schema(type=openapi.TYPE_STRING, description='State'),
-                'country': openapi.Schema(type=openapi.TYPE_STRING, description='Country'),
-                'postal_code': openapi.Schema(type=openapi.TYPE_STRING, description='Postal code')
-            },
-            required=['session_token', 'address_id']
-        ),
-        responses={
-            200: openapi.Response("Success: Address details updated successfully", MailingDetailSerializer),
-            400: "Bad Request: Missing required information or invalid data format",
-            401: "Unauthorized: Admin permissions required",
-            404: "Not Found: User not recognized or address detail not found",
-            500: "Server Error: Internal server error"
-        },
-        operation_description="Update address details for a user"
-    )
-    def put(self, request, *args, **kwargs):
-        try:
-            data = request.data
-            session_token = data.get('session_token')
-            address_id = data.get('address_id')
-
-            # Validate session_token and address_id presence
-            if not session_token or not address_id:
-                return Response({"message": "Missing user information or address ID."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Validate required fields
-            required_fields = ['address_id', 'street_address', 'city', 'state', 'country', 'postal_code']
-            error_response = validate_required_fields(required_fields, data)
-            if error_response:
-                return error_response
-
-            # Retrieve user profile
-            user = UserProfile.objects.filter(session_token=session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Retrieve address detail based on address_id and mailing_session (user)
-            address_detail = MailingDetail.objects.filter(mailing_session=user, address_id=address_id).first()
-            if not address_detail:
-                return Response({"message": "Address detail not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Validate and update mailing detail
-            serializer = MailingDetailSerializer(address_detail, data=data, partial=True)
-            if serializer.is_valid():
-                serializer.save()
-                return Response(serializer.data, status=status.HTTP_200_OK)
-            else:
-                # Extracting first error message with field name
-                first_error_field = next(iter(serializer.errors))
-                first_error_message = f"{first_error_field}: {serializer.errors[first_error_field][0]}"
-                return Response({"message": first_error_message}, status=status.HTTP_400_BAD_REQUEST)
-
-        except KeyError as e:
-            # Handle missing key error
-            logger.error(f"Missing key error in Put - ManageUserAddressView: {str(e)}")
-            return Response({"message": f"Missing key: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
-
-        except Exception as e:
-            # Log the error and return a server error response
-            logger.error("Put - ManageUserAddressView: %s", str(e))
-            return Response({"message": "Failed to update address detail. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-class SendEmailOTPView(APIView):
-    permission_classes = [IsAdminUser]
-
-    @swagger_auto_schema(
-        operation_description="Send or Resend OTP to the user's email based on session token",
-        request_body=openapi.Schema(type=openapi.TYPE_OBJECT, required=['session_token'], properties={'session_token': openapi.Schema(type=openapi.TYPE_STRING, description="Session token of the user")}),
-        responses={
-            200: "OTP sent successfully.",
-            400: "Bad Request: Missing or invalid input data",
-            401: "Unauthorized: Admin permissions required",
-            404: "Not Found: User not found with the provided session token",
-            500: "Server Error: Internal server error"
-        }
-    )
-    def put(self, request, *args, **kwargs):
-        try:
-            # Check if session_token is provided
-            session_token = request.data.get('session_token')
-            if not session_token:
-                return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Retrieve user profile based on session_token
-            user = UserProfile.objects.filter(session_token=session_token).first()
-
-            # Check if user exists
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
-
-            otp = random_six_digits()
-            result = send_verification_email(user.email, user.name, otp)
-            # Check if email sending was successful
-            if result == "Success":
-                user.email_otp = otp
-                user.save()
-                return Response({"message": "OTP sent successfully."}, status=status.HTTP_200_OK)
-            else:
-                return Response({"message": "Failed to send OTP. Please try again later."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        except Exception as e:
-            # Adding logs
-            logger.error("ResendOTPView error: %s", str(e))
-            return Response({"message": "Failed to send otp. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-class MatchEmailOTPView(APIView):
-    permission_classes = [IsAdminUser]
-
-    @swagger_auto_schema(
-        request_body=openapi.Schema(
-            type=openapi.TYPE_OBJECT,
-            properties={
-                'session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the user'),
-                'otp': openapi.Schema(type=openapi.TYPE_STRING, description='OTP Password of user'),
-            },
-            required=['session_token', 'otp']
-        ),
-        responses={
-            200: openapi.Response("Success: OTP Matched successfully", UserProfileSerializer),
-            400: "Bad Request: Missing required information or invalid data format",
-            401: "Unauthorized: Admin permissions required",
-            404: "Not Found: User not recognized",
-            500: "Server Error: Internal server error"
-        },
-        operation_description="Update address details for a user"
-    )
-    def put(self, request, *args, **kwargs):
-        try:
-            # Check if session_token is provided
-            session_token = request.data.get('session_token')
-            email_otp = request.data.get('otp')
-            if not email_otp or not session_token:
-                return Response({"message": "Missing OTP or user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            #  Retrieve user profile based on session_token
-            user = UserProfile.objects.filter(session_token=session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
-
-            # If OTP has expired (within 2 minute)
-            time_difference = timezone.now() - user.otp_time
-            if time_difference > timedelta(minutes=2):
-                return Response({"message": "OTP has expired. Please request a new OTP."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Matching otp
-            if user.email_otp != email_otp:
-                return Response({"message": "Invalid OTP."}, status=status.HTTP_400_BAD_REQUEST)
-
-            with transaction.atomic():
-                user.is_email_verified = True
-                user.email_otp = ""
-                user.save()
-
-            # Returning user profile
-            serialized_user = UserProfileSerializer(user)
-            return Response(serialized_user.data, status=status.HTTP_200_OK)
-        except Exception as e:
-            # adding logs
-            logger.error("MatchEmailOTPView error: %s", str(e))
-            return Response({"message": "Failed to verify otp. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

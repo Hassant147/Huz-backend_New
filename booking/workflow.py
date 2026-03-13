@@ -1,4 +1,5 @@
 from datetime import timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from django.utils import timezone
 
@@ -153,16 +154,26 @@ def booking_has_full_approval(booking):
     return get_payment_stage_status(booking, "Full") == PAYMENT_STATUS_APPROVED
 
 
+def _to_decimal_amount(value):
+    try:
+        return Decimal(str(value or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal("0.00")
+
+
 def get_total_approved_payment_amount(booking):
-    total = 0.0
+    total = Decimal("0.00")
     for payment in get_booking_payments(booking):
         if normalize_payment_status(getattr(payment, "payment_status", "")) == PAYMENT_STATUS_APPROVED:
-            total += float(getattr(payment, "transaction_amount", 0) or 0)
-    return total
+            total += _to_decimal_amount(getattr(payment, "transaction_amount", 0))
+    return float(total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def get_remaining_amount_due(booking):
-    return max(float(getattr(booking, "total_price", 0) or 0) - get_total_approved_payment_amount(booking), 0.0)
+    remaining_amount = _to_decimal_amount(getattr(booking, "total_price", 0)) - Decimal(
+        str(get_total_approved_payment_amount(booking))
+    )
+    return float(max(remaining_amount, Decimal("0.00")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def _get_related_items(booking, relation_name):
@@ -378,7 +389,6 @@ def sync_booking_state(booking, *, now=None, save=True):
         has_submitted_payment = booking_has_any_submitted_payment(booking)
         has_minimum_approval = booking_has_minimum_approval(booking)
         has_full_approval = booking_has_full_approval(booking)
-        has_operator_documents = booking_operator_documents_are_complete(booking)
         has_trip_ended = booking_end_date is not None and timezone.localdate(now) > _as_local_date(booking_end_date)
 
         if hold_expires_at and not has_submitted_payment and now > hold_expires_at:
@@ -390,6 +400,7 @@ def sync_booking_state(booking, *, now=None, save=True):
         elif current_status == BOOKING_STATUS_READY_FOR_TRAVEL:
             target_status = BOOKING_STATUS_COMPLETED if has_trip_ended else BOOKING_STATUS_READY_FOR_TRAVEL
         elif current_status == BOOKING_STATUS_IN_FULFILLMENT:
+            has_operator_documents = booking_operator_documents_are_complete(booking)
             if has_operator_documents:
                 target_status = BOOKING_STATUS_COMPLETED if has_trip_ended else BOOKING_STATUS_READY_FOR_TRAVEL
             else:

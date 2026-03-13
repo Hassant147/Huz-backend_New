@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/5.0/ref/settings/
 
 from pathlib import Path
 import os
+import sys
 from decouple import config, Csv
 from corsheaders.defaults import default_headers
 
@@ -23,11 +24,18 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/5.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-)_a%x5b_vzdbf-r&eb1*yw*hd(!jaf_cb6f@576d9uitb5t)n)'
+SECRET_KEY = config('SECRET_KEY')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = False
 # DEBUG = True
+ENABLE_API_DOCS = config('ENABLE_API_DOCS', cast=bool, default=False)
+IS_RUNSERVER = len(sys.argv) > 1 and sys.argv[1].startswith("runserver")
+SERVE_MEDIA_AND_STATIC_FROM_DJANGO = config(
+    'SERVE_MEDIA_AND_STATIC_FROM_DJANGO',
+    cast=bool,
+    default=IS_RUNSERVER,
+)
 
 ALLOWED_HOSTS = config(
     'ALLOWED_HOSTS',
@@ -57,12 +65,10 @@ INSTALLED_APPS = [
     'rest_framework',
     'drf_yasg',
     'corsheaders',
-    'channels',
     'common',
     'partners',
     'management',
     'booking',
-    'chat',
 ]
 
 REST_FRAMEWORK = {
@@ -230,6 +236,14 @@ MEDIA_URL = '/media/'
 STATIC_ROOT = os.path.join(BASE_DIR, 'static')
 
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+FIREBASE_CREDENTIAL_PATH = config(
+    'FIREBASE_CREDENTIAL_PATH',
+    default=str(BASE_DIR / 'common' / 'firebase.json'),
+)
+VIEW_LOG_PATH = config(
+    'VIEW_LOG_PATH',
+    default=str(BASE_DIR / 'view_logs.txt'),
+)
 
 
 EMAIL_ADDRESS = config('EMAIL_ADDRESS', default='HajjUmrah.co <no-reply@hajjumrah.co>')

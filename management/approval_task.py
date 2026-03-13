@@ -1,3 +1,7 @@
+import hashlib
+from time import perf_counter
+from urllib.parse import urlencode
+
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -5,7 +9,7 @@ from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from rest_framework.permissions import IsAdminUser
 from django.db import transaction
-from django.db.models import Max, Prefetch, Q, Sum
+from django.db.models import Count, Max, Prefetch, Q, Sum
 from django.core.cache import cache
 from datetime import timedelta
 from django.utils.dateparse import parse_date
@@ -37,6 +41,7 @@ from booking.flow_utils import get_expected_traveller_count
 from booking.models import Booking, PartnersBookingPayment, Payment, PassportValidity
 from booking.querysets import annotate_booking_payment_statuses
 from booking.serializers import LegacyDetailBookingSerializer, PartnersBookingPaymentSerializer, AdminPaidBookingSerializer
+from booking.services import BookingServiceError, validate_booking_payment_amount
 from booking.statuses import (
     BOOKING_STATUS_AWAITING_FINAL_PAYMENT,
     BOOKING_STATUS_COMPLETED,
@@ -102,8 +107,77 @@ PAYMENT_REVIEW_QUEUE_VALUES = {
 }
 
 
+def _build_management_cache_namespace_key(cache_key):
+    return f"{cache_key}:namespace"
+
+
+def _current_management_cache_namespace_value():
+    return str(int(timezone.now().timestamp() * 1000000))
+
+
+def _get_management_cache_namespace(cache_key):
+    namespace_key = _build_management_cache_namespace_key(cache_key)
+    namespace = cache.get(namespace_key)
+    if namespace:
+        return namespace
+
+    namespace = "1"
+    cache.set(namespace_key, namespace, None)
+    return namespace
+
+
+def _normalize_management_cache_params(raw_params):
+    if hasattr(raw_params, "lists"):
+        items = raw_params.lists()
+    else:
+        items = raw_params.items()
+
+    normalized_params = []
+    for key, values in sorted(items, key=lambda entry: entry[0]):
+        iterable_values = values if isinstance(values, (list, tuple)) else [values]
+        for value in iterable_values:
+            normalized_params.append((str(key), str(value or "")))
+
+    return normalized_params
+
+
+def _build_management_scoped_cache_key(cache_key, raw_params):
+    params_digest = hashlib.md5(
+        urlencode(_normalize_management_cache_params(raw_params), doseq=True).encode("utf-8")
+    ).hexdigest()
+    return f"{cache_key}:{_get_management_cache_namespace(cache_key)}:{params_digest}"
+
+
+def _format_management_performance_context(context):
+    parts = []
+    for key, value in context.items():
+        if value in (None, ""):
+            continue
+        parts.append(f"{key}={value}")
+    return " ".join(parts)
+
+
+def _log_management_performance(event, started_at, **context):
+    logger.info(
+        "management.performance event=%s duration_ms=%.2f %s",
+        event,
+        (perf_counter() - started_at) * 1000,
+        _format_management_performance_context(context),
+    )
+
+
 def _invalidate_management_cache():
     cache.delete_many(MANAGEMENT_CACHE_KEYS)
+    cache.set(
+        _build_management_cache_namespace_key(CACHE_KEY_PAID_BOOKINGS),
+        _current_management_cache_namespace_value(),
+        None,
+    )
+    cache.set(
+        _build_management_cache_namespace_key(CACHE_KEY_PARTNER_RECEIVABLES),
+        _current_management_cache_namespace_value(),
+        None,
+    )
 
 
 def _normalize_payment_review_decision(value):
@@ -128,14 +202,23 @@ def _collect_user_notification_tokens(user):
 
 
 def _notify_user_about_payment_update(user, booking_number, title, message):
-    save_notification(
-        user,
-        title,
-        message,
-        getattr(user, "firebase_token", "") or "",
-        getattr(user, "web_firebase_token", "") or "",
-        booking_number,
-    )
+    save_notification_started_at = perf_counter()
+    try:
+        save_notification(
+            user,
+            title,
+            message,
+            getattr(user, "firebase_token", "") or "",
+            getattr(user, "web_firebase_token", "") or "",
+            booking_number,
+        )
+    finally:
+        _log_management_performance(
+            "save_notification",
+            save_notification_started_at,
+            booking_number=booking_number,
+            user_id=getattr(user, "pk", ""),
+        )
 
     if not getattr(user, "is_notification_allowed", True):
         return
@@ -144,6 +227,7 @@ def _notify_user_about_payment_update(user, booking_number, title, message):
     if not registration_tokens:
         return
 
+    push_started_at = perf_counter()
     try:
         send_push_notification(
             title,
@@ -155,6 +239,13 @@ def _notify_user_about_payment_update(user, booking_number, title, message):
         )
     except Exception as exc:
         logger.error("Failed to send push notification for booking %s: %s", booking_number, str(exc))
+    finally:
+        _log_management_performance(
+            "push_notification_dispatch",
+            push_started_at,
+            booking_number=booking_number,
+            token_count=len(registration_tokens),
+        )
 
 
 def _parse_optional_management_date(raw_value, *, field_name):
@@ -213,13 +304,51 @@ def _combine_queue_filters(queue_filters):
     return combined_filter or Q(pk__in=[])
 
 
+def _build_payment_review_summary(queryset, queue_filters):
+    aggregate_kwargs = {
+        "total_requests": Count("pk"),
+        "total_amount": Sum("total_price"),
+    }
+    queue_aliases = {}
+    queue_total_aliases = {}
+    for index, (queue_key, queue_filter) in enumerate(queue_filters.items()):
+        alias = f"queue_count_{index}"
+        queue_aliases[alias] = queue_key
+        aggregate_kwargs[alias] = Count("pk", filter=queue_filter)
+        total_alias = f"queue_total_amount_{index}"
+        queue_total_aliases[total_alias] = queue_key
+        aggregate_kwargs[total_alias] = Sum("total_price", filter=queue_filter)
+
+    summary = queryset.aggregate(**aggregate_kwargs)
+    return {
+        "total_requests": int(summary.get("total_requests") or 0),
+        "total_amount": summary.get("total_amount") or 0,
+        "queue_counts": {
+            queue_key: int(summary.get(alias) or 0)
+            for alias, queue_key in queue_aliases.items()
+        },
+        "queue_total_amounts": {
+            queue_key: summary.get(alias) or 0
+            for alias, queue_key in queue_total_aliases.items()
+        },
+    }
+
+
 def _build_paginated_response(request, queryset, serializer_class, *, meta=None):
     paginator = CustomPagination()
+    queryset_started_at = perf_counter()
     page = paginator.paginate_queryset(queryset, request)
+    queryset_duration_ms = (perf_counter() - queryset_started_at) * 1000
+    serializer_started_at = perf_counter()
     serializer = serializer_class(page, many=True, context={"request": request})
     response = paginator.get_paginated_response(serializer.data)
+    serializer_duration_ms = (perf_counter() - serializer_started_at) * 1000
     if meta is not None:
         response.data["meta"] = meta
+    response._timing_metrics = {
+        "queryset_duration_ms": queryset_duration_ms,
+        "serializer_duration_ms": serializer_duration_ms,
+    }
     return response
 
 
@@ -1047,6 +1176,7 @@ class ApproveBookingPaymentView(APIView):
     @transaction.atomic
     def put(self, request, *args, **kwargs):
         try:
+            request_started_at = perf_counter()
             # Extract required data from the request
             session_token = (request.data.get("session_token") or "").strip()
             booking_number = (request.data.get("booking_number") or "").strip()
@@ -1073,7 +1203,7 @@ class ApproveBookingPaymentView(APIView):
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            sync_booking_state(booking_detail, save=True)
+            sync_booking_state(booking_detail, save=False)
             current_status = (booking_detail.booking_status or "").strip()
             if current_status not in PAYMENT_REVIEWABLE_BOOKING_STATUSES:
                 return Response(
@@ -1103,6 +1233,15 @@ class ApproveBookingPaymentView(APIView):
 
                 payment_already_approved = normalized_payment_status == PAYMENT_STATUS_APPROVED
                 if not payment_already_approved:
+                    try:
+                        validate_booking_payment_amount(
+                            booking_detail,
+                            check_payment.transaction_type,
+                            check_payment.transaction_amount,
+                            exclude_payment_id=check_payment.payment_id,
+                        )
+                    except BookingServiceError as exc:
+                        return Response(exc.detail, status=exc.status_code)
                     check_payment.payment_status = PAYMENT_STATUS_APPROVED
                     check_payment.review_message = None
                     check_payment.save(update_fields=['payment_status', 'review_message'])
@@ -1121,7 +1260,15 @@ class ApproveBookingPaymentView(APIView):
 
                 sync_booking_state(booking_detail, save=True)
                 if not payment_already_approved:
-                    send_payment_verification_email(user.email, user.name, booking_number)
+                    verification_email_started_at = perf_counter()
+                    try:
+                        send_payment_verification_email(user.email, user.name, booking_number)
+                    finally:
+                        _log_management_performance(
+                            "send_payment_verification_email",
+                            verification_email_started_at,
+                            booking_number=booking_number,
+                        )
                     _notify_user_about_payment_update(
                         user,
                         booking_number,
@@ -1132,7 +1279,19 @@ class ApproveBookingPaymentView(APIView):
                         BOOKING_STATUS_READY_FOR_TRAVEL,
                         BOOKING_STATUS_COMPLETED,
                     }:
-                        preparation_email(user.email, user.name, booking_detail.package_token.package_type)
+                        preparation_email_started_at = perf_counter()
+                        try:
+                            preparation_email(
+                                user.email,
+                                user.name,
+                                booking_detail.package_token.package_type,
+                            )
+                        finally:
+                            _log_management_performance(
+                                "preparation_email",
+                                preparation_email_started_at,
+                                booking_number=booking_number,
+                            )
             else:
                 rejection_note = review_message or "Please upload a clearer or corrected payment proof and submit it again."
 
@@ -1149,7 +1308,15 @@ class ApproveBookingPaymentView(APIView):
                 booking_detail.save(update_fields=["payment_correction_expires_at"])
                 sync_booking_state(booking_detail, save=True)
 
-                send_payment_rejection_email(user.email, user.name, booking_number, rejection_note)
+                rejection_email_started_at = perf_counter()
+                try:
+                    send_payment_rejection_email(user.email, user.name, booking_number, rejection_note)
+                finally:
+                    _log_management_performance(
+                        "send_payment_rejection_email",
+                        rejection_email_started_at,
+                        booking_number=booking_number,
+                    )
                 _notify_user_about_payment_update(
                     user,
                     booking_number,
@@ -1158,9 +1325,19 @@ class ApproveBookingPaymentView(APIView):
                 )
 
             # Serialize the updated booking detail and return response
+            serializer_started_at = perf_counter()
             serialized_booking = LegacyDetailBookingSerializer(booking_detail)
+            response_payload = serialized_booking.data
+            serializer_duration_ms = (perf_counter() - serializer_started_at) * 1000
             _invalidate_management_cache()
-            return Response(serialized_booking.data, status=status.HTTP_200_OK)
+            _log_management_performance(
+                "approve_booking_payment",
+                request_started_at,
+                booking_number=booking_number,
+                decision=decision,
+                serializer_duration_ms=f"{serializer_duration_ms:.2f}",
+            )
+            return Response(response_payload, status=status.HTTP_200_OK)
 
         except Exception as e:
             # Log the exception and return an error response
@@ -1182,6 +1359,7 @@ class FetchPaidBookingView(APIView):
     )
     def get(self, request):
         try:
+            request_started_at = perf_counter()
             payment_queue = str(request.query_params.get("payment_queue") or "").strip().lower()
             if payment_queue and payment_queue not in PAYMENT_REVIEW_QUEUE_VALUES:
                 return Response(
@@ -1201,9 +1379,26 @@ class FetchPaidBookingView(APIView):
             if order_date_error is not None:
                 return order_date_error
 
+            cache_key = _build_management_scoped_cache_key(
+                CACHE_KEY_PAID_BOOKINGS,
+                request.query_params,
+            )
+            cached_payload = cache.get(cache_key)
+            if cached_payload is not None:
+                _log_management_performance(
+                    "fetch_paid_bookings",
+                    request_started_at,
+                    cache_hit=True,
+                    payment_queue=payment_queue or "all",
+                    booking_number=booking_number,
+                    order_date=order_date.isoformat() if order_date is not None else "",
+                    page=request.query_params.get("page") or 1,
+                )
+                return Response(cached_payload, status=status.HTTP_200_OK)
+
             booking_details_qs = Booking.objects.filter(
                 booking_token__isnull=False,
-            ).select_related(
+            ).distinct().select_related(
                 'order_to',
                 'order_by',
                 'package_token',
@@ -1235,6 +1430,20 @@ class FetchPaidBookingView(APIView):
                         'long',
                     ),
                 ),
+                Prefetch(
+                    'passport_for_booking_number',
+                    queryset=PassportValidity.objects.only(
+                        'passport_for_booking_number_id',
+                        'user_passport',
+                        'user_photo',
+                        'first_name',
+                        'last_name',
+                        'date_of_birth',
+                        'passport_number',
+                        'passport_country',
+                        'expiry_date',
+                    ),
+                ),
                 'booking_token',
             ).order_by('-order_time')
 
@@ -1246,10 +1455,9 @@ class FetchPaidBookingView(APIView):
             annotated_queryset = annotate_booking_payment_statuses(booking_details_qs)
             queue_filters = _build_payment_review_queue_filters(now=timezone.now())
             reviewable_queryset = annotated_queryset.filter(_combine_queue_filters(queue_filters))
-            queue_counts = {
-                queue_key: reviewable_queryset.filter(queue_filter).count()
-                for queue_key, queue_filter in queue_filters.items()
-            }
+            summary_started_at = perf_counter()
+            review_summary = _build_payment_review_summary(reviewable_queryset, queue_filters)
+            summary_duration_ms = (perf_counter() - summary_started_at) * 1000
 
             filtered_queryset = (
                 reviewable_queryset.filter(queue_filters[payment_queue])
@@ -1257,21 +1465,39 @@ class FetchPaidBookingView(APIView):
                 else reviewable_queryset
             )
             total_amount = (
-                filtered_queryset.aggregate(total_amount=Sum("total_price")).get("total_amount") or 0
+                review_summary["queue_total_amounts"].get(payment_queue, 0)
+                if payment_queue
+                else review_summary["total_amount"]
             )
 
-            return _build_paginated_response(
+            response = _build_paginated_response(
                 request,
                 filtered_queryset,
                 AdminPaidBookingSerializer,
                 meta={
                     "payment_queue": payment_queue or None,
                     "order_date": order_date.isoformat() if order_date is not None else None,
-                    "total_requests": reviewable_queryset.count(),
-                    "queue_counts": queue_counts,
+                    "total_requests": review_summary["total_requests"],
+                    "queue_counts": review_summary["queue_counts"],
                     "total_amount": float(total_amount),
                 },
             )
+            cache.set(cache_key, response.data, MANAGEMENT_CACHE_TIMEOUT_SECONDS)
+            timing_metrics = getattr(response, "_timing_metrics", {})
+            _log_management_performance(
+                "fetch_paid_bookings",
+                request_started_at,
+                cache_hit=False,
+                payment_queue=payment_queue or "all",
+                booking_number=booking_number,
+                order_date=order_date.isoformat() if order_date is not None else "",
+                page=request.query_params.get("page") or 1,
+                summary_duration_ms=f"{summary_duration_ms:.2f}",
+                queryset_duration_ms=f"{timing_metrics.get('queryset_duration_ms', 0):.2f}",
+                serializer_duration_ms=f"{timing_metrics.get('serializer_duration_ms', 0):.2f}",
+                result_count=len(response.data.get("results") or []),
+            )
+            return response
 
         except Exception as e:
             # Log the exception and return an error response
@@ -1347,6 +1573,21 @@ class GetPartnerReceiveAblePaymentsView(APIView):
     )
     def get(self, request):
         try:
+            request_started_at = perf_counter()
+            cache_key = _build_management_scoped_cache_key(
+                CACHE_KEY_PARTNER_RECEIVABLES,
+                request.query_params,
+            )
+            cached_payload = cache.get(cache_key)
+            if cached_payload is not None:
+                _log_management_performance(
+                    "fetch_partner_receivables",
+                    request_started_at,
+                    cache_hit=True,
+                    page=request.query_params.get("page") or 1,
+                )
+                return Response(cached_payload, status=status.HTTP_200_OK)
+
             receive_able_qs = PartnersBookingPayment.objects.filter(payment_status="NotPaid").select_related(
                 'payment_for_partner',
                 'payment_for_booking',
@@ -1365,13 +1606,15 @@ class GetPartnerReceiveAblePaymentsView(APIView):
                     ),
                 )
             ).order_by("-create_date")
+            summary_started_at = perf_counter()
             summary = receive_able_qs.aggregate(
                 total_receivable=Sum("receivable_amount"),
                 total_pending=Sum("pending_amount"),
                 total_processed=Sum("processed_amount"),
             )
+            summary_duration_ms = (perf_counter() - summary_started_at) * 1000
 
-            return _build_paginated_response(
+            response = _build_paginated_response(
                 request,
                 receive_able_qs,
                 PartnersBookingPaymentSerializer,
@@ -1381,6 +1624,19 @@ class GetPartnerReceiveAblePaymentsView(APIView):
                     "total_processed": float(summary.get("total_processed") or 0),
                 },
             )
+            cache.set(cache_key, response.data, MANAGEMENT_CACHE_TIMEOUT_SECONDS)
+            timing_metrics = getattr(response, "_timing_metrics", {})
+            _log_management_performance(
+                "fetch_partner_receivables",
+                request_started_at,
+                cache_hit=False,
+                page=request.query_params.get("page") or 1,
+                summary_duration_ms=f"{summary_duration_ms:.2f}",
+                queryset_duration_ms=f"{timing_metrics.get('queryset_duration_ms', 0):.2f}",
+                serializer_duration_ms=f"{timing_metrics.get('serializer_duration_ms', 0):.2f}",
+                result_count=len(response.data.get("results") or []),
+            )
+            return response
 
         except Exception as e:
             # Log the exception and return an error response

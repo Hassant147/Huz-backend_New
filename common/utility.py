@@ -3,6 +3,7 @@ from firebase_admin import credentials, messaging
 import base64, random
 import bcrypt
 import smtplib
+from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from django.conf import settings
@@ -16,18 +17,42 @@ from common.logs_file import logger
 from .pagination import CustomPagination
 
 
-cred = credentials.Certificate("common/firebase.json")
-firebase_admin.initialize_app(cred)
+_firebase_app = None
+
+
+def get_firebase_app():
+    global _firebase_app
+
+    if _firebase_app is not None:
+        return _firebase_app
+
+    if firebase_admin._apps:
+        _firebase_app = firebase_admin.get_app()
+        return _firebase_app
+
+    credentials_path = Path(settings.FIREBASE_CREDENTIAL_PATH).expanduser()
+    if not credentials_path.is_absolute():
+        credentials_path = Path(settings.BASE_DIR) / credentials_path
+
+    if not credentials_path.exists():
+        raise FileNotFoundError(
+            f"Firebase credentials file not found at {credentials_path}."
+        )
+
+    cred = credentials.Certificate(str(credentials_path))
+    _firebase_app = firebase_admin.initialize_app(cred)
+    return _firebase_app
 
 
 def send_push_notification(title, msg, registration_token, dataObject=None):
+    get_firebase_app()
 
     message1 = messaging.MulticastMessage(
         notification=messaging.Notification(
             title=title,
             body=msg,
         ),
-        data={},
+        data=dataObject or {},
         tokens=registration_token
     )
     response = messaging.send_multicast(message1)

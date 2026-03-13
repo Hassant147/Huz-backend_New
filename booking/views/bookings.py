@@ -1,4 +1,5 @@
 from datetime import datetime, time
+from time import perf_counter
 
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
@@ -8,14 +9,14 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from common.auth_utils import is_admin_request, require_user_profile
+from common.logs_file import logger
 from common.models import UserProfile
 from common.pagination import CustomPagination
 from common.permissions import IsAdminOrAuthenticatedUserProfile
 
-from .. import manage_bookings as legacy_manage_bookings
 from ..querysets import USER_BOOKING_STATUS_BUCKETS, normalize_user_booking_status_bucket
 from ..request_serializers import BookingCreateRequestSerializer, validate_serializer_or_raise
-from ..serializers import CurrentUserBookingListSerializer, DetailBookingSerializer
+from ..serializers import BookingMutationSerializer, CurrentUserBookingListSerializer, DetailBookingSerializer
 from ..services import (
     create_booking,
     find_existing_user_booking,
@@ -23,10 +24,6 @@ from ..services import (
     get_filtered_user_bookings_queryset,
     remove_booking_for_user,
 )
-
-
-ManageBookingsView = legacy_manage_bookings.ManageBookingsView
-GetAllBookingsByUserView = legacy_manage_bookings.GetAllBookingsByUserView
 
 
 def _resolve_request_user_profile(request, payload=None):
@@ -119,6 +116,7 @@ class BookingViewSet(viewsets.ViewSet):
             user_profile,
             pk,
             must_be_future=False,
+            include_detail_relations=True,
         )
         serializer = DetailBookingSerializer(booking, context={"request": request})
         return Response(serializer.data, status=status.HTTP_200_OK)
@@ -127,10 +125,21 @@ class BookingViewSet(viewsets.ViewSet):
         payload, _ = _payload_with_user_session(request, request.data)
         input_serializer = BookingCreateRequestSerializer(data=payload)
         validated_data = validate_serializer_or_raise(input_serializer)
+        request_started_at = perf_counter()
         booking, created = create_booking(validated_data)
-        serializer = DetailBookingSerializer(booking, context={"request": request})
+        serializer_started_at = perf_counter()
+        serializer = BookingMutationSerializer(booking, context={"request": request})
+        response_payload = serializer.data
+        serializer_duration_ms = (perf_counter() - serializer_started_at) * 1000
+        logger.info(
+            "booking.api event=create_booking_mutation duration_ms=%.2f serializer_duration_ms=%.2f booking_number=%s created=%s",
+            (perf_counter() - request_started_at) * 1000,
+            serializer_duration_ms,
+            booking.booking_number,
+            created,
+        )
         return Response(
-            serializer.data,
+            response_payload,
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
         )
 

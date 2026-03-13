@@ -1,21 +1,13 @@
 from rest_framework import serializers
-from .models import UserOTP, SubscribeUser, UserProfile, Wallet, MailingDetail, UserBankAccount, UserTransactionHistory, UserWithdraw
+from .models import UserOTP, UserProfile, Wallet, MailingDetail, UserBankAccount, UserTransactionHistory, UserWithdraw
 import re
 
 
-class SubscribeSerializer(serializers.ModelSerializer):
-
-    class Meta:
-        model = SubscribeUser
-        fields = ['email']
-
-    def validate_email(self, value):
-        # Regular expression pattern for a valid phone number
-        regex = r'^[a-zA-Z0-9.+_-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]+$'
-        # Validate the phone number
-        if not re.fullmatch(regex, value):
-            raise serializers.ValidationError("You've entered an invalid email format.")
-        return value
+def _get_prefetched_items(instance, relation_name):
+    prefetched_cache = getattr(instance, '_prefetched_objects_cache', None) or {}
+    if relation_name not in prefetched_cache:
+        return None
+    return list(prefetched_cache.get(relation_name) or [])
 
 
 class UserOTPSerializer(serializers.ModelSerializer):
@@ -44,6 +36,13 @@ class UserProfileSerializer(serializers.ModelSerializer):
                   )
 
     def get_wallet_amount(self, obj):
+        prefetched_wallets = _get_prefetched_items(obj, 'wallet_session')
+        if prefetched_wallets is not None:
+            if not prefetched_wallets:
+                return 0.0
+            wallet_amount = prefetched_wallets[0].wallet_amount
+            return wallet_amount if wallet_amount is not None else 0.0
+
         wallet_amount = (
             Wallet.objects.filter(wallet_session=obj)
             .values_list('wallet_amount', flat=True)

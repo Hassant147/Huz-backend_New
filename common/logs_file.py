@@ -1,16 +1,19 @@
 import logging
+from pathlib import Path
+
+from django.conf import settings
 
 # Configure logger
 logger = logging.getLogger('my_app_logger')
 logger.setLevel(logging.INFO)
 
-# Create file handler
-file_handler = logging.FileHandler('view_logs.txt')
-file_handler.setLevel(logging.INFO)
+if not logger.handlers:
+    log_path = Path(settings.VIEW_LOG_PATH)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
 
-# Create formatter and add it to the handler
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(formatter)
+    file_handler = logging.FileHandler(log_path)
+    file_handler.setLevel(logging.INFO)
 
-# Add the handler to the logger
-logger.addHandler(file_handler)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
