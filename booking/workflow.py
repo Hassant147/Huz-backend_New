@@ -176,6 +176,22 @@ def get_remaining_amount_due(booking):
     return float(max(remaining_amount, Decimal("0.00")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
+def normalize_airline_direction(value):
+    normalized = str(value or "").strip().lower()
+    if normalized in {"return", "inbound", "back"}:
+        return "return"
+    return "outbound"
+
+
+def _get_airline_sort_timestamp(detail):
+    flight_date = getattr(detail, "flight_date", None)
+    if flight_date is None:
+        return 0
+    if timezone.is_naive(flight_date):
+        flight_date = timezone.make_aware(flight_date, timezone.get_current_timezone())
+    return flight_date.timestamp()
+
+
 def _get_related_items(booking, relation_name):
     related_items_cache = getattr(booking, "_cached_related_items", None)
     if related_items_cache is None:
@@ -204,6 +220,44 @@ def _get_related_items(booking, relation_name):
     return related_items_cache[relation_name]
 
 
+def booking_requires_return_airline_detail(booking):
+    package = getattr(booking, "package_token", None)
+    if package is None:
+        return False
+
+    package_airlines = _get_related_items(package, "airline_for_package")
+    if not package_airlines:
+        return False
+
+    return bool(getattr(package_airlines[0], "is_return_flight_included", False))
+
+
+def get_booking_airline_details(booking):
+    direction_order = {"outbound": 0, "return": 1}
+    return sorted(
+        _get_related_items(booking, "airline_for_booking"),
+        key=lambda detail: (
+            direction_order.get(
+                normalize_airline_direction(getattr(detail, "flight_direction", "")),
+                len(direction_order),
+            ),
+            _get_airline_sort_timestamp(detail),
+        ),
+    )
+
+
+def booking_airline_details_are_complete(booking):
+    required_directions = {"outbound"}
+    if booking_requires_return_airline_detail(booking):
+        required_directions.add("return")
+
+    captured_directions = {
+        normalize_airline_direction(getattr(detail, "flight_direction", ""))
+        for detail in get_booking_airline_details(booking)
+    }
+    return required_directions.issubset(captured_directions)
+
+
 def booking_passports_are_complete(booking):
     traveller_status = _get_related_items(booking, "passport_for_booking_number")
     expected_traveller_count = get_expected_traveller_count(booking)
@@ -229,15 +283,12 @@ def booking_operator_documents_are_complete(booking):
         return False
 
     document_status = document_statuses[0]
-    return all(
-        bool(getattr(document_status, flag, False))
-        for flag in (
-            "is_visa_completed",
-            "is_airline_completed",
-            "is_airline_detail_completed",
-            "is_hotel_completed",
-            "is_transport_completed",
-        )
+    return (
+        bool(getattr(document_status, "is_visa_completed", False))
+        and bool(getattr(document_status, "is_airline_completed", False))
+        and booking_airline_details_are_complete(booking)
+        and bool(getattr(document_status, "is_hotel_completed", False))
+        and bool(getattr(document_status, "is_transport_completed", False))
     )
 
 

@@ -14,7 +14,7 @@ from rest_framework.test import APIRequestFactory, APITransactionTestCase, force
 
 from common.models import MailingDetail, UserProfile
 from management.approval_task import FetchPaidBookingView
-from partners.models import BusinessProfile, HuzBasicDetail, HuzPackageDateRange, PartnerProfile, Wallet
+from partners.models import BusinessProfile, HuzAirlineDetail, HuzBasicDetail, HuzHotelDetail, HuzPackageDateRange, HuzTransportDetail, PartnerProfile, Wallet
 
 from .manage_partner_booking import (
     GetOverallPartnerComplaintsView,
@@ -40,6 +40,7 @@ from .models import (
     BookingAirlineDetail,
     BookingComplaints,
     BookingDocuments,
+    BookingHotelAndTransport,
     BookingObjections,
     BookingRequest,
     DocumentsStatus,
@@ -2653,6 +2654,115 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertEqual(response.data.get("booking_number"), hidden_booking.booking_number)
         self.assertFalse(response.data.get("operator_visible"))
 
+    def test_partner_detail_includes_package_transport_and_hotel_defaults(self):
+        self.package_a.jeddah_nights = 1
+        self.package_a.mecca_nights = 6
+        self.package_a.madinah_nights = 3
+        self.package_a.taif_nights = 2
+        self.package_a.riyadah_nights = 1
+        self.package_a.save(
+            update_fields=[
+                "jeddah_nights",
+                "mecca_nights",
+                "madinah_nights",
+                "taif_nights",
+                "riyadah_nights",
+            ]
+        )
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-DETAIL-PACKAGE-DEFAULTS-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(booking)
+        HuzTransportDetail.objects.create(
+            transport_name="Coaster",
+            transport_type="Shared",
+            routes="JED_MKK,MKK_MDN,MDN_JED",
+            transport_for_package=self.package_a,
+        )
+        HuzHotelDetail.objects.create(
+            hotel_city="Makkah",
+            hotel_name="Premium Makkah Hotel",
+            hotel_rating="5 Star",
+            room_sharing_type="Quad",
+            hotel_distance="900",
+            distance_type="Meters",
+            hotel_for_package=self.package_a,
+        )
+
+        request = self._authenticated_request(
+            self.factory.get(
+                "/bookings/get_booking_detail_by_booking_number/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "booking_number": booking.booking_number,
+                },
+            )
+        )
+
+        response = GetBookingDetailByBookingNumberForPartnerView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("transport_detail", {}).get("transport_name"), "Coaster")
+        self.assertEqual(response.data.get("transport_detail", {}).get("routes"), "JED_MKK,MKK_MDN,MDN_JED")
+        self.assertEqual(response.data.get("hotel_detail", [])[0].get("hotel_name"), "Premium Makkah Hotel")
+        self.assertEqual(response.data.get("hotel_detail", [])[0].get("hotel_city"), "Makkah")
+        self.assertEqual(response.data.get("jeddah_nights"), "1")
+        self.assertEqual(response.data.get("taif_nights"), "2")
+        self.assertEqual(response.data.get("riyadah_nights"), "1")
+
+    def test_hotel_transport_post_persists_additional_city_contacts(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-DETAIL-ARRANGEMENT-CITIES-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(booking)
+
+        request = self._authenticated_request(
+            self.factory.post(
+                "/bookings/manage_booking_hotel_or_transport_details/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "booking_number": booking.booking_number,
+                    "jeddah_name": "Jeddah Desk",
+                    "jeddah_number": "+9665000001",
+                    "mecca_name": "Makkah Desk",
+                    "mecca_number": "+9665000002",
+                    "madinah_name": "Madinah Desk",
+                    "madinah_number": "+9665000003",
+                    "taif_name": "Taif Desk",
+                    "taif_number": "+9665000004",
+                    "riyadh_name": "Riyadh Desk",
+                    "riyadh_number": "+9665000005",
+                    "comment_1": "Primary arrangement note",
+                    "comment_2": "Secondary arrangement note",
+                    "detail_for": "Transport",
+                },
+                format="json",
+            )
+        )
+
+        response = BookingHotelAndTransportDetailsView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(
+            response.data.get("booking_hotel_and_transport_details", [])[0].get("taif_name"),
+            "Taif Desk",
+        )
+        self.assertEqual(
+            response.data.get("booking_hotel_and_transport_details", [])[0].get("riyadh_name"),
+            "Riyadh Desk",
+        )
+
+        detail = BookingHotelAndTransport.objects.get(
+            hotel_or_transport_for_booking=booking,
+            detail_for="Transport",
+        )
+        self.assertEqual(detail.taif_number, "+9665000004")
+        self.assertEqual(detail.riyadh_number, "+9665000005")
+
     def test_complaints_list_returns_paginated_empty_payload(self):
         request = self._authenticated_request(
             self.factory.get(
@@ -2995,6 +3105,122 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         response = BookingHotelAndTransportDetailsView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("Invalid detail_for", response.data.get("message", ""))
+
+    def test_airline_post_requires_both_legs_for_round_trip_booking(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-AIRLINE-ROUNDTRIP-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        DocumentsStatus.objects.update_or_create(
+            status_for_booking=booking,
+            defaults={
+                "is_visa_completed": True,
+                "is_airline_completed": True,
+                "is_airline_detail_completed": False,
+                "is_hotel_completed": True,
+                "is_transport_completed": True,
+            },
+        )
+        HuzAirlineDetail.objects.create(
+            airline_name="Flynas",
+            ticket_type="economy",
+            flight_from="Karachi",
+            flight_to="Jeddah",
+            return_flight_from="Jeddah",
+            return_flight_to="Karachi",
+            is_return_flight_included=True,
+            airline_for_package=self.package_a,
+        )
+
+        outbound_request = self._authenticated_request(
+            self.factory.post(
+                "/bookings/manage_booking_airline_details/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "booking_number": booking.booking_number,
+                    "flight_direction": "outbound",
+                    "flight_date": timezone.now().isoformat(),
+                    "flight_time": "10:00:00",
+                    "flight_from": "Karachi",
+                    "flight_to": "Jeddah",
+                },
+                format="json",
+            )
+        )
+
+        outbound_response = BookingAirlineDetailsView.as_view()(outbound_request)
+        self.assertEqual(outbound_response.status_code, status.HTTP_201_CREATED)
+
+        booking.refresh_from_db()
+        document_status = DocumentsStatus.objects.get(status_for_booking=booking)
+        self.assertFalse(document_status.is_airline_detail_completed)
+        self.assertEqual(booking.booking_status, BOOKING_STATUS_IN_FULFILLMENT)
+
+        return_request = self._authenticated_request(
+            self.factory.post(
+                "/bookings/manage_booking_airline_details/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "booking_number": booking.booking_number,
+                    "flight_direction": "return",
+                    "flight_date": (timezone.now() + timedelta(days=10)).isoformat(),
+                    "flight_time": "18:30:00",
+                    "flight_from": "Jeddah",
+                    "flight_to": "Karachi",
+                },
+                format="json",
+            )
+        )
+
+        return_response = BookingAirlineDetailsView.as_view()(return_request)
+        self.assertEqual(return_response.status_code, status.HTTP_201_CREATED)
+
+        booking.refresh_from_db()
+        document_status.refresh_from_db()
+        self.assertTrue(document_status.is_airline_detail_completed)
+        self.assertEqual(booking.booking_status, BOOKING_STATUS_READY_FOR_TRAVEL)
+        self.assertEqual(
+            list(
+                BookingAirlineDetail.objects.filter(airline_for_booking=booking).order_by("flight_direction").values_list(
+                    "flight_direction", flat=True
+                )
+            ),
+            ["outbound", "return"],
+        )
+
+    def test_airline_post_rejects_return_leg_for_one_way_booking(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-AIRLINE-ONEWAY-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+
+        request = self._authenticated_request(
+            self.factory.post(
+                "/bookings/manage_booking_airline_details/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "booking_number": booking.booking_number,
+                    "flight_direction": "return",
+                    "flight_date": timezone.now().isoformat(),
+                    "flight_time": "18:30:00",
+                    "flight_from": "Jeddah",
+                    "flight_to": "Karachi",
+                },
+                format="json",
+            )
+        )
+
+        response = BookingAirlineDetailsView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data.get("message"),
+            "Return airline details are not enabled for this booking.",
+        )
+        self.assertFalse(BookingAirlineDetail.objects.filter(airline_for_booking=booking).exists())
 
     def test_airline_put_is_scoped_to_booking_airline_id(self):
         booking_a = self._create_booking(

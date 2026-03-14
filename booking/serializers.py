@@ -6,13 +6,20 @@ from .models import Booking, Payment, BookingRequest, PassportValidity, BookingO
 from common.models import UserProfile, MailingDetail
 from common.serializers import MailingDetailSerializer
 from partners.models import PartnerProfile, HuzBasicDetail, BusinessProfile, PartnerMailingDetail, HuzAirlineDetail
-from partners.serializers import ShortBusinessSerializer, PartnerMailingDetailSerializer, HuzAirlineSerializer
+from partners.serializers import (
+    ShortBusinessSerializer,
+    PartnerMailingDetailSerializer,
+    HuzAirlineSerializer,
+    HuzHotelSerializer,
+    HuzTransportSerializer,
+)
 from .statuses import ISSUE_STATUS_NONE
 from .workflow import (
     booking_allows_client_traveller_updates,
     booking_allows_full_payment_submission,
     booking_allows_minimum_payment_submission,
     booking_allows_operator_action,
+    get_booking_airline_details,
     booking_has_operator_visibility,
     get_payment_stage_status,
     get_remaining_amount_due,
@@ -454,6 +461,9 @@ class ShortBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSerial
     package_cost = serializers.CharField(source='package_token.package_base_cost', read_only=True)
     mecca_nights = serializers.CharField(source='package_token.mecca_nights', read_only=True)
     madinah_nights = serializers.CharField(source='package_token.madinah_nights', read_only=True)
+    jeddah_nights = serializers.CharField(source='package_token.jeddah_nights', read_only=True)
+    taif_nights = serializers.CharField(source='package_token.taif_nights', read_only=True)
+    riyadah_nights = serializers.CharField(source='package_token.riyadah_nights', read_only=True)
     is_visa_included = serializers.CharField(source='package_token.is_visa_included', read_only=True)
     is_airport_reception_included = serializers.CharField(source='package_token.is_airport_reception_included', read_only=True)
     is_tour_guide_included = serializers.CharField(source='package_token.is_tour_guide_included', read_only=True)
@@ -483,6 +493,7 @@ class ShortBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSerial
             'user_photo', 'user_address_detail',
 
             'huz_token', 'package_type', 'package_name', 'package_cost', 'mecca_nights', 'madinah_nights',
+            'jeddah_nights', 'taif_nights', 'riyadah_nights',
             'is_visa_included', 'is_airport_reception_included', 'is_tour_guide_included', 'is_insurance_included',
             'is_breakfast_included', 'is_lunch_included', 'is_dinner_included',
 
@@ -530,6 +541,9 @@ class DetailBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSeria
     package_cost = serializers.CharField(source='package_token.package_base_cost', read_only=True)
     mecca_nights = serializers.CharField(source='package_token.mecca_nights', read_only=True)
     madinah_nights = serializers.CharField(source='package_token.madinah_nights', read_only=True)
+    jeddah_nights = serializers.CharField(source='package_token.jeddah_nights', read_only=True)
+    taif_nights = serializers.CharField(source='package_token.taif_nights', read_only=True)
+    riyadah_nights = serializers.CharField(source='package_token.riyadah_nights', read_only=True)
     is_visa_included = serializers.CharField(source='package_token.is_visa_included', read_only=True)
     is_airport_reception_included = serializers.CharField(source='package_token.is_airport_reception_included', read_only=True)
     is_tour_guide_included = serializers.CharField(source='package_token.is_tour_guide_included', read_only=True)
@@ -545,6 +559,8 @@ class DetailBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSeria
     cost_for_single = serializers.CharField(source='package_token.cost_for_single', read_only=True)
 
     airline_detail = serializers.SerializerMethodField()
+    transport_detail = serializers.SerializerMethodField()
+    hotel_detail = serializers.SerializerMethodField()
     booking_documents_status = serializers.SerializerMethodField()
     booking_documents = serializers.SerializerMethodField()
     user_documents = serializers.SerializerMethodField()
@@ -573,9 +589,10 @@ class DetailBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSeria
             'user_session_token', 'user_fullName', 'user_country_code', 'user_phone_number', 'user_email',
             'user_photo', 'user_address_detail',
 
-            'airline_detail',
+            'airline_detail', 'transport_detail', 'hotel_detail',
 
             'huz_token', 'package_type', 'package_name', 'package_cost', 'mecca_nights', 'madinah_nights',
+            'jeddah_nights', 'taif_nights', 'riyadah_nights',
             'is_visa_included', 'is_airport_reception_included', 'is_tour_guide_included', 'is_insurance_included',
             'is_breakfast_included', 'is_lunch_included', 'is_dinner_included',
             'cost_for_sharing', 'cost_for_quad', 'cost_for_triple', 'cost_for_double', 'cost_for_single',
@@ -595,6 +612,23 @@ class DetailBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSeria
 
         airline = _list_related_items(obj.package_token, 'airline_for_package')
         return HuzAirlineSerializer(airline, many=True).data
+
+    def get_transport_detail(self, obj):
+        if not obj.package_token:
+            return None
+
+        transport_items = _list_related_items(obj.package_token, 'transport_for_package')
+        if not transport_items:
+            return None
+
+        return HuzTransportSerializer(transport_items[0], context=self.context).data
+
+    def get_hotel_detail(self, obj):
+        if not obj.package_token:
+            return []
+
+        hotel_items = _list_related_items(obj.package_token, 'hotel_for_package')
+        return HuzHotelSerializer(hotel_items, many=True, context=self.context).data
 
     def get_passport_validity_detail(self, obj):
         return get_passport_validity(obj)
@@ -621,7 +655,7 @@ class DetailBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSeria
         return BookingDocumentsSerializer(documents, many=True).data
 
     def get_booking_airline_details(self, obj):
-        airline = _list_related_items(obj, 'airline_for_booking')
+        airline = get_booking_airline_details(obj)
         return BookingAirlineSerializer(airline, many=True).data
 
     def get_booking_hotel_and_transport_details(self, obj):
@@ -765,14 +799,15 @@ class DocumentsStatusSerializer(serializers.ModelSerializer):
 class BookingAirlineSerializer(serializers.ModelSerializer):
     class Meta:
         model = BookingAirlineDetail
-        fields = ['booking_airline_id', 'flight_date', 'flight_time', 'flight_from', 'flight_to']
+        fields = ['booking_airline_id', 'flight_direction', 'flight_date', 'flight_time', 'flight_from', 'flight_to']
 
 
 class BookingHotelOrTransportSerializer(serializers.ModelSerializer):
     class Meta:
         model = BookingHotelAndTransport
         fields = ['hotel_or_transport_id', 'detail_for', 'jeddah_name', 'jeddah_number', 'mecca_name',
-                  'mecca_number', 'madinah_name', 'madinah_number', 'comment_1', 'comment_2',
+                  'mecca_number', 'madinah_name', 'madinah_number', 'taif_name', 'taif_number',
+                  'riyadh_name', 'riyadh_number', 'comment_1', 'comment_2',
                   'shared_time']
 
 

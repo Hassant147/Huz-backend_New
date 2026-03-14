@@ -185,7 +185,19 @@ class DocumentsStatus(models.Model):
 
 
 class BookingAirlineDetail(models.Model):
+    FLIGHT_DIRECTION_OUTBOUND = "outbound"
+    FLIGHT_DIRECTION_RETURN = "return"
+    FLIGHT_DIRECTION_CHOICES = (
+        (FLIGHT_DIRECTION_OUTBOUND, "Outbound"),
+        (FLIGHT_DIRECTION_RETURN, "Return"),
+    )
+
     booking_airline_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    flight_direction = models.CharField(
+        max_length=20,
+        choices=FLIGHT_DIRECTION_CHOICES,
+        default=FLIGHT_DIRECTION_OUTBOUND,
+    )
     flight_date = models.DateTimeField()
     flight_time = models.TimeField()
     flight_from = models.CharField(max_length=100)
@@ -205,6 +217,10 @@ class BookingHotelAndTransport(models.Model):
     mecca_number = models.CharField(max_length=20)
     madinah_name = models.CharField(max_length=100)
     madinah_number = models.CharField(max_length=20)
+    taif_name = models.CharField(max_length=100, null=True, blank=True)
+    taif_number = models.CharField(max_length=20, null=True, blank=True)
+    riyadh_name = models.CharField(max_length=100, null=True, blank=True)
+    riyadh_number = models.CharField(max_length=20, null=True, blank=True)
     comment_1 = models.TextField(null=True)
     comment_2 = models.TextField(null=True)
     # e.g Hotel or Transport

@@ -46,7 +46,11 @@ from .statuses import (
 )
 from .workflow import (
     booking_allows_operator_action,
+    booking_airline_details_are_complete,
+    booking_requires_return_airline_detail,
+    clear_booking_runtime_caches,
     normalize_booking_status,
+    normalize_airline_direction,
     resolve_operator_workflow_bucket,
     sync_booking_state,
 )
@@ -155,6 +159,10 @@ BOOKING_DETAIL_PREFETCH_RELATED = (
     "order_to__company_of_partner",
     "order_to__mailing_of_partner",
     "package_token__airline_for_package",
+    "package_token__transport_for_package",
+    "package_token__hotel_for_package",
+    "package_token__hotel_for_package__hotel_images",
+    "package_token__hotel_for_package__catalog_hotel__hotel_images",
     "objection_for_booking",
     "passport_for_booking_number",
     "booking_token",
@@ -219,6 +227,20 @@ def normalize_document_type(document_for):
 def normalize_arrangement_detail_type(detail_for):
     normalized = str(detail_for or "").strip().lower()
     return ARRANGEMENT_DETAIL_TYPE_NORMALIZER.get(normalized, "")
+
+
+def get_airline_direction_label(direction):
+    return "Return" if normalize_airline_direction(direction) == "return" else "Outbound"
+
+
+def sync_airline_detail_completion(booking_detail, doc=None):
+    clear_booking_runtime_caches(booking_detail)
+    doc = doc or DocumentsStatus.objects.get_or_create(status_for_booking=booking_detail)[0]
+    is_complete = booking_airline_details_are_complete(booking_detail)
+    if bool(doc.is_airline_detail_completed) != is_complete:
+        doc.is_airline_detail_completed = is_complete
+        doc.save(update_fields=["is_airline_detail_completed"])
+    return doc, is_complete
 
 
 def can_update_booking_documents(booking_detail):
@@ -650,6 +672,7 @@ class BookingAirlineDetailsView(APIView):
             properties={
                 'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Partner session token'),
                 'booking_number': openapi.Schema(type=openapi.TYPE_STRING, description='Booking number'),
+                'flight_direction': openapi.Schema(type=openapi.TYPE_STRING, description='Flight leg direction: outbound or return'),
                 'flight_date': openapi.Schema(type=openapi.TYPE_STRING, format=openapi.FORMAT_DATE, description='Flight date'),
                 'flight_time': openapi.Schema(type=openapi.TYPE_STRING, description='Flight time'),
                 'flight_from': openapi.Schema(type=openapi.TYPE_STRING, description='Flight origin'),
@@ -696,10 +719,19 @@ class BookingAirlineDetailsView(APIView):
             if not package_detail:
                 return Response({"message": "Package detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            # Check if airline details already exist for the booking
-            check_exist = BookingAirlineDetail.objects.filter(airline_for_booking=booking_detail).first()
+            flight_direction = normalize_airline_direction(data.get('flight_direction'))
+            if flight_direction == "return" and not booking_requires_return_airline_detail(booking_detail):
+                return Response({"message": "Return airline details are not enabled for this booking."}, status=status.HTTP_400_BAD_REQUEST)
+
+            check_exist = BookingAirlineDetail.objects.filter(
+                airline_for_booking=booking_detail,
+                flight_direction=flight_direction,
+            ).first()
             if check_exist:
-                return Response({"message": "Airline details already exist."}, status=status.HTTP_409_CONFLICT)
+                return Response(
+                    {"message": f"{get_airline_direction_label(flight_direction)} airline details already exist."},
+                    status=status.HTTP_409_CONFLICT,
+                )
 
             # Check if the booking status allows for adding airline details
             if can_update_booking_documents(booking_detail):
@@ -708,6 +740,7 @@ class BookingAirlineDetailsView(APIView):
 
                 # Create new airline detail entry
                 BookingAirlineDetail.objects.create(
+                    flight_direction=flight_direction,
                     flight_date=request.data.get('flight_date'),
                     flight_time=request.data.get('flight_time'),
                     flight_from=request.data.get('flight_from'),
@@ -715,9 +748,7 @@ class BookingAirlineDetailsView(APIView):
                     airline_for_booking=booking_detail
                 )
 
-                # Mark airline detail as completed in document status
-                doc.is_airline_detail_completed = True
-                doc.save(update_fields=["is_airline_detail_completed"])
+                doc, _ = sync_airline_detail_completion(booking_detail, doc)
 
                 finalize_booking_if_all_documents_completed(
                     booking_detail=booking_detail,
@@ -747,6 +778,7 @@ class BookingAirlineDetailsView(APIView):
                 'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Partner session token'),
                 'booking_airline_id': openapi.Schema(type=openapi.TYPE_STRING, description='Booking airline ID'),
                 'booking_number': openapi.Schema(type=openapi.TYPE_STRING, description='Booking number'),
+                'flight_direction': openapi.Schema(type=openapi.TYPE_STRING, description='Flight leg direction: outbound or return'),
                 'flight_date': openapi.Schema(type=openapi.TYPE_STRING, format=openapi.FORMAT_DATE, description='Flight date'),
                 'flight_time': openapi.Schema(type=openapi.TYPE_STRING, description='Flight time'),
                 'flight_from': openapi.Schema(type=openapi.TYPE_STRING, description='Flight origin'),
@@ -788,12 +820,31 @@ class BookingAirlineDetailsView(APIView):
                 return Response({"message": "Airline details not found."}, status=status.HTTP_404_NOT_FOUND)
 
             if can_update_booking_documents(booking_detail):
+                flight_direction = normalize_airline_direction(
+                    data.get('flight_direction') or getattr(airline_detail, 'flight_direction', '')
+                )
+                if flight_direction == "return" and not booking_requires_return_airline_detail(booking_detail):
+                    return Response({"message": "Return airline details are not enabled for this booking."}, status=status.HTTP_400_BAD_REQUEST)
+
+                duplicate_direction = BookingAirlineDetail.objects.filter(
+                    airline_for_booking=booking_detail,
+                    flight_direction=flight_direction,
+                ).exclude(booking_airline_id=airline_detail.booking_airline_id).exists()
+                if duplicate_direction:
+                    return Response(
+                        {"message": f"{get_airline_direction_label(flight_direction)} airline details already exist."},
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
                 # Update the airline detail fields with the new data
+                airline_detail.flight_direction = flight_direction
                 airline_detail.flight_date = data.get('flight_date')
                 airline_detail.flight_time = data.get('flight_time')
                 airline_detail.flight_from = data.get('flight_from')
                 airline_detail.flight_to = data.get('flight_to')
                 airline_detail.save()
+
+                sync_airline_detail_completion(booking_detail)
 
                 sync_booking_state(booking_detail, save=True)
                 serialized_package = LegacyDetailBookingSerializer(booking_detail, context={"request": request, "hide_payment_detail": True})
@@ -813,7 +864,7 @@ class BookingHotelAndTransportDetailsView(APIView):
         operation_description="Add hotel and transport details for a booking.",
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
-            required=['partner_session_token', 'booking_number', 'jeddah_name', 'jeddah_number', 'mecca_name', 'mecca_number', 'madinah_name', 'madinah_number', 'comment_1',  'comment_2', 'detail_for'],
+            required=['partner_session_token', 'booking_number', 'jeddah_name', 'jeddah_number', 'mecca_name', 'mecca_number', 'madinah_name', 'madinah_number', 'comment_1', 'detail_for'],
             properties={
                 'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Partner session token'),
                 'jeddah_name': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Name for Jeddah hotel'),
@@ -822,8 +873,12 @@ class BookingHotelAndTransportDetailsView(APIView):
                 'mecca_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Number for Mecca hotel'),
                 'madinah_name': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Name for Madinah hotel'),
                 'madinah_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Number for Madinah hotel'),
-                'comment_1': openapi.Schema(type=openapi.TYPE_STRING, description='Additional comment or note 1'),
-                'comment_2': openapi.Schema(type=openapi.TYPE_STRING, description='Additional comment or note 2'),
+                'taif_name': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Name for Taif hotel or transport'),
+                'taif_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Number for Taif hotel or transport'),
+                'riyadh_name': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Name for Riyadh hotel or transport'),
+                'riyadh_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Number for Riyadh hotel or transport'),
+                'comment_1': openapi.Schema(type=openapi.TYPE_STRING, description='Traveler-facing arrangement note'),
+                'comment_2': openapi.Schema(type=openapi.TYPE_STRING, description='Legacy secondary arrangement note (optional)'),
                 'detail_for': openapi.Schema(type=openapi.TYPE_STRING, description='Detail type (Hotel or Transport)'),
             },
         ),
@@ -839,7 +894,7 @@ class BookingHotelAndTransportDetailsView(APIView):
     def post(self, request, *args, **kwargs):
         try:
             data = request.data
-            required_fields = ['partner_session_token', 'booking_number', 'jeddah_name', 'jeddah_number', 'mecca_name', 'mecca_number', 'madinah_name', 'madinah_number', 'comment_1',  'comment_2', 'detail_for']
+            required_fields = ['partner_session_token', 'booking_number', 'jeddah_name', 'jeddah_number', 'mecca_name', 'mecca_number', 'madinah_name', 'madinah_number', 'comment_1', 'detail_for']
 
             # Check for missing required fields
             error_response = validate_required_fields(required_fields, data)
@@ -892,6 +947,10 @@ class BookingHotelAndTransportDetailsView(APIView):
                     mecca_number=data.get('mecca_number'),
                     madinah_name=data.get('madinah_name'),
                     madinah_number=data.get('madinah_number'),
+                    taif_name=data.get('taif_name'),
+                    taif_number=data.get('taif_number'),
+                    riyadh_name=data.get('riyadh_name'),
+                    riyadh_number=data.get('riyadh_number'),
                     comment_1=data.get('comment_1'),
                     comment_2=data.get('comment_2'),
                     detail_for=normalized_detail_for,
@@ -946,12 +1005,16 @@ class BookingHotelAndTransportDetailsView(APIView):
                 'mecca_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact number for Mecca hotel/transport'),
                 'madinah_name': openapi.Schema(type=openapi.TYPE_STRING, description='Name of the Madinah hotel/transport'),
                 'madinah_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact number for Madinah hotel/transport'),
-                'comment_1': openapi.Schema(type=openapi.TYPE_STRING, description='First comment'),
-                'comment_2': openapi.Schema(type=openapi.TYPE_STRING, description='Second comment'),
+                'taif_name': openapi.Schema(type=openapi.TYPE_STRING, description='Name of the Taif hotel/transport'),
+                'taif_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact number for Taif hotel/transport'),
+                'riyadh_name': openapi.Schema(type=openapi.TYPE_STRING, description='Name of the Riyadh hotel/transport'),
+                'riyadh_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact number for Riyadh hotel/transport'),
+                'comment_1': openapi.Schema(type=openapi.TYPE_STRING, description='Traveler-facing arrangement note'),
+                'comment_2': openapi.Schema(type=openapi.TYPE_STRING, description='Legacy secondary arrangement note (optional)'),
                 'detail_for': openapi.Schema(type=openapi.TYPE_STRING, description='Detail type (Hotel/Transport)')
             },
             required=['hotel_or_transport_id', 'partner_session_token', 'booking_number', 'jeddah_name', 'jeddah_number', 'mecca_name',
-                      'mecca_number', 'madinah_name', 'madinah_number', 'comment_1', 'comment_2', 'detail_for']
+                      'mecca_number', 'madinah_name', 'madinah_number', 'comment_1', 'detail_for']
         ),
         responses={
             200: openapi.Response('Hotel or transport details updated successfully', LegacyDetailBookingSerializer),
@@ -966,7 +1029,7 @@ class BookingHotelAndTransportDetailsView(APIView):
         try:
             data = request.data
             required_fields = ['hotel_or_transport_id', 'partner_session_token', 'booking_number', 'jeddah_name', 'jeddah_number',
-                               'mecca_name', 'mecca_number', 'madinah_name', 'madinah_number', 'comment_1', 'comment_2',
+                               'mecca_name', 'mecca_number', 'madinah_name', 'madinah_number', 'comment_1',
                                'detail_for']
 
             # Check for missing required fields
@@ -1006,6 +1069,10 @@ class BookingHotelAndTransportDetailsView(APIView):
                 detail_exists.mecca_number = data.get('mecca_number')
                 detail_exists.madinah_name = data.get('madinah_name')
                 detail_exists.madinah_number = data.get('madinah_number')
+                detail_exists.taif_name = data.get('taif_name')
+                detail_exists.taif_number = data.get('taif_number')
+                detail_exists.riyadh_name = data.get('riyadh_name')
+                detail_exists.riyadh_number = data.get('riyadh_number')
                 detail_exists.comment_1 = data.get('comment_1')
                 detail_exists.comment_2 = data.get('comment_2')
                 detail_exists.detail_for = normalized_detail_for
