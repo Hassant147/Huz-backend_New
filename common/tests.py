@@ -1,32 +1,59 @@
 import importlib
 from unittest.mock import Mock, patch
 
-from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.db import connection
 from django.test import SimpleTestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.urls import clear_url_caches
 from uuid import uuid4
-from rest_framework import status
-from rest_framework.test import APIRequestFactory, APITestCase, force_authenticate
+from rest_framework import serializers, status
+from rest_framework.test import APIRequestFactory, APITestCase
 
-from .models import MailingDetail, UserBankAccount, UserProfile, UserTransactionHistory, Wallet
+from .models import MailingDetail, UserBankAccount, UserOTP, UserProfile, UserTransactionHistory, Wallet
+from .phone_utils import resolve_phone_identity
 from .serializers import UserProfileSerializer
 from .user_profile import CreateMemberProfileView, SendOTPSMSAPIView
 from huz import urls as huz_urls
+
+
+class PhoneIdentityTests(SimpleTestCase):
+    def test_resolve_phone_identity_normalizes_countries_with_national_trunk_prefixes(self):
+        gb_identity = resolve_phone_identity(
+            phone_number="+447400123456",
+            country_code="+44",
+            country_iso_code="GB",
+            local_phone_number="07400123456",
+        )
+        it_identity = resolve_phone_identity(
+            phone_number="+3903123456789",
+            country_code="+39",
+            country_iso_code="IT",
+            local_phone_number="03123456789",
+        )
+
+        self.assertEqual(gb_identity["local_phone_number"], "7400123456")
+        self.assertEqual(gb_identity["full_phone_number"], "+447400123456")
+        self.assertEqual(it_identity["local_phone_number"], "03123456789")
+        self.assertEqual(it_identity["full_phone_number"], "+3903123456789")
+
+    def test_resolve_phone_identity_rejects_numbers_outside_selected_country(self):
+        with self.assertRaisesMessage(
+            serializers.ValidationError,
+            "Phone number does not match the selected country.",
+        ):
+            resolve_phone_identity(
+                phone_number="+15062345678",
+                country_code="+1",
+                country_iso_code="US",
+                local_phone_number="5062345678",
+            )
 
 
 class SendOTPSMSAPIViewThrottleTests(APITestCase):
     def setUp(self):
         cache.clear()
         self.factory = APIRequestFactory()
-        self.admin_user = get_user_model().objects.create_user(
-            username="otp-throttle-admin",
-            password="pass123",
-            is_staff=True,
-            is_superuser=True,
-        )
 
     def tearDown(self):
         cache.clear()
@@ -38,22 +65,20 @@ class SendOTPSMSAPIViewThrottleTests(APITestCase):
         mocked_post.return_value = Mock(status_code=200)
         view = SendOTPSMSAPIView.as_view()
 
-        for _ in range(10):
+        for _ in range(3):
             request = self.factory.post(
                 "/common/send_otp_sms/",
-                {"phone_number": "+921234567890"},
+                {"phone_number": "+14155552671"},
                 format="json",
             )
-            force_authenticate(request, user=self.admin_user)
             response = view(request)
             self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         throttled_request = self.factory.post(
             "/common/send_otp_sms/",
-            {"phone_number": "+921234567890"},
+            {"phone_number": "+14155552671"},
             format="json",
         )
-        force_authenticate(throttled_request, user=self.admin_user)
         throttled_response = view(throttled_request)
 
         self.assertEqual(throttled_response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
@@ -62,41 +87,64 @@ class SendOTPSMSAPIViewThrottleTests(APITestCase):
 class CreateMemberProfileViewTransactionTests(APITestCase):
     def setUp(self):
         self.factory = APIRequestFactory()
-        self.admin_user = get_user_model().objects.create_user(
-            username="member-create-admin",
-            password="pass123",
-            is_staff=True,
-            is_superuser=True,
-        )
 
     @patch("common.user_profile.save_notification", return_value="Success")
-    def test_create_member_profile_rejects_unsupported_country_before_persisting_user(
+    @patch("common.user_profile.send_sms_gateway_request")
+    def test_create_member_profile_normalizes_pakistan_number_with_leading_zero(
         self,
+        mocked_send_sms_gateway_request,
         _mocked_save_notification,
     ):
+        mocked_send_sms_gateway_request.return_value = Mock(status_code=200)
         request = self.factory.post(
             "/common/manage_user_account/",
             {
-                "phone_number": "+11234567890",
-                "name": "Test User",
-                "email": "unsupported-country@example.com",
+                "phone_number": "+923395690614",
+                "country_code": "+92",
+                "local_phone_number": "03395690614",
+                "name": "Pakistan User",
+                "email": "pakistan-user@example.com",
                 "user_type": "user",
             },
             format="json",
         )
-        force_authenticate(request, user=self.admin_user)
 
         response = CreateMemberProfileView.as_view()(request)
 
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(
-            response.data.get("message"),
-            "Sending OTP to this country is not allowed.",
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        created_user = UserProfile.objects.get(email="pakistan-user@example.com")
+        self.assertEqual(created_user.country_code, "+92")
+        self.assertEqual(created_user.phone_number, "3395690614")
+
+    @patch("common.user_profile.save_notification", return_value="Success")
+    @patch("common.user_profile.send_sms_gateway_request")
+    def test_create_member_profile_accepts_non_pakistani_country_codes(
+        self,
+        mocked_send_sms_gateway_request,
+        _mocked_save_notification,
+    ):
+        mocked_send_sms_gateway_request.return_value = Mock(status_code=200)
+        request = self.factory.post(
+            "/common/manage_user_account/",
+            {
+                "phone_number": "+14155552671",
+                "country_code": "+1",
+                "local_phone_number": "4155552671",
+                "name": "Test User",
+                "email": "global-user@example.com",
+                "user_type": "user",
+            },
+            format="json",
         )
-        self.assertFalse(
-            UserProfile.objects.filter(email="unsupported-country@example.com").exists()
-        )
-        self.assertEqual(Wallet.objects.count(), 0)
+
+        response = CreateMemberProfileView.as_view()(request)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        created_user = UserProfile.objects.get(email="global-user@example.com")
+        self.assertEqual(created_user.country_code, "+1")
+        self.assertEqual(created_user.phone_number, "4155552671")
+        self.assertNotIn("session_token", response.data.get("data", {}))
+        self.assertEqual(Wallet.objects.count(), 1)
 
     @patch("common.user_profile.save_notification", return_value="Success")
     @patch("common.user_profile.send_sms_gateway_request")
@@ -109,14 +157,15 @@ class CreateMemberProfileViewTransactionTests(APITestCase):
         request = self.factory.post(
             "/common/manage_user_account/",
             {
-                "phone_number": "+921234567890",
+                "phone_number": "+14155552671",
+                "country_code": "+1",
+                "local_phone_number": "4155552671",
                 "name": "Test User",
                 "email": "sms-failure@example.com",
                 "user_type": "user",
             },
             format="json",
         )
-        force_authenticate(request, user=self.admin_user)
 
         response = CreateMemberProfileView.as_view()(request)
 
@@ -127,6 +176,104 @@ class CreateMemberProfileViewTransactionTests(APITestCase):
         )
         self.assertFalse(UserProfile.objects.filter(email="sms-failure@example.com").exists())
         self.assertEqual(Wallet.objects.count(), 0)
+
+
+class PublicAuthContractTests(APITestCase):
+    def setUp(self):
+        self.user = UserProfile.objects.create(
+            session_token=f"auth-contract-session-{uuid4().hex[:8]}",
+            name="Contract User",
+            country_code="+1",
+            phone_number="4155552671",
+            email="contract-user@example.com",
+            user_type="user",
+        )
+        Wallet.objects.create(
+            wallet_code=f"auth-contract-wallet-{uuid4().hex[:8]}",
+            wallet_amount=0,
+            wallet_session=self.user,
+        )
+
+    def test_is_user_exist_does_not_leak_session_token(self):
+        response = self.client.post(
+            "/common/is_user_exist/",
+            {
+                "phone_number": "+14155552671",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("exists"), True)
+        self.assertNotIn("session_token", response.data)
+
+    def test_verify_otp_returns_authenticated_profile_after_match(self):
+        UserOTP.objects.create(phone_number="+14155552671", otp_password="654321")
+
+        response = self.client.put(
+            "/common/verify_otp/",
+            {
+                "phone_number": "+14155552671",
+                "otp_password": "654321",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data.get("data", {}).get("session_token"),
+            self.user.session_token,
+        )
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.is_phone_verified)
+
+    def test_verify_otp_normalizes_pakistan_number_with_trunk_zero(self):
+        pakistan_user = UserProfile.objects.create(
+            session_token=f"auth-contract-pk-session-{uuid4().hex[:8]}",
+            name="Pakistan User",
+            country_code="+92",
+            phone_number="3395690614",
+            email="pakistan-contract-user@example.com",
+            user_type="user",
+        )
+        Wallet.objects.create(
+            wallet_code=f"auth-contract-pk-wallet-{uuid4().hex[:8]}",
+            wallet_amount=0,
+            wallet_session=pakistan_user,
+        )
+        UserOTP.objects.create(phone_number="+923395690614", otp_password="123456")
+
+        response = self.client.put(
+            "/common/verify_otp/",
+            {
+                "phone_number": "+9203395690614",
+                "otp_password": "123456",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data.get("data", {}).get("session_token"),
+            pakistan_user.session_token,
+        )
+
+    @override_settings(DEBUG=True)
+    def test_verify_otp_does_not_accept_the_old_debug_bypass_code(self):
+        response = self.client.put(
+            "/common/verify_otp/",
+            {
+                "phone_number": "+14155552671",
+                "otp_password": "123456",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data.get("message"),
+            "OTP not found for this phone number.",
+        )
 
 
 class CurrentUserApiV1Tests(APITestCase):

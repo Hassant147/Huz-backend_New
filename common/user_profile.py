@@ -4,6 +4,11 @@ from rest_framework.response import Response
 from rest_framework import status, serializers
 from .models import UserProfile, Wallet, UserOTP
 from .serializers import UserProfileSerializer, UserOTPSerializer
+from .phone_utils import (
+    find_user_profile_by_phone,
+    resolve_phone_identity,
+    resolve_signup_phone_identity,
+)
 import requests
 from .utility import random_six_digits, generate_token, save_notification, delete_file_from_directory, save_file_in_directory, check_photo_format_and_size, validate_required_fields, send_verification_email, new_user_welcome_email
 from .logs_file import logger
@@ -12,7 +17,6 @@ from datetime import datetime
 from django.db import transaction
 from rest_framework.parsers import MultiPartParser, FormParser
 from decouple import config
-from django.conf import settings
 from django.utils import timezone
 from datetime import timedelta
 from drf_yasg.utils import swagger_auto_schema
@@ -22,9 +26,6 @@ GENDER_CHOICES = ['male', 'female', 'non_binary', 'prefer_not_to_say', 'other']
 SMS_GATEWAY_TIMEOUT_SECONDS = 6
 SMS_GATEWAY_MAX_ATTEMPTS = 2
 SMS_GATEWAY_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
-DEV_OTP_BYPASS_ENABLED = config('DEV_OTP_BYPASS_ENABLED', cast=bool, default=False)
-DEV_OTP_BYPASS_CODE = '123456'
-LOCAL_DEV_HOSTS = {'127.0.0.1', 'localhost'}
 
 
 class OTPDeliveryError(Exception):
@@ -68,18 +69,6 @@ def send_sms_gateway_request(url):
     raise requests.exceptions.RequestException("SMS gateway request failed.")
 
 
-def is_dev_otp_bypass_enabled(request=None):
-    host = ''
-
-    if request is not None:
-        try:
-            host = request.get_host().split(':')[0].lower()
-        except Exception:
-            host = ''
-
-    return settings.DEBUG or DEV_OTP_BYPASS_ENABLED or host in LOCAL_DEV_HOSTS
-
-
 def upsert_user_otp(phone_number, otp_code):
     user_otp, _ = UserOTP.objects.get_or_create(phone_number=phone_number)
     user_otp.otp_password = otp_code
@@ -87,17 +76,83 @@ def upsert_user_otp(phone_number, otp_code):
     return user_otp
 
 
-def user_exists_for_phone(phone_number):
-    country_code = phone_number[:-10]
-    local_phone_number = phone_number[-10:]
-    return UserProfile.objects.filter(
-        country_code=country_code,
-        phone_number=local_phone_number,
-    ).exists()
+def send_otp_via_sms_gateway(phone_number):
+    otp_code = random_six_digits()
+    sender = 'VTvOTP'
+    otp_message = f'HajjUmrah.co One-Time Password: {otp_code}. Please do not share OTP with anyone.'
+    api_key = config('APIKey', default='').strip()
+
+    if not api_key:
+        logger.error("SMS gateway API key is missing while sending OTP to %s.", phone_number)
+        raise OTPDeliveryError("Failed to send OTP. Please try again later.")
+
+    url = (
+        f'https://api.veevotech.com/v3/sendsms?hash={api_key}'
+        f'&receivernum={phone_number}&sendernum={sender}&textmessage={otp_message}'
+    )
+
+    try:
+        response = send_sms_gateway_request(url)
+    except requests.exceptions.RequestException as exc:
+        logger.error("OTP delivery request failed for %s: %s", phone_number, str(exc))
+        raise OTPDeliveryError("An error occurred while sending OTP.")
+
+    if response.status_code != 200:
+        logger.error(
+            "OTP delivery failed for %s with gateway status %s.",
+            phone_number,
+            response.status_code,
+        )
+        raise OTPDeliveryError("Failed to send OTP. Please try again later.")
+
+    upsert_user_otp(phone_number, otp_code)
+    return otp_code
+
+
+def get_phone_identity_from_request(request, *, allow_lookup_only=False):
+    try:
+        if allow_lookup_only:
+            return resolve_phone_identity(
+                phone_number=request.data.get('phone_number'),
+                country_code=request.data.get('country_code'),
+                local_phone_number=request.data.get('local_phone_number'),
+                country_iso_code=request.data.get('country_iso_code'),
+            )
+
+        return resolve_signup_phone_identity(
+            phone_number=request.data.get('phone_number'),
+            country_code=request.data.get('country_code'),
+            local_phone_number=request.data.get('local_phone_number'),
+            country_iso_code=request.data.get('country_iso_code'),
+        )
+    except serializers.ValidationError as exc:
+        detail = exc.detail[0] if isinstance(exc.detail, list) else exc.detail
+        raise serializers.ValidationError(detail)
+
+
+def get_user_for_phone_identity(phone_identity):
+    return find_user_profile_by_phone(
+        phone_number=phone_identity.get('full_phone_number'),
+        country_code=phone_identity.get('country_code'),
+        local_phone_number=phone_identity.get('local_phone_number'),
+    )
+
+
+def build_verified_user_response(user, message="OTP matched successfully."):
+    user.is_phone_verified = True
+    user.save(update_fields=['is_phone_verified'])
+    serializer = UserProfileSerializer(user)
+    return Response(
+        {
+            "message": message,
+            "data": serializer.data,
+        },
+        status=status.HTTP_200_OK,
+    )
 
 
 class SendOTPSMSAPIView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
     throttle_classes = [OTPAnonRateThrottle, OTPUserRateThrottle]
     @swagger_auto_schema(
         operation_description="Send OTP SMS to User",
@@ -105,62 +160,25 @@ class SendOTPSMSAPIView(APIView):
         responses={
             200: "Success: SMS Sent successfully",
             400: "Bad Request: Invalid input data",
-            401: "Unauthorized: Admin permissions required",
             500: "Server Error: Internal server error"
         }
     )
     def post(self, request):
-        phone_number = request.data.get('phone_number')
-        # Checking Required parameters
-        if not phone_number:
-            return Response({"message": "Phone number is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-        serializer = UserOTPSerializer(data=request.data)
-        # Validate phone number format
         try:
-            serializer.validate_phone_number(phone_number)
-        except serializers.ValidationError as e:
-            return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
+            phone_identity = get_phone_identity_from_request(request, allow_lookup_only=True)
+            phone_number = phone_identity['full_phone_number']
+        except serializers.ValidationError as exc:
+            return Response({"message": str(exc.detail)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Check country code
-        country_code = phone_number[:-10]
-        if country_code != '+92':
-            return Response({"message": "Sending OTP to this country is not allowed."}, status=status.HTTP_400_BAD_REQUEST)
-
-        if is_dev_otp_bypass_enabled(request):
-            upsert_user_otp(phone_number, DEV_OTP_BYPASS_CODE)
-            logger.warning("DEV OTP bypass enabled for send_otp_sms on %s.", phone_number)
+        try:
+            send_otp_via_sms_gateway(phone_number)
             return Response({"message": "OTP sent successfully."}, status=status.HTTP_200_OK)
-
-        # Getting a random 6-digit OTP from Utility
-        otp_code = random_six_digits()
-
-        sender = 'VTvOTP'
-        # SMS message
-        otp_message = f'HajjUmrah.co One-Time Password: {otp_code}. Please do not share OTP with anyone.'
-
-        # Construct API URL with credentials
-        API_Key = config('APIKey')  # Getting APIKey from environment file
-        url = f'https://api.veevotech.com/v3/sendsms?hash={API_Key}&receivernum={phone_number}&sendernum={sender}&textmessage={otp_message}'
-
-        try:
-            # Send SMS using requests module
-            response = send_sms_gateway_request(url)
-
-            # Check response status
-            if response.status_code == 200:
-                upsert_user_otp(phone_number, otp_code)
-
-                return Response({"message": "OTP sent successfully."}, status=status.HTTP_200_OK)
-            else:
-                return Response({"message": "Failed to send OTP. Please try again later."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        except requests.exceptions.RequestException as e:
-            return Response({"message": "An error occurred while sending OTP."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        except OTPDeliveryError as exc:
+            return Response({"message": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class MatchOTPSMSAPIView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         operation_description="Match OTP",
@@ -168,6 +186,9 @@ class MatchOTPSMSAPIView(APIView):
             type=openapi.TYPE_OBJECT,
             properties={
                 'phone_number': openapi.Schema(type=openapi.TYPE_STRING, description='Phone number of the user'),
+                'country_code': openapi.Schema(type=openapi.TYPE_STRING, description='Selected country code'),
+                'country_iso_code': openapi.Schema(type=openapi.TYPE_STRING, description='Selected ISO country code'),
+                'local_phone_number': openapi.Schema(type=openapi.TYPE_STRING, description='Local phone number'),
                 'otp_password': openapi.Schema(type=openapi.TYPE_STRING, description='OTP password'),
             },
             required=['phone_number', 'otp_password'],
@@ -175,32 +196,20 @@ class MatchOTPSMSAPIView(APIView):
         responses={
             200: "Success: OTP matched successfully",
             400: "Bad Request: Invalid input data",
-            401: "Unauthorized: Admin permissions required",
             500: "Server Error: Internal server error"
         }
     )
     def put(self, request):
-        phone_number = request.data.get('phone_number')
         otp_entered = request.data.get('otp_password')
 
-        # Checking Required Parameters
-        if not phone_number or not otp_entered:
+        if not otp_entered:
             return Response({"message": "Phone number and OTP are required."}, status=status.HTTP_400_BAD_REQUEST)
 
-        serializer = UserOTPSerializer(data=request.data)
-        # Validate phone number format
         try:
-            serializer.validate_phone_number(phone_number)
-        except serializers.ValidationError as e:
-            return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
-
-        if is_dev_otp_bypass_enabled(request) and otp_entered == DEV_OTP_BYPASS_CODE:
-            if not user_exists_for_phone(phone_number):
-                return Response({"message": "OTP not found for this phone number."}, status=status.HTTP_400_BAD_REQUEST)
-
-            UserOTP.objects.filter(phone_number=phone_number).delete()
-            logger.warning("DEV OTP bypass accepted for verify_otp on %s.", phone_number)
-            return Response({"message": "OTP matched successfully."}, status=status.HTTP_200_OK)
+            phone_identity = get_phone_identity_from_request(request, allow_lookup_only=True)
+            phone_number = phone_identity['full_phone_number']
+        except serializers.ValidationError as exc:
+            return Response({"message": str(exc.detail)}, status=status.HTTP_400_BAD_REQUEST)
 
         # If OTP record exists for the provided phone number
         try:
@@ -221,7 +230,11 @@ class MatchOTPSMSAPIView(APIView):
         # Deleting the OTP record to ensure it is not reused
         user_otp.delete()
 
-        return Response({"message": "OTP matched successfully."}, status=status.HTTP_200_OK)
+        user = get_user_for_phone_identity(phone_identity)
+        if not user:
+            return Response({"message": "User with this phone number does not exist."}, status=status.HTTP_404_NOT_FOUND)
+
+        return build_verified_user_response(user)
 
 
 class IsUserExistView(APIView):
@@ -232,38 +245,44 @@ class IsUserExistView(APIView):
             type=openapi.TYPE_OBJECT,
             properties={
                 'phone_number': openapi.Schema(type=openapi.TYPE_STRING),
+                'country_code': openapi.Schema(type=openapi.TYPE_STRING),
+                'country_iso_code': openapi.Schema(type=openapi.TYPE_STRING),
+                'local_phone_number': openapi.Schema(type=openapi.TYPE_STRING),
             },
             required=['phone_number'],
         ),
         responses={
-            200: openapi.Response(description="User exists", schema=UserProfileSerializer),
+            200: openapi.Response(description="User exists", schema=openapi.Schema(type=openapi.TYPE_OBJECT)),
             404: openapi.Response(description="User does not exist", schema=openapi.Schema(type=openapi.TYPE_OBJECT)),
             400: "Bad Request: Invalid input data",
             500: "Server Error: Internal server error"
         }
     )
     def post(self, request, *args, **kwargs):
-        # Deserialize request data using UserProfileSerializer
-        serializer = UserProfileSerializer(data=request.data)
-
-        # checking that phone_number is provided
-        phone_number = request.data.get('phone_number')
-        if not phone_number:
-            return Response({"message": "Phone number is required."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            phone_identity = get_phone_identity_from_request(request, allow_lookup_only=True)
+        except serializers.ValidationError as exc:
+            return Response({"message": str(exc.detail)}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            # Validate the phone_number format using serializer validation
-            serializer.validate_phone_number(phone_number)
-        except serializers.ValidationError as e:
-            return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Split into country_code and phone_number parts
-        country_code, phone_number = phone_number[:-10], phone_number[-10:]
-
-        try:
-            user = UserProfile.objects.get(country_code=country_code, phone_number=phone_number)
-            serializer = UserProfileSerializer(user)
-            return Response(serializer.data, status=status.HTTP_200_OK)
+            user = get_user_for_phone_identity(phone_identity)
+            if not user:
+                return Response(
+                    {
+                        "exists": False,
+                        "message": "User with this phone number does not exist.",
+                    },
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            return Response(
+                {
+                    "exists": True,
+                    "message": "User exists.",
+                },
+                status=status.HTTP_200_OK,
+            )
+        except serializers.ValidationError as exc:
+            return Response({"message": str(exc.detail)}, status=status.HTTP_400_BAD_REQUEST)
         except UserProfile.DoesNotExist:
             return Response({"message": "User with this phone number does not exist."}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
@@ -273,7 +292,12 @@ class IsUserExistView(APIView):
 
 
 class CreateMemberProfileView(APIView):
-    permission_classes = [IsAdminUser]
+    permission_classes = [AllowAny]
+
+    def get_permissions(self):
+        if self.request.method == 'DELETE':
+            return [IsAdminUser()]
+        return [AllowAny()]
 
     @swagger_auto_schema(
         request_body=openapi.Schema(
@@ -319,6 +343,9 @@ class CreateMemberProfileView(APIView):
             type=openapi.TYPE_OBJECT,
             properties={
                 'phone_number': openapi.Schema(type=openapi.TYPE_STRING),
+                'country_code': openapi.Schema(type=openapi.TYPE_STRING),
+                'country_iso_code': openapi.Schema(type=openapi.TYPE_STRING),
+                'local_phone_number': openapi.Schema(type=openapi.TYPE_STRING),
                 'name': openapi.Schema(type=openapi.TYPE_STRING),
                 'email': openapi.Schema(type=openapi.TYPE_STRING),
                 'user_type': openapi.Schema(type=openapi.TYPE_STRING),
@@ -329,50 +356,42 @@ class CreateMemberProfileView(APIView):
             required=['phone_number', 'name', 'email', 'user_type'],
         ),
         responses={
-            201: openapi.Response("Successful creation", UserProfileSerializer),
-            401: "Unauthorized: Admin permissions required",
+            201: openapi.Response("Successful creation", openapi.Schema(type=openapi.TYPE_OBJECT)),
             400: "Bad Request: Invalid input data",
             500: "Server Error: Internal server error"
         }
     )
     def post(self, request):
-        serializer = UserProfileSerializer(data=request.data)
-
-        # Check if phone_number and email are provided
-        phone_number = request.data.get('phone_number')
-        phone_number_1 = phone_number
         email = request.data.get('email')
-        if not phone_number or not email:
+        if not (request.data.get('phone_number') or request.data.get('local_phone_number')) or not email:
             return Response({"message": "Phone number and email are required."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            # Validate phone_number and email format using serializer validation
-            serializer.validate_phone_number(phone_number)
+            phone_identity = get_phone_identity_from_request(request)
+            serializer = UserProfileSerializer(data=request.data)
             serializer.validate_email(email)
-        except serializers.ValidationError as e:
-            return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
+        except serializers.ValidationError as exc:
+            detail = exc.detail[0] if isinstance(exc.detail, list) else exc.detail
+            return Response({"message": str(detail)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Extract country_code and phone_number from phone_number
-        country_code = phone_number[:-10]
-        phone_number = phone_number[-10:]
-
-        if country_code != '+92':
-            return Response({"message": "Sending OTP to this country is not allowed."}, status=status.HTTP_400_BAD_REQUEST)
+        country_code = phone_identity['country_code']
+        phone_number = phone_identity['local_phone_number']
+        full_phone_number = phone_identity['full_phone_number']
 
         # Generate session token
-        key = int(phone_number) * 52955917
+        key = int(phone_number[-10:]) * 52955917 if len(phone_number) >= 10 else int(phone_number) * 52955917
         token_key = str(country_code) + str(key)
         token_key = generate_token(token_key)
 
-        # Check if user with session_token already exists
-        if UserProfile.objects.filter(session_token=token_key).exists():
+        if UserProfile.objects.filter(country_code=country_code, phone_number=phone_number).exists():
             return Response({"message": "User with this phone number already exists."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            data = request.data
+            data = request.data.copy()
             data['session_token'] = token_key
             data['country_code'] = country_code
             data['phone_number'] = phone_number
+            data['country_iso_code'] = phone_identity.get('country_iso_code', '')
             data['account_status'] = "Active"
 
             serializer = UserProfileSerializer(data=data)
@@ -381,24 +400,21 @@ class CreateMemberProfileView(APIView):
                 with transaction.atomic():
                     user = serializer.save()
                     self.handle_new_user_setup(user, data)
+                    send_otp_via_sms_gateway(full_phone_number)
 
-                    if is_dev_otp_bypass_enabled(request):
-                        upsert_user_otp(phone_number_1, DEV_OTP_BYPASS_CODE)
-                        logger.warning("DEV OTP bypass enabled for signup flow on %s.", phone_number_1)
-                    else:
-                        otp_code = random_six_digits()
-                        sender = 'VTvOTP'
-                        otp_message = f'HajjUmrah.co One-Time Password: {otp_code}. Please do not share OTP with anyone.'
-                        API_Key = config('APIKey')
-                        url = f'https://api.veevotech.com/v3/sendsms?hash={API_Key}&receivernum={phone_number_1}&sendernum={sender}&textmessage={otp_message}'
-                        response = send_sms_gateway_request(url)
-                        if response.status_code != 200:
-                            raise OTPDeliveryError("Failed to send OTP. Please try again later.")
-                        upsert_user_otp(phone_number_1, otp_code)
-
-                serialized_user = UserProfileSerializer(user)
                 new_user_welcome_email(user.email, user.name)
-                return Response(serialized_user.data, status=status.HTTP_201_CREATED)
+                return Response(
+                    {
+                        "message": "Account created successfully. OTP sent successfully.",
+                        "data": {
+                            "country_code": country_code,
+                            "phone_number": phone_number,
+                            "email": user.email,
+                            "name": user.name,
+                        },
+                    },
+                    status=status.HTTP_201_CREATED,
+                )
             else:
                 first_error_field = next(iter(serializer.errors))
                 first_error_message = f"{first_error_field}: {serializer.errors[first_error_field][0]}"

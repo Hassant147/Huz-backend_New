@@ -50,8 +50,6 @@ class Booking(models.Model):
     # Whether payment has been received or not
     is_payment_received = models.BooleanField(default=False)
 
-    is_check_in_makkah = models.BooleanField(default=False)
-    is_check_in_madinah = models.BooleanField(default=False)
     # Remarks made by the partner regarding the booking
     partner_remarks = models.TextField(null=True)
 
@@ -79,8 +77,32 @@ class Booking(models.Model):
         return str(self.booking_id)
 
 
+class BookingGroup(models.Model):
+    group_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    label = models.CharField(max_length=100)
+    sequence = models.PositiveIntegerField(default=1)
+    notes = models.TextField(null=True, blank=True)
+    booking = models.ForeignKey(
+        Booking,
+        related_name="booking_groups",
+        on_delete=models.CASCADE,
+    )
+
+    class Meta:
+        ordering = ["sequence", "label"]
+        indexes = [
+            models.Index(fields=["booking", "sequence"], name="booking_group_sequence_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.booking.booking_number} - {self.label}"
+
+
 class PassportValidity(models.Model):
     passport_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    traveler_sequence = models.PositiveIntegerField(default=1)
+    traveler_type = models.CharField(max_length=100, null=True, blank=True)
+    room_type = models.CharField(max_length=100, null=True, blank=True)
     first_name = models.CharField(max_length=100, null=True)
     middle_name = models.CharField(max_length=100, null=True)
     last_name = models.CharField(max_length=100, null=True)
@@ -88,9 +110,15 @@ class PassportValidity(models.Model):
     passport_number = models.CharField(max_length=20, null=True)
     passport_country = models.CharField(max_length=200, null=True)
     expiry_date = models.DateTimeField(null=True)
-    report_rabbit = models.BooleanField(null=True, default=False)
-    user_passport = models.ImageField(upload_to='user_images', null=True, blank=True)
-    user_photo = models.ImageField(upload_to='user_images', null=True, blank=True)
+    user_passport = models.FileField(upload_to='passport_uploads', null=True, blank=True)
+    user_photo = models.FileField(upload_to='passport_uploads', null=True, blank=True)
+    booking_group = models.ForeignKey(
+        BookingGroup,
+        related_name="travelers",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
     passport_for_booking_number = models.ForeignKey(Booking, related_name='passport_for_booking_number', on_delete=models.SET_NULL, null=True)
 
     def __str__(self):
@@ -104,7 +132,7 @@ class Payment(models.Model):
     transaction_number = models.CharField(max_length=500, null=True)
     transaction_type = models.CharField(max_length=500, null=True)
     # Photo of the transaction (e.g., receipt or proof of payment)
-    transaction_photo = models.ImageField(upload_to='user_images', null=True, blank=True)
+    transaction_photo = models.FileField(upload_to='payment_uploads', null=True, blank=True)
     # Amount of the transaction
     transaction_amount = models.FloatField()
     transaction_time = models.DateTimeField(default=timezone.now)
@@ -133,7 +161,7 @@ class BookingObjections(models.Model):
     objection_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     remarks_or_reason = models.CharField(max_length=250)
     client_remarks = models.CharField(max_length=250, null=True)
-    required_document_for_objection = models.ImageField(upload_to='user_images', null=True, blank=True)
+    required_document_for_objection = models.FileField(upload_to='user_images', null=True, blank=True)
     create_time = models.DateTimeField(default=timezone.now)
     objection_for_booking = models.ForeignKey(Booking, related_name='objection_for_booking', on_delete=models.SET_NULL, null=True)
 
@@ -145,7 +173,7 @@ class UserRequiredDocuments(models.Model):
     user_document_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     # Description or purpose of the document
     comment = models.CharField(max_length=100)
-    user_document = models.ImageField(upload_to='user_images', null=True, blank=True)
+    user_document = models.FileField(upload_to='user_images', null=True, blank=True)
     document_type = models.CharField(max_length=100, null=True)
     create_time = models.DateTimeField(default=timezone.now)
     # Reference to the related booking
@@ -156,12 +184,42 @@ class UserRequiredDocuments(models.Model):
 
 
 class BookingDocuments(models.Model):
+    DOCUMENT_SCOPE_BOOKING = "booking"
+    DOCUMENT_SCOPE_GROUP = "group"
+    DOCUMENT_SCOPE_TRAVELER = "traveler"
+    DOCUMENT_SCOPE_CHOICES = [
+        (DOCUMENT_SCOPE_BOOKING, DOCUMENT_SCOPE_BOOKING),
+        (DOCUMENT_SCOPE_GROUP, DOCUMENT_SCOPE_GROUP),
+        (DOCUMENT_SCOPE_TRAVELER, DOCUMENT_SCOPE_TRAVELER),
+    ]
+
     document_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     # Description or purpose of the document
     document_for = models.CharField(max_length=100)
+    document_category = models.CharField(max_length=100, null=True, blank=True)
+    document_scope = models.CharField(
+        max_length=20,
+        choices=DOCUMENT_SCOPE_CHOICES,
+        default=DOCUMENT_SCOPE_BOOKING,
+    )
+    document_title = models.CharField(max_length=150, null=True, blank=True)
     # Link to the document image
-    document_link = models.ImageField(upload_to='user_images', null=True, blank=True)
+    document_link = models.FileField(upload_to='user_images', null=True, blank=True)
     create_time = models.DateTimeField(default=timezone.now)
+    booking_group = models.ForeignKey(
+        BookingGroup,
+        related_name="documents",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    traveler = models.ForeignKey(
+        PassportValidity,
+        related_name="documents",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
     # Reference to the related booking
     document_for_booking_token = models.ForeignKey(Booking, related_name='document_for_booking_token', on_delete=models.SET_NULL, null=True)
 
@@ -209,28 +267,122 @@ class BookingAirlineDetail(models.Model):
         return self.booking_airline_id
 
 
-class BookingHotelAndTransport(models.Model):
-    hotel_or_transport_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    jeddah_name = models.CharField(max_length=100, null=True)
-    jeddah_number = models.CharField(max_length=20, null=True)
-    mecca_name = models.CharField(max_length=100)
-    mecca_number = models.CharField(max_length=20)
-    madinah_name = models.CharField(max_length=100)
-    madinah_number = models.CharField(max_length=20)
-    taif_name = models.CharField(max_length=100, null=True, blank=True)
-    taif_number = models.CharField(max_length=20, null=True, blank=True)
-    riyadh_name = models.CharField(max_length=100, null=True, blank=True)
-    riyadh_number = models.CharField(max_length=20, null=True, blank=True)
-    comment_1 = models.TextField(null=True)
-    comment_2 = models.TextField(null=True)
-    # e.g Hotel or Transport
-    detail_for = models.CharField(max_length=20, null=True)
+class BookingHotelFulfillment(models.Model):
+    fulfillment_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    city = models.CharField(max_length=100)
+    hotel_name = models.CharField(max_length=150, null=True, blank=True)
+    contact_name = models.CharField(max_length=100, null=True, blank=True)
+    contact_phone = models.CharField(max_length=50, null=True, blank=True)
+    note = models.TextField(null=True, blank=True)
     shared_time = models.DateTimeField(default=timezone.now)
-    # Reference to the related booking
-    hotel_or_transport_for_booking = models.ForeignKey(Booking, related_name='hotel_or_transport_for_booking', on_delete=models.SET_NULL, null=True)
+    package_hotel = models.ForeignKey(
+        "partners.HuzHotelDetail",
+        related_name="booking_fulfillments",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    hotel_for_booking = models.ForeignKey(
+        Booking,
+        related_name="hotel_fulfillments",
+        on_delete=models.CASCADE,
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["hotel_for_booking", "city"], name="booking_hotel_city_idx"),
+        ]
 
     def __str__(self):
-        return self.hotel_or_transport_id
+        return f"{self.hotel_for_booking.booking_number} - {self.city}"
+
+
+class BookingTransportFulfillment(models.Model):
+    MODE_NONE = "none"
+    MODE_TICKET_ONLY = "ticket_only"
+    MODE_DETAILS_ONLY = "details_only"
+    MODE_DETAILS_AND_TICKET = "details_and_ticket"
+    MODE_CHOICES = [
+        (MODE_NONE, MODE_NONE),
+        (MODE_TICKET_ONLY, MODE_TICKET_ONLY),
+        (MODE_DETAILS_ONLY, MODE_DETAILS_ONLY),
+        (MODE_DETAILS_AND_TICKET, MODE_DETAILS_AND_TICKET),
+    ]
+
+    transport_fulfillment_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    transport_mode = models.CharField(max_length=32, choices=MODE_CHOICES, default=MODE_NONE)
+    transport_name = models.CharField(max_length=100, null=True, blank=True)
+    transport_type = models.CharField(max_length=100, null=True, blank=True)
+    route_summary = models.CharField(max_length=250, null=True, blank=True)
+    contact_name = models.CharField(max_length=100, null=True, blank=True)
+    contact_phone = models.CharField(max_length=50, null=True, blank=True)
+    ticket_reference = models.CharField(max_length=120, null=True, blank=True)
+    note = models.TextField(null=True, blank=True)
+    shared_time = models.DateTimeField(default=timezone.now)
+    transport_for_booking = models.OneToOneField(
+        Booking,
+        related_name="transport_fulfillment",
+        on_delete=models.CASCADE,
+    )
+
+    def __str__(self):
+        return f"{self.transport_for_booking.booking_number} - {self.transport_mode}"
+
+
+class TravelerIssue(models.Model):
+    ISSUE_TYPE_REPORTED = "REPORTED"
+    ISSUE_TYPE_RABBIT = "RABBIT"
+    ISSUE_TYPE_CHOICES = [
+        (ISSUE_TYPE_REPORTED, ISSUE_TYPE_REPORTED.lower()),
+        (ISSUE_TYPE_RABBIT, ISSUE_TYPE_RABBIT.lower()),
+    ]
+
+    STATUS_OPEN = "open"
+    STATUS_RESOLVED = "resolved"
+    STATUS_CHOICES = [
+        (STATUS_OPEN, STATUS_OPEN),
+        (STATUS_RESOLVED, STATUS_RESOLVED),
+    ]
+
+    traveler_issue_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    booking = models.ForeignKey(
+        Booking,
+        related_name="traveler_issues",
+        on_delete=models.CASCADE,
+    )
+    traveler = models.ForeignKey(
+        PassportValidity,
+        related_name="traveler_issues",
+        on_delete=models.CASCADE,
+    )
+    issue_type = models.CharField(max_length=20, choices=ISSUE_TYPE_CHOICES, default=ISSUE_TYPE_REPORTED)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_OPEN)
+    notes = models.TextField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        PartnerProfile,
+        related_name="created_traveler_issues",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    resolved_by = models.ForeignKey(
+        PartnerProfile,
+        related_name="resolved_traveler_issues",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    created_at = models.DateTimeField(default=timezone.now)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["booking", "status"], name="trav_issue_book_stat_idx"),
+            models.Index(fields=["traveler", "status"], name="trav_issue_trav_stat_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.booking.booking_number} - {self.traveler_id} - {self.issue_type}"
 
 
 class BookingRatingAndReview(models.Model):

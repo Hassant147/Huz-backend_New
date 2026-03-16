@@ -19,6 +19,8 @@ from .statuses import (
     BOOKING_STATUS_TERMINAL_SET,
     BOOKING_STATUS_TRAVELER_DETAILS_PENDING,
     ISSUE_STATUS_NONE,
+    ISSUE_STATUS_OPERATOR_OBJECTION,
+    ISSUE_STATUS_REPORTED,
     PAYMENT_STATUS_APPROVED,
     PAYMENT_STATUS_NOT_SUBMITTED,
     PAYMENT_STATUS_REJECTED,
@@ -220,6 +222,13 @@ def _get_related_items(booking, relation_name):
     return related_items_cache[relation_name]
 
 
+def _get_single_related_item(instance, relation_name):
+    try:
+        return getattr(instance, relation_name, None)
+    except Exception:
+        return None
+
+
 def booking_requires_return_airline_detail(booking):
     package = getattr(booking, "package_token", None)
     if package is None:
@@ -277,6 +286,145 @@ def booking_passports_are_complete(booking):
     )
 
 
+def _normalize_city_key(value):
+    normalized = str(value or "").strip().lower()
+    if normalized == "mecca":
+        return "makkah"
+    return normalized
+
+
+def _get_required_hotel_city_keys(booking):
+    package = getattr(booking, "package_token", None)
+    if package is None:
+        return []
+
+    hotel_items = _get_related_items(package, "hotel_for_package")
+    if hotel_items:
+        seen = []
+        for hotel in hotel_items:
+            city_key = _normalize_city_key(getattr(hotel, "hotel_city", ""))
+            if city_key and city_key not in seen:
+                seen.append(city_key)
+        if seen:
+            return seen
+
+    city_night_pairs = (
+        ("jeddah", getattr(package, "jeddah_nights", 0)),
+        ("makkah", getattr(package, "mecca_nights", 0)),
+        ("madinah", getattr(package, "madinah_nights", 0)),
+        ("taif", getattr(package, "taif_nights", 0)),
+        ("riyadh", getattr(package, "riyadah_nights", 0)),
+    )
+    return [city_key for city_key, nights in city_night_pairs if int(nights or 0) > 0]
+
+
+def _hotel_fulfillment_has_shared_details(fulfillment):
+    return any(
+        [
+            getattr(fulfillment, "hotel_name", None),
+            getattr(fulfillment, "contact_name", None),
+            getattr(fulfillment, "contact_phone", None),
+            getattr(fulfillment, "note", None),
+        ]
+    )
+
+
+def booking_hotel_fulfillments_are_complete(booking):
+    hotel_documents = _get_booking_documents_by_category(booking, "hotel")
+    if hotel_documents:
+        return True
+
+    required_city_keys = _get_required_hotel_city_keys(booking)
+    if not required_city_keys:
+        return True
+
+    hotel_fulfillments = _get_related_items(booking, "hotel_fulfillments")
+    if not hotel_fulfillments:
+        return False
+
+    fulfilled_city_keys = set()
+    for fulfillment in hotel_fulfillments:
+        if not _hotel_fulfillment_has_shared_details(fulfillment):
+            continue
+
+        city_key = _normalize_city_key(getattr(fulfillment, "city", ""))
+        if city_key:
+            fulfilled_city_keys.add(city_key)
+
+    return set(required_city_keys).issubset(fulfilled_city_keys)
+
+
+def _get_booking_documents_by_category(booking, category):
+    normalized_category = str(category or "").strip().lower()
+    documents = _get_related_items(booking, "document_for_booking_token")
+    filtered_documents = []
+    for document in documents:
+        document_category = str(
+            getattr(document, "document_category", None)
+            or getattr(document, "document_for", "")
+            or ""
+        ).strip().lower()
+        if document_category == normalized_category:
+            filtered_documents.append(document)
+    return filtered_documents
+
+
+def _package_has_transport_default(booking):
+    package = getattr(booking, "package_token", None)
+    if package is None:
+        return False
+
+    return bool(_get_related_items(package, "transport_for_package"))
+
+
+def _transport_fulfillment_has_ticket(transport_fulfillment):
+    return bool(getattr(transport_fulfillment, "ticket_reference", None))
+
+
+def _transport_fulfillment_has_details(transport_fulfillment):
+    return any(
+        [
+            getattr(transport_fulfillment, "transport_name", None),
+            getattr(transport_fulfillment, "transport_type", None),
+            getattr(transport_fulfillment, "route_summary", None),
+            getattr(transport_fulfillment, "contact_name", None),
+            getattr(transport_fulfillment, "contact_phone", None),
+        ]
+    )
+
+
+def booking_transport_fulfillment_is_complete(booking):
+    transport_fulfillment = _get_single_related_item(booking, "transport_fulfillment")
+    transport_documents = _get_booking_documents_by_category(booking, "transport")
+    package_has_transport = _package_has_transport_default(booking)
+
+    if not transport_fulfillment:
+        if transport_documents:
+            return True
+        return not package_has_transport
+
+    mode = str(getattr(transport_fulfillment, "transport_mode", "") or "").strip().lower()
+    has_ticket = _transport_fulfillment_has_ticket(transport_fulfillment) or bool(transport_documents)
+    has_details = _transport_fulfillment_has_details(transport_fulfillment)
+
+    if has_ticket or has_details:
+        return True
+
+    if not mode or mode == "none":
+        return not package_has_transport
+
+    return False
+
+
+def get_open_traveler_issues(booking):
+    traveler_issues = _get_related_items(booking, "traveler_issues")
+    return [
+        issue
+        for issue in traveler_issues
+        if str(getattr(issue, "status", "") or "").strip().lower() == "open"
+    ]
+
+
 def booking_operator_documents_are_complete(booking):
     document_statuses = _get_related_items(booking, "status_for_booking")
     if not document_statuses:
@@ -287,8 +435,8 @@ def booking_operator_documents_are_complete(booking):
         bool(getattr(document_status, "is_visa_completed", False))
         and bool(getattr(document_status, "is_airline_completed", False))
         and booking_airline_details_are_complete(booking)
-        and bool(getattr(document_status, "is_hotel_completed", False))
-        and bool(getattr(document_status, "is_transport_completed", False))
+        and booking_hotel_fulfillments_are_complete(booking)
+        and booking_transport_fulfillment_is_complete(booking)
     )
 
 
@@ -382,7 +530,7 @@ def resolve_operator_workflow_bucket(booking):
 
     booking_status = normalize_booking_status(getattr(booking, "booking_status", ""))
     issue_status = str(getattr(booking, "issue_status", ISSUE_STATUS_NONE) or ISSUE_STATUS_NONE).strip().upper()
-    if issue_status in {"OPERATOR_OBJECTION", "REPORTED"}:
+    if issue_status == ISSUE_STATUS_OPERATOR_OBJECTION or get_open_traveler_issues(booking):
         return WORKFLOW_BUCKET_ISSUES
 
     if booking_status in {BOOKING_STATUS_TRAVELER_DETAILS_PENDING, BOOKING_STATUS_AWAITING_FINAL_PAYMENT}:
@@ -470,8 +618,14 @@ def sync_booking_state(booking, *, now=None, save=True):
         booking.status_changed_at = now
         update_fields.extend(["booking_status", "status_changed_at"])
 
-    normalized_issue_status = str(getattr(booking, "issue_status", ISSUE_STATUS_NONE) or ISSUE_STATUS_NONE).strip().upper()
-    if not normalized_issue_status:
+    current_issue_status = str(
+        getattr(booking, "issue_status", ISSUE_STATUS_NONE) or ISSUE_STATUS_NONE
+    ).strip().upper()
+    if current_issue_status == ISSUE_STATUS_OPERATOR_OBJECTION:
+        normalized_issue_status = ISSUE_STATUS_OPERATOR_OBJECTION
+    elif get_open_traveler_issues(booking):
+        normalized_issue_status = ISSUE_STATUS_REPORTED
+    else:
         normalized_issue_status = ISSUE_STATUS_NONE
     if normalized_issue_status != getattr(booking, "issue_status", ISSUE_STATUS_NONE):
         booking.issue_status = normalized_issue_status

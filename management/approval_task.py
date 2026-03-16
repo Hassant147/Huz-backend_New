@@ -40,8 +40,12 @@ from common.utility import (
 from booking.flow_utils import get_expected_traveller_count
 from booking.models import Booking, PartnersBookingPayment, Payment, PassportValidity
 from booking.querysets import annotate_booking_payment_statuses
-from booking.serializers import LegacyDetailBookingSerializer, PartnersBookingPaymentSerializer, AdminPaidBookingSerializer
-from booking.services import BookingServiceError, validate_booking_payment_amount
+from booking.serializers import DetailBookingSerializer, PartnersBookingPaymentSerializer, AdminPaidBookingSerializer
+from booking.services import (
+    BookingServiceError,
+    ensure_booking_group_assignments,
+    validate_booking_payment_amount,
+)
 from booking.statuses import (
     BOOKING_STATUS_AWAITING_FINAL_PAYMENT,
     BOOKING_STATUS_COMPLETED,
@@ -1165,7 +1169,7 @@ class ApproveBookingPaymentView(APIView):
             required=['session_token', 'booking_number']
         ),
         responses={
-            200: openapi.Response('Booking status updated successfully', LegacyDetailBookingSerializer(many=False)),
+            200: openapi.Response('Booking status updated successfully', DetailBookingSerializer(many=False)),
             400: "Bad Request: Missing or invalid input data.",
             401: "Unauthorized: Admin permissions required",
             404: "Not Found: Booking detail or user detail not found.",
@@ -1257,6 +1261,7 @@ class ApproveBookingPaymentView(APIView):
                     PassportValidity.objects.bulk_create(
                         [PassportValidity(passport_for_booking_number=booking_detail) for _ in range(missing_passports)]
                     )
+                ensure_booking_group_assignments(booking_detail)
 
                 sync_booking_state(booking_detail, save=True)
                 if not payment_already_approved:
@@ -1326,7 +1331,7 @@ class ApproveBookingPaymentView(APIView):
 
             # Serialize the updated booking detail and return response
             serializer_started_at = perf_counter()
-            serialized_booking = LegacyDetailBookingSerializer(booking_detail)
+            serialized_booking = DetailBookingSerializer(booking_detail)
             response_payload = serialized_booking.data
             serializer_duration_ms = (perf_counter() - serializer_started_at) * 1000
             _invalidate_management_cache()
@@ -1444,6 +1449,7 @@ class FetchPaidBookingView(APIView):
                         'expiry_date',
                     ),
                 ),
+                'status_for_booking',
                 'booking_token',
             ).order_by('-order_time')
 

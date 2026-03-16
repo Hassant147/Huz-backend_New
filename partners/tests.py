@@ -14,6 +14,7 @@ from .models import (
     HuzHotelDetail,
     HuzPackageDateRange,
     PartnerProfile,
+    PartnerServices,
     PartnerTransactionHistory,
     Wallet,
 )
@@ -32,6 +33,7 @@ from .package_management_operator import (
     GetHuzPackageDetailByTokenView,
     GetHuzShortPackageByTokenView,
 )
+from .partner_profile import PartnerServicesView
 
 
 def ensure_tables_for_apps(app_labels):
@@ -862,3 +864,71 @@ class PartnerWalletEndpointAccessTests(APITransactionTestCase):
         response = GetPartnerTransactionOverallSummaryView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(response.data.get("message"), "Missing user information.")
+
+
+class PartnerServicesViewTests(APITransactionTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        ensure_tables_for_apps(["common", "partners", "booking"])
+
+    def setUp(self):
+        self.factory = APIRequestFactory()
+        PartnerProfile.objects.filter(
+            partner_session_token="partner-services-session-token"
+        ).delete()
+        self.partner = PartnerProfile.objects.create(
+            partner_session_token="partner-services-session-token",
+            user_name="partner-services-user",
+            name="Services Partner",
+            partner_type="NA",
+            account_status="Pending",
+        )
+
+    def test_partner_services_endpoint_accepts_hajj_and_umrah_only(self):
+        request = self.factory.post(
+            "/partner/partner_service/",
+            {
+                "partner_session_token": self.partner.partner_session_token,
+                "is_hajj_service_offer": True,
+                "is_umrah_service_offer": False,
+                "is_ziyarah_service_offer": True,
+                "is_transport_service_offer": True,
+                "is_visa_service_offer": True,
+            },
+            format="json",
+        )
+
+        response = PartnerServicesView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        self.partner.refresh_from_db()
+        services = PartnerServices.objects.get(services_of_partner=self.partner)
+
+        self.assertEqual(self.partner.partner_type, "Company")
+        self.assertTrue(services.is_hajj_service_offer)
+        self.assertFalse(services.is_umrah_service_offer)
+        self.assertFalse(services.is_ziyarah_service_offer)
+        self.assertFalse(services.is_transport_service_offer)
+        self.assertFalse(services.is_visa_service_offer)
+
+    def test_partner_services_endpoint_rejects_empty_supported_service_selection(self):
+        request = self.factory.post(
+            "/partner/partner_service/",
+            {
+                "partner_session_token": self.partner.partner_session_token,
+                "is_hajj_service_offer": False,
+                "is_umrah_service_offer": False,
+            },
+            format="json",
+        )
+
+        response = PartnerServicesView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data.get("message"),
+            "Select at least one supported service: Hajj or Umrah.",
+        )
+        self.assertFalse(
+            PartnerServices.objects.filter(services_of_partner=self.partner).exists()
+        )

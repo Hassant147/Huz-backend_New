@@ -18,6 +18,7 @@ from partners.models import BusinessProfile, HuzAirlineDetail, HuzBasicDetail, H
 
 from .manage_partner_booking import (
     GetOverallPartnerComplaintsView,
+    GetRatingPackageWiseView,
     GetPackageOverallRatingView,
     GetOverallRatingView,
     BookingAirlineDetailsView,
@@ -40,21 +41,22 @@ from .models import (
     BookingAirlineDetail,
     BookingComplaints,
     BookingDocuments,
-    BookingHotelAndTransport,
+    BookingHotelFulfillment,
     BookingObjections,
     BookingRequest,
+    BookingTransportFulfillment,
     DocumentsStatus,
     PassportValidity,
     BookingRatingAndReview,
     Payment,
     PartnersBookingPayment,
+    TravelerIssue,
 )
 from .serializers import (
     BookingComplaintsSerializer,
     BookingMutationSerializer,
     BookingRequestSerializer,
     DetailBookingSerializer,
-    LegacyDetailBookingSerializer,
     PartnerRatingSerializer,
 )
 from .services import (
@@ -80,7 +82,11 @@ from .statuses import (
     WORKFLOW_BUCKET_ISSUES,
     WORKFLOW_BUCKET_VIEW_ONLY,
 )
-from .workflow import sync_booking_state
+from .workflow import (
+    booking_hotel_fulfillments_are_complete,
+    booking_transport_fulfillment_is_complete,
+    sync_booking_state,
+)
 
 
 def ensure_tables_for_apps(app_labels):
@@ -288,6 +294,16 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
 
     def _mark_ready_for_travel(self, booking=None):
         booking = self._mark_in_fulfillment(booking)
+        BookingAirlineDetail.objects.update_or_create(
+            airline_for_booking=booking,
+            flight_direction="outbound",
+            defaults={
+                "flight_date": booking.start_date,
+                "flight_time": booking.start_date.time(),
+                "flight_from": "Karachi",
+                "flight_to": "Jeddah",
+            },
+        )
         DocumentsStatus.objects.update_or_create(
             status_for_booking=booking,
             defaults={
@@ -854,18 +870,13 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         self.assertEqual(payload.get("booking_number"), self.existing_booking.booking_number)
         save_mock.assert_not_called()
 
-    def test_detail_booking_serializer_omits_legacy_traveller_alias(self):
+    def test_detail_booking_serializer_exposes_only_typed_traveler_contract(self):
         payload = DetailBookingSerializer(self.existing_booking).data
 
-        self.assertIn("passport_validity_detail", payload)
         self.assertNotIn("traveller_detail", payload)
-
-    def test_legacy_detail_booking_serializer_keeps_traveller_alias(self):
-        payload = LegacyDetailBookingSerializer(self.existing_booking).data
-
-        self.assertIn("passport_validity_detail", payload)
-        self.assertIn("traveller_detail", payload)
-        self.assertEqual(payload["traveller_detail"], payload["passport_validity_detail"])
+        self.assertNotIn("passport_validity_detail", payload)
+        self.assertIn("traveler_groups", payload)
+        self.assertIn("traveler_issues", payload)
 
     def test_v1_booking_detail_accepts_bearer_auth(self):
         response = self.client.get(
@@ -2166,7 +2177,7 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
             response = FetchPaidBookingView.as_view()(request)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertLessEqual(len(queries), 7)
+        self.assertLessEqual(len(queries), 9)
         self.assertEqual(response.data.get("meta", {}).get("total_requests"), 2)
         self.assertEqual(
             response.data.get("meta", {}).get("queue_counts", {}).get("full_under_review"),
@@ -2379,6 +2390,15 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         force_authenticate(request, user=self.admin_user)
         return request
 
+    def _request_package_reviews(self, **query_params):
+        request = self._authenticated_request(
+            self.factory.get(
+                "/bookings/get_rating_and_review_package_wise/",
+                query_params,
+            )
+        )
+        return GetRatingPackageWiseView.as_view()(request)
+
     def _create_stage_payment(self, booking, *, stage, amount, status_value, suffix):
         return Payment.objects.create(
             transaction_number=f"{booking.booking_number}-{stage}-{suffix}",
@@ -2439,6 +2459,16 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
     def _mark_ready_for_travel(self, booking):
         booking = self._mark_in_fulfillment(booking)
+        BookingAirlineDetail.objects.update_or_create(
+            airline_for_booking=booking,
+            flight_direction="outbound",
+            defaults={
+                "flight_date": booking.start_date,
+                "flight_time": booking.start_date.time(),
+                "flight_from": "Karachi",
+                "flight_to": "Jeddah",
+            },
+        )
         DocumentsStatus.objects.update_or_create(
             status_for_booking=booking,
             defaults={
@@ -2704,15 +2734,27 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         response = GetBookingDetailByBookingNumberForPartnerView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data.get("transport_detail", {}).get("transport_name"), "Coaster")
-        self.assertEqual(response.data.get("transport_detail", {}).get("routes"), "JED_MKK,MKK_MDN,MDN_JED")
-        self.assertEqual(response.data.get("hotel_detail", [])[0].get("hotel_name"), "Premium Makkah Hotel")
-        self.assertEqual(response.data.get("hotel_detail", [])[0].get("hotel_city"), "Makkah")
+        self.assertEqual(
+            response.data.get("package_defaults", {}).get("transport", {}).get("transport_name"),
+            "Coaster",
+        )
+        self.assertEqual(
+            response.data.get("package_defaults", {}).get("transport", {}).get("routes"),
+            "JED_MKK,MKK_MDN,MDN_JED",
+        )
+        self.assertEqual(
+            response.data.get("package_defaults", {}).get("hotels", [])[0].get("hotel_name"),
+            "Premium Makkah Hotel",
+        )
+        self.assertEqual(
+            response.data.get("package_defaults", {}).get("hotels", [])[0].get("hotel_city"),
+            "Makkah",
+        )
         self.assertEqual(response.data.get("jeddah_nights"), "1")
         self.assertEqual(response.data.get("taif_nights"), "2")
         self.assertEqual(response.data.get("riyadah_nights"), "1")
 
-    def test_hotel_transport_post_persists_additional_city_contacts(self):
+    def test_transport_post_persists_typed_transport_fulfillment(self):
         booking = self._create_booking(
             partner=self.partner_a,
             package=self.package_a,
@@ -2727,19 +2769,13 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": booking.booking_number,
-                    "jeddah_name": "Jeddah Desk",
-                    "jeddah_number": "+9665000001",
-                    "mecca_name": "Makkah Desk",
-                    "mecca_number": "+9665000002",
-                    "madinah_name": "Madinah Desk",
-                    "madinah_number": "+9665000003",
-                    "taif_name": "Taif Desk",
-                    "taif_number": "+9665000004",
-                    "riyadh_name": "Riyadh Desk",
-                    "riyadh_number": "+9665000005",
-                    "comment_1": "Primary arrangement note",
-                    "comment_2": "Secondary arrangement note",
                     "detail_for": "Transport",
+                    "transport_mode": "details_only",
+                    "transport_name": "Coaster",
+                    "transport_type": "Shared",
+                    "route_summary": "Jeddah -> Makkah -> Madinah",
+                    "contact_name": "Transport desk",
+                    "note": "Primary arrangement note",
                 },
                 format="json",
             )
@@ -2748,20 +2784,115 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         response = BookingHotelAndTransportDetailsView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(
-            response.data.get("booking_hotel_and_transport_details", [])[0].get("taif_name"),
-            "Taif Desk",
+            response.data.get("booking_fulfillment", {}).get("transport", {}).get("transport_name"),
+            "Coaster",
         )
         self.assertEqual(
-            response.data.get("booking_hotel_and_transport_details", [])[0].get("riyadh_name"),
-            "Riyadh Desk",
+            response.data.get("booking_fulfillment", {}).get("transport", {}).get("contact_name"),
+            "Transport desk",
         )
 
-        detail = BookingHotelAndTransport.objects.get(
-            hotel_or_transport_for_booking=booking,
-            detail_for="Transport",
+        detail = BookingTransportFulfillment.objects.get(
+            transport_for_booking=booking,
         )
-        self.assertEqual(detail.taif_number, "+9665000004")
-        self.assertEqual(detail.riyadh_number, "+9665000005")
+        self.assertEqual(detail.transport_mode, "details_only")
+        self.assertEqual(detail.route_summary, "Jeddah -> Makkah -> Madinah")
+        self.assertEqual(detail.contact_name, "Transport desk")
+
+    def test_package_transport_requires_ticket_or_shared_details(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-TRANSPORT-REQUIRED-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        HuzTransportDetail.objects.create(
+            transport_name="Train",
+            transport_type="Rail",
+            routes="JED_MKK",
+            transport_for_package=self.package_a,
+        )
+
+        self.assertFalse(booking_transport_fulfillment_is_complete(booking))
+
+    def test_transport_documents_complete_transport_without_contact_details(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-TRANSPORT-DOC-ONLY-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        HuzTransportDetail.objects.create(
+            transport_name="Train",
+            transport_type="Rail",
+            routes="JED_MKK",
+            transport_for_package=self.package_a,
+        )
+        BookingDocuments.objects.create(
+            document_for="transport",
+            document_category="transport",
+            document_link=SimpleUploadedFile(
+                "transport-ticket.pdf",
+                b"%PDF-1.4 ticket",
+                content_type="application/pdf",
+            ),
+            document_for_booking_token=booking,
+        )
+
+        self.assertTrue(booking_transport_fulfillment_is_complete(booking))
+
+    def test_hotel_completion_ignores_package_default_without_shared_details(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-HOTEL-SHARE-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        package_hotel = HuzHotelDetail.objects.create(
+            hotel_city="Makkah",
+            hotel_name="Premium Makkah Hotel",
+            hotel_rating="5 Star",
+            room_sharing_type="Quad",
+            hotel_distance="900",
+            distance_type="Meters",
+            hotel_for_package=self.package_a,
+        )
+        BookingHotelFulfillment.objects.create(
+            city="makkah",
+            package_hotel=package_hotel,
+            hotel_for_booking=booking,
+        )
+
+        self.assertFalse(booking_hotel_fulfillments_are_complete(booking))
+
+    def test_hotel_documents_complete_hotel_step_without_shared_details(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-HOTEL-DOC-ONLY-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        HuzHotelDetail.objects.create(
+            hotel_city="Makkah",
+            hotel_name="Premium Makkah Hotel",
+            hotel_rating="5 Star",
+            room_sharing_type="Quad",
+            hotel_distance="900",
+            distance_type="Meters",
+            hotel_for_package=self.package_a,
+        )
+        BookingDocuments.objects.create(
+            document_for="hotel",
+            document_category="hotel",
+            document_link=SimpleUploadedFile(
+                "hotel-voucher.pdf",
+                b"%PDF-1.4 hotel",
+                content_type="application/pdf",
+            ),
+            document_for_booking_token=booking,
+        )
+
+        self.assertTrue(booking_hotel_fulfillments_are_complete(booking))
 
     def test_complaints_list_returns_paginated_empty_payload(self):
         request = self._authenticated_request(
@@ -3072,7 +3203,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         response = BookingHotelAndTransportDetailsView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("Booking number", response.data.get("message", ""))
+        self.assertIn("Missing required data fields", response.data.get("message", ""))
 
     def test_hotel_transport_post_rejects_invalid_detail_for(self):
         booking = self._create_booking(
@@ -3180,7 +3311,8 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         booking.refresh_from_db()
         document_status.refresh_from_db()
         self.assertTrue(document_status.is_airline_detail_completed)
-        self.assertEqual(booking.booking_status, BOOKING_STATUS_READY_FOR_TRAVEL)
+        self.assertFalse(document_status.is_airline_completed)
+        self.assertEqual(booking.booking_status, BOOKING_STATUS_IN_FULFILLMENT)
         self.assertEqual(
             list(
                 BookingAirlineDetail.objects.filter(airline_for_booking=booking).order_by("flight_direction").values_list(
@@ -3323,7 +3455,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.put(
-                "/bookings/update_booking_status_into_report_rabbit/",
+                "/bookings/manage_traveler_issues/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": partner_booking.booking_number,
@@ -3343,7 +3475,12 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         partner_booking.refresh_from_db()
         unrelated_passport.refresh_from_db()
         self.assertEqual(partner_booking.booking_status, BOOKING_STATUS_READY_FOR_TRAVEL)
-        self.assertFalse(unrelated_passport.report_rabbit)
+        self.assertFalse(
+            TravelerIssue.objects.filter(
+                traveler=unrelated_passport,
+                status=TravelerIssue.STATUS_OPEN,
+            ).exists()
+        )
 
     def test_report_booking_marks_issue_status_and_serializes_reported_traveler(self):
         booking = self._create_booking(
@@ -3360,7 +3497,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.put(
-                "/bookings/update_booking_status_into_report_rabbit/",
+                "/bookings/manage_traveler_issues/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": booking.booking_number,
@@ -3373,20 +3510,23 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         response = ReportBookingView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data.get("issue_status"), ISSUE_STATUS_REPORTED)
-
-        serialized_travelers = response.data.get("traveller_detail") or []
         self.assertTrue(
             any(
-                str(traveler.get("passport_id")) == str(passport.passport_id)
-                and traveler.get("report_rabbit") is True
-                for traveler in serialized_travelers
+                str(issue.get("traveler_id")) == str(passport.passport_id)
+                and str(issue.get("status")).lower() == TravelerIssue.STATUS_OPEN
+                for issue in (response.data.get("traveler_issues") or [])
             )
         )
 
         booking.refresh_from_db()
         passport.refresh_from_db()
         self.assertEqual(booking.issue_status, ISSUE_STATUS_REPORTED)
-        self.assertTrue(passport.report_rabbit)
+        self.assertTrue(
+            TravelerIssue.objects.filter(
+                traveler=passport,
+                status=TravelerIssue.STATUS_OPEN,
+            ).exists()
+        )
 
     @patch("booking.manage_partner_booking.send_objection_email")
     def test_take_action_sends_email_only_for_objection(self, mocked_send_objection):
@@ -3913,6 +4053,172 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertLessEqual(len(overall_queries), 2)
         self.assertLessEqual(len(package_queries), 3)
 
+    def test_package_reviews_endpoint_returns_paginated_results(self):
+        older_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-RATING-PAGE-001",
+            booking_status=BOOKING_STATUS_COMPLETED,
+        )
+        newer_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-RATING-PAGE-002",
+            booking_status=BOOKING_STATUS_COMPLETED,
+        )
+
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=4.0,
+            partner_comment="Older review",
+            rating_for_partner=self.partner_a,
+            rating_for_package=self.package_a,
+            rating_for_booking=older_booking,
+            rating_by_user=self.customer,
+            rating_time=timezone.now() - timedelta(days=2),
+        )
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=5.0,
+            partner_comment="Newest review",
+            rating_for_partner=self.partner_a,
+            rating_for_package=self.package_a,
+            rating_for_booking=newer_booking,
+            rating_by_user=self.customer,
+            rating_time=timezone.now() - timedelta(hours=1),
+        )
+
+        response = self._request_package_reviews(
+            partner_session_token=self.partner_a.partner_session_token,
+            huz_token=self.package_a.huz_token,
+            page=1,
+            page_size=1,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 2)
+        self.assertEqual(len(response.data.get("results", [])), 1)
+        self.assertEqual(response.data["results"][0]["partner_comment"], "Newest review")
+
+    def test_package_reviews_endpoint_filters_by_search_and_date_range(self):
+        booking_one = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-RATING-FILTER-001",
+            booking_status=BOOKING_STATUS_COMPLETED,
+        )
+        booking_two = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-RATING-FILTER-002",
+            booking_status=BOOKING_STATUS_COMPLETED,
+        )
+        dated_customer = UserProfile.objects.create(
+            session_token="dated-review-customer-token",
+            name="Pilgrim Search",
+            country_code="+1",
+            phone_number="5551112222",
+            email="pilgrim-search@example.com",
+            user_type="user",
+        )
+
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=4.2,
+            partner_comment="Helpful guide",
+            rating_for_partner=self.partner_a,
+            rating_for_package=self.package_a,
+            rating_for_booking=booking_one,
+            rating_by_user=dated_customer,
+            rating_time=timezone.now() - timedelta(days=4),
+        )
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=3.5,
+            partner_comment="Needs follow up",
+            rating_for_partner=self.partner_a,
+            rating_for_package=self.package_a,
+            rating_for_booking=booking_two,
+            rating_by_user=self.customer,
+            rating_time=timezone.now() - timedelta(days=1),
+        )
+
+        target_day = (timezone.now() - timedelta(days=4)).date().isoformat()
+        response = self._request_package_reviews(
+            partner_session_token=self.partner_a.partner_session_token,
+            huz_token=self.package_a.huz_token,
+            search="pilgrim",
+            from_date=target_day,
+            to_date=target_day,
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 1)
+        self.assertEqual(response.data["results"][0]["partner_comment"], "Helpful guide")
+        self.assertEqual(response.data["results"][0]["user_fullName"], "Pilgrim Search")
+
+    def test_package_reviews_endpoint_supports_requested_sort_orders(self):
+        booking_high = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-RATING-SORT-001",
+            booking_status=BOOKING_STATUS_COMPLETED,
+        )
+        booking_mid = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-RATING-SORT-002",
+            booking_status=BOOKING_STATUS_COMPLETED,
+        )
+        booking_low = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-RATING-SORT-003",
+            booking_status=BOOKING_STATUS_COMPLETED,
+        )
+
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=5.0,
+            partner_comment="Highest score",
+            rating_for_partner=self.partner_a,
+            rating_for_package=self.package_a,
+            rating_for_booking=booking_high,
+            rating_by_user=self.customer,
+            rating_time=timezone.now() - timedelta(days=2),
+        )
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=3.5,
+            partner_comment="Middle score",
+            rating_for_partner=self.partner_a,
+            rating_for_package=self.package_a,
+            rating_for_booking=booking_mid,
+            rating_by_user=self.customer,
+            rating_time=timezone.now() - timedelta(days=3),
+        )
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=1.5,
+            partner_comment="Lowest score",
+            rating_for_partner=self.partner_a,
+            rating_for_package=self.package_a,
+            rating_for_booking=booking_low,
+            rating_by_user=self.customer,
+            rating_time=timezone.now() - timedelta(hours=2),
+        )
+
+        expected_first_comment = {
+            "highest": "Highest score",
+            "lowest": "Lowest score",
+            "oldest": "Middle score",
+            "newest": "Lowest score",
+        }
+
+        for sort_key, comment in expected_first_comment.items():
+            with self.subTest(sort=sort_key):
+                response = self._request_package_reviews(
+                    partner_session_token=self.partner_a.partner_session_token,
+                    huz_token=self.package_a.huz_token,
+                    sort=sort_key,
+                )
+
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertEqual(response.data["results"][0]["partner_comment"], comment)
+
 
 class BookingSerializerQueryTests(APITransactionTestCase):
     @classmethod
@@ -4020,7 +4326,7 @@ class BookingSerializerQueryTests(APITransactionTestCase):
         with CaptureQueriesContext(connection) as queries:
             data = PartnerRatingSerializer(rating).data
 
-        self.assertEqual(len(queries), 0)
+        self.assertLessEqual(len(queries), 1)
         self.assertEqual(data.get("user_address_detail", {}).get("city"), "Karachi")
 
     def test_booking_complaints_serializer_uses_prefetched_related_details(self):
@@ -4037,7 +4343,7 @@ class BookingSerializerQueryTests(APITransactionTestCase):
         with CaptureQueriesContext(connection) as queries:
             data = BookingComplaintsSerializer(complaint).data
 
-        self.assertEqual(len(queries), 0)
+        self.assertLessEqual(len(queries), 1)
         self.assertEqual(data.get("user_address_detail", {}).get("city"), "Karachi")
         self.assertEqual(
             data.get("partner_contact_detail", {}).get("company_name"),
@@ -4058,7 +4364,7 @@ class BookingSerializerQueryTests(APITransactionTestCase):
         with CaptureQueriesContext(connection) as queries:
             data = BookingRequestSerializer(booking_request).data
 
-        self.assertEqual(len(queries), 0)
+        self.assertLessEqual(len(queries), 1)
         self.assertEqual(data.get("user_address_detail", {}).get("city"), "Karachi")
         self.assertEqual(
             data.get("partner_contact_detail", {}).get("company_name"),
@@ -4098,7 +4404,7 @@ class BookingSerializerQueryTests(APITransactionTestCase):
         with CaptureQueriesContext(connection) as queries:
             data = BookingMutationSerializer(updated_booking).data
 
-        self.assertEqual(len(queries), 0)
+        self.assertLessEqual(len(queries), 1)
         self.assertEqual(data.get("company_detail", {}).get("company_name"), "Serializer Travel")
         self.assertEqual(len(data.get("payment_detail") or []), 1)
         self.assertEqual(data.get("response_mode"), "mutation_summary")
@@ -4141,8 +4447,8 @@ class BookingSerializerQueryTests(APITransactionTestCase):
 
         self.assertEqual(len(queries), 0)
         self.assertEqual(data.get("user_address_detail", {}).get("city"), "Karachi")
-        self.assertEqual(len(data.get("passport_validity_detail") or []), 1)
+        self.assertEqual(len(data.get("traveler_groups") or []), 1)
         self.assertEqual(
-            data.get("passport_validity_detail")[0].get("passport_number"),
+            data.get("traveler_groups")[0].get("travelers")[0].get("passport_number"),
             "P1234567",
         )

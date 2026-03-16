@@ -475,14 +475,11 @@ class PartnerServicesView(APIView):
         operation_description="Create services for a partner based on the provided session token.",
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
-            required=['partner_session_token', 'is_hajj_service_offer', 'is_umrah_service_offer', 'is_ziyarah_service_offer', 'is_transport_service_offer', 'is_visa_service_offer'],
+            required=['partner_session_token', 'is_hajj_service_offer', 'is_umrah_service_offer'],
             properties={
                 'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description="Session token of the partner"),
                 'is_hajj_service_offer': openapi.Schema(type=openapi.TYPE_BOOLEAN, description="Hajj service offer"),
                 'is_umrah_service_offer': openapi.Schema(type=openapi.TYPE_BOOLEAN, description="Umrah service offer"),
-                'is_ziyarah_service_offer': openapi.Schema(type=openapi.TYPE_BOOLEAN, description="Ziyarah service offer"),
-                'is_transport_service_offer': openapi.Schema(type=openapi.TYPE_BOOLEAN, description="Transport service offer"),
-                'is_visa_service_offer': openapi.Schema(type=openapi.TYPE_BOOLEAN, description="Visa service offer"),
             }
         ),
         responses={
@@ -510,18 +507,45 @@ class PartnerServicesView(APIView):
 
         # Field Validation
         required_fields = [
-            'is_hajj_service_offer', 'is_umrah_service_offer', 'is_ziyarah_service_offer',
-            'is_transport_service_offer', 'is_visa_service_offer'
+            'is_hajj_service_offer',
+            'is_umrah_service_offer',
         ]
         error_response = validate_required_fields(required_fields, data)
         if error_response:
             return error_response
 
+        normalized_data = {
+            'is_hajj_service_offer': self._parse_bool(data.get('is_hajj_service_offer')),
+            'is_umrah_service_offer': self._parse_bool(data.get('is_umrah_service_offer')),
+            'is_ziyarah_service_offer': False,
+            'is_transport_service_offer': False,
+            'is_visa_service_offer': False,
+        }
+
+        if not any([
+            normalized_data['is_hajj_service_offer'],
+            normalized_data['is_umrah_service_offer'],
+        ]):
+            return Response(
+                {"message": "Select at least one supported service: Hajj or Umrah."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         # Check if the user already has a partner type other than "NA"
         if user.partner_type != "NA":
             return Response({"message": "Sorry, record already exists."}, status=status.HTTP_409_CONFLICT)
 
-        return self.add_partner_services(user, data)
+        return self.add_partner_services(user, normalized_data)
+
+    @staticmethod
+    def _parse_bool(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return False
 
     def add_partner_services(self, user, data):
         try:
@@ -548,11 +572,11 @@ class PartnerServicesView(APIView):
             return Response({"message": "Failed to add partner services. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     def update_partner_type(self, user, data):
-        # Check if any specific services are offered and set the partner type accordingly
-        if any([data[field] for field in ['is_hajj_service_offer', 'is_umrah_service_offer', 'is_ziyarah_service_offer', 'is_visa_service_offer']]):
+        # The operator onboarding currently supports company package services only.
+        if any([data[field] for field in ['is_hajj_service_offer', 'is_umrah_service_offer']]):
             user.partner_type = "Company"
-        elif data['is_transport_service_offer']:
-            user.partner_type = "Individual"
+        else:
+            user.partner_type = "NA"
         user.save()
 
 

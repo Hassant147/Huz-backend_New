@@ -1,6 +1,13 @@
+import re
+
 from rest_framework import serializers
 from .models import UserOTP, UserProfile, Wallet, MailingDetail, UserBankAccount, UserTransactionHistory, UserWithdraw
-import re
+from .phone_utils import (
+    normalize_country_code,
+    normalize_country_iso_code,
+    normalize_full_phone_number,
+    normalize_local_phone_number,
+)
 
 
 def _get_prefetched_items(instance, relation_name):
@@ -16,12 +23,10 @@ class UserOTPSerializer(serializers.ModelSerializer):
         fields = ['phone_number']
 
     def validate_phone_number(self, value):
-        # Regular expression pattern for a valid phone number
-        regex = r'^(\+\d{1,3}[\s-]?)?\d{10}$'
-        # Validate the phone number
-        if not re.fullmatch(regex, value):
-            raise serializers.ValidationError("You've entered an invalid Phone Number.")
-        return value
+        country_iso_code = ""
+        if hasattr(self, "initial_data"):
+            country_iso_code = self.initial_data.get("country_iso_code", "")
+        return normalize_full_phone_number(value, country_iso_code=country_iso_code)
 
 
 class UserProfileSerializer(serializers.ModelSerializer):
@@ -51,17 +56,29 @@ class UserProfileSerializer(serializers.ModelSerializer):
         return wallet_amount if wallet_amount is not None else 0.0
 
     def validate_phone_number(self, value):
-        # Regular expression pattern for a valid phone number
-        regex = r'^(\+\d{1,3}[\s-]?)?\d{10}$'
-        # Validate the phone number
-        if not re.fullmatch(regex, value):
-            raise serializers.ValidationError("You've entered an invalid Phone Number.")
-        return value
+        country_code = ""
+        country_iso_code = ""
+        if hasattr(self, "initial_data"):
+            country_code = self.initial_data.get("country_code", "")
+            country_iso_code = self.initial_data.get("country_iso_code", "")
+
+        return normalize_local_phone_number(
+            value,
+            country_code=country_code,
+            country_iso_code=country_iso_code,
+        )
+
+    def validate_country_code(self, value):
+        country_iso_code = ""
+        if hasattr(self, "initial_data"):
+            country_iso_code = self.initial_data.get("country_iso_code", "")
+        return normalize_country_code(value, country_iso_code=country_iso_code)
+
+    def validate_country_iso_code(self, value):
+        return normalize_country_iso_code(value)
 
     def validate_email(self, value):
-        # Regular expression pattern for a valid phone number
         regex = r'^[a-zA-Z0-9.+_-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]+$'
-        # Validate the phone number
         if not re.fullmatch(regex, value):
             raise serializers.ValidationError("You've entered an invalid email format.")
         return value

@@ -2,7 +2,24 @@ from datetime import datetime
 
 from django.utils import timezone
 from rest_framework import serializers
-from .models import Booking, Payment, BookingRequest, PassportValidity, BookingObjections, PartnersBookingPayment, BookingDocuments, DocumentsStatus, BookingAirlineDetail, BookingHotelAndTransport, BookingRatingAndReview, BookingComplaints, UserRequiredDocuments
+from .models import (
+    Booking,
+    BookingAirlineDetail,
+    BookingComplaints,
+    BookingDocuments,
+    BookingGroup,
+    BookingHotelFulfillment,
+    BookingObjections,
+    BookingRatingAndReview,
+    BookingRequest,
+    BookingTransportFulfillment,
+    DocumentsStatus,
+    PartnersBookingPayment,
+    PassportValidity,
+    Payment,
+    TravelerIssue,
+    UserRequiredDocuments,
+)
 from common.models import UserProfile, MailingDetail
 from common.serializers import MailingDetailSerializer
 from partners.models import PartnerProfile, HuzBasicDetail, BusinessProfile, PartnerMailingDetail, HuzAirlineDetail
@@ -20,7 +37,10 @@ from .workflow import (
     booking_allows_minimum_payment_submission,
     booking_allows_operator_action,
     get_booking_airline_details,
+    get_open_traveler_issues,
+    booking_hotel_fulfillments_are_complete,
     booking_has_operator_visibility,
+    booking_transport_fulfillment_is_complete,
     get_payment_stage_status,
     get_remaining_amount_due,
     resolve_client_workflow_stage,
@@ -145,8 +165,82 @@ def get_booking_objections(obj):
 
 
 def get_passport_validity(obj):
-    passport_validity = _list_related_items(obj, 'passport_for_booking_number')
+    passport_validity = sorted(
+        _list_related_items(obj, 'passport_for_booking_number'),
+        key=lambda passport: (
+            getattr(getattr(passport, "booking_group", None), "sequence", 10_000),
+            getattr(passport, "traveler_sequence", 10_000),
+            str(getattr(passport, "passport_id", "")),
+        ),
+    )
     return PassportValiditySerializer(passport_validity, many=True).data
+
+
+def get_traveler_issues(obj):
+    traveler_issues = sorted(
+        _list_related_items(obj, "traveler_issues"),
+        key=lambda issue: (
+            0 if str(getattr(issue, "status", "") or "").strip().lower() == "open" else 1,
+            -_get_datetime_sort_value(getattr(issue, "created_at", None)),
+        ),
+    )
+    return TravelerIssueSerializer(traveler_issues, many=True).data
+
+
+def get_traveler_groups(obj):
+    booking_groups = _list_related_items(obj, "booking_groups")
+    return BookingGroupSerializer(booking_groups, many=True).data
+
+
+def get_package_defaults(obj):
+    if not obj.package_token:
+        return None
+
+    package = obj.package_token
+    airline_items = _list_related_items(package, "airline_for_package")
+    hotel_items = _list_related_items(package, "hotel_for_package")
+    transport_items = _list_related_items(package, "transport_for_package")
+
+    return {
+        "airlines": HuzAirlineSerializer(airline_items, many=True).data,
+        "hotels": HuzHotelSerializer(hotel_items, many=True, context={}).data,
+        "transport": HuzTransportSerializer(transport_items[0], context={}).data if transport_items else None,
+        "inclusions": {
+            "visa": bool(getattr(package, "is_visa_included", False)),
+            "airport_reception": bool(getattr(package, "is_airport_reception_included", False)),
+            "tour_guide": bool(getattr(package, "is_tour_guide_included", False)),
+            "insurance": bool(getattr(package, "is_insurance_included", False)),
+            "breakfast": bool(getattr(package, "is_breakfast_included", False)),
+            "lunch": bool(getattr(package, "is_lunch_included", False)),
+            "dinner": bool(getattr(package, "is_dinner_included", False)),
+        },
+    }
+
+
+def get_booking_fulfillment(obj):
+    document_status = _get_first_related_item(obj, "status_for_booking")
+    booking_documents = _list_related_items(obj, "document_for_booking_token")
+    hotel_fulfillments = _list_related_items(obj, "hotel_fulfillments")
+    try:
+        transport_fulfillment = obj.transport_fulfillment
+    except Exception:
+        transport_fulfillment = None
+
+    return {
+        "summary": {
+            "visa_completed": bool(getattr(document_status, "is_visa_completed", False)),
+            "airline_documents_completed": bool(getattr(document_status, "is_airline_completed", False)),
+            "airline_details_completed": bool(getattr(document_status, "is_airline_detail_completed", False)),
+            "hotel_completed": booking_hotel_fulfillments_are_complete(obj),
+            "transport_completed": booking_transport_fulfillment_is_complete(obj),
+        },
+        "documents": BookingDocumentsSerializer(booking_documents, many=True).data,
+        "airlines": BookingAirlineSerializer(get_booking_airline_details(obj), many=True).data,
+        "hotels": BookingHotelFulfillmentSerializer(hotel_fulfillments, many=True).data,
+        "transport": BookingTransportFulfillmentSerializer(transport_fulfillment).data
+        if transport_fulfillment
+        else None,
+    }
 
 
 def get_payment_detail(obj):
@@ -473,7 +567,6 @@ class ShortBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSerial
     is_dinner_included = serializers.CharField(source='package_token.is_dinner_included', read_only=True)
     # Payment Verified or not
     payment_detail = serializers.SerializerMethodField()
-    passport_validity_detail = serializers.SerializerMethodField()
 
     class Meta:
         model = Booking
@@ -497,8 +590,6 @@ class ShortBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSerial
             'is_visa_included', 'is_airport_reception_included', 'is_tour_guide_included', 'is_insurance_included',
             'is_breakfast_included', 'is_lunch_included', 'is_dinner_included',
 
-            'passport_validity_detail',
-
             'payment_detail',
             'order_by', 'order_to', 'package_token'
                   )
@@ -513,10 +604,6 @@ class ShortBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSerial
         if should_hide_payment_detail(self):
             return []
         return get_payment_detail(obj)
-
-    def get_passport_validity_detail(self, obj):
-        return get_passport_validity(obj)
-
 
 class DetailBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSerializer):
     # Partner Section
@@ -558,18 +645,17 @@ class DetailBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSeria
     cost_for_double = serializers.CharField(source='package_token.cost_for_double', read_only=True)
     cost_for_single = serializers.CharField(source='package_token.cost_for_single', read_only=True)
 
-    airline_detail = serializers.SerializerMethodField()
-    transport_detail = serializers.SerializerMethodField()
-    hotel_detail = serializers.SerializerMethodField()
     booking_documents_status = serializers.SerializerMethodField()
     booking_documents = serializers.SerializerMethodField()
     user_documents = serializers.SerializerMethodField()
     booking_airline_details = serializers.SerializerMethodField()
-    booking_hotel_and_transport_details = serializers.SerializerMethodField()
     booking_rating = serializers.SerializerMethodField()
     payment_detail = serializers.SerializerMethodField()
     booking_objections = serializers.SerializerMethodField()
-    passport_validity_detail = serializers.SerializerMethodField()
+    package_defaults = serializers.SerializerMethodField()
+    booking_fulfillment = serializers.SerializerMethodField()
+    traveler_groups = serializers.SerializerMethodField()
+    traveler_issues = serializers.SerializerMethodField()
     class Meta:
         model = Booking
         fields = (
@@ -589,49 +675,32 @@ class DetailBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSeria
             'user_session_token', 'user_fullName', 'user_country_code', 'user_phone_number', 'user_email',
             'user_photo', 'user_address_detail',
 
-            'airline_detail', 'transport_detail', 'hotel_detail',
-
             'huz_token', 'package_type', 'package_name', 'package_cost', 'mecca_nights', 'madinah_nights',
             'jeddah_nights', 'taif_nights', 'riyadah_nights',
             'is_visa_included', 'is_airport_reception_included', 'is_tour_guide_included', 'is_insurance_included',
             'is_breakfast_included', 'is_lunch_included', 'is_dinner_included',
             'cost_for_sharing', 'cost_for_quad', 'cost_for_triple', 'cost_for_double', 'cost_for_single',
-            'payment_detail', 'booking_objections', 'is_check_in_makkah', 'is_check_in_madinah',
+            'payment_detail', 'booking_objections',
 
-            'passport_validity_detail',
             'booking_documents_status',  'user_documents',
-            'booking_documents', 'booking_airline_details', 'booking_hotel_and_transport_details', 'booking_rating'
+            'booking_documents', 'booking_airline_details', 'booking_rating',
+            'package_defaults', 'booking_fulfillment', 'traveler_groups', 'traveler_issues',
                   )
 
     def get_company_detail(self, obj):
         return get_company_detail(obj)
 
-    def get_airline_detail(self, obj):
-        if not obj.package_token:
-            return []
+    def get_package_defaults(self, obj):
+        return get_package_defaults(obj)
 
-        airline = _list_related_items(obj.package_token, 'airline_for_package')
-        return HuzAirlineSerializer(airline, many=True).data
+    def get_booking_fulfillment(self, obj):
+        return get_booking_fulfillment(obj)
 
-    def get_transport_detail(self, obj):
-        if not obj.package_token:
-            return None
+    def get_traveler_groups(self, obj):
+        return get_traveler_groups(obj)
 
-        transport_items = _list_related_items(obj.package_token, 'transport_for_package')
-        if not transport_items:
-            return None
-
-        return HuzTransportSerializer(transport_items[0], context=self.context).data
-
-    def get_hotel_detail(self, obj):
-        if not obj.package_token:
-            return []
-
-        hotel_items = _list_related_items(obj.package_token, 'hotel_for_package')
-        return HuzHotelSerializer(hotel_items, many=True, context=self.context).data
-
-    def get_passport_validity_detail(self, obj):
-        return get_passport_validity(obj)
+    def get_traveler_issues(self, obj):
+        return get_traveler_issues(obj)
 
     def get_partner_address_detail(self, obj):
         return get_partner_address_detail(obj)
@@ -658,12 +727,6 @@ class DetailBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSeria
         airline = get_booking_airline_details(obj)
         return BookingAirlineSerializer(airline, many=True).data
 
-    def get_booking_hotel_and_transport_details(self, obj):
-        airline = _list_related_items(obj, 'hotel_or_transport_for_booking')
-        return BookingHotelOrTransportSerializer(airline, many=True).data
-
-
-
     def get_booking_rating(self, obj):
         airline = _list_related_items(obj, 'rating_for_booking')
         return BookingRatingAndReviewSerializer(airline, many=True).data
@@ -672,17 +735,6 @@ class DetailBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSeria
         if should_hide_payment_detail(self):
             return []
         return get_payment_detail(obj)
-
-
-class LegacyDetailBookingSerializer(DetailBookingSerializer):
-    traveller_detail = serializers.SerializerMethodField()
-
-    class Meta(DetailBookingSerializer.Meta):
-        fields = DetailBookingSerializer.Meta.fields + ('traveller_detail',)
-
-    def get_traveller_detail(self, obj):
-        return get_passport_validity(obj)
-
 
 class AdminPaidBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSerializer):
     # Partner Section
@@ -784,9 +836,21 @@ class UserRequiredBookingDocumentsSerializer(serializers.ModelSerializer):
 
 
 class BookingDocumentsSerializer(serializers.ModelSerializer):
+    booking_group_id = serializers.UUIDField(read_only=True)
+    traveler_id = serializers.UUIDField(read_only=True)
+
     class Meta:
         model = BookingDocuments
-        fields = ['document_id', 'document_for', 'document_link']
+        fields = [
+            'document_id',
+            'document_for',
+            'document_category',
+            'document_scope',
+            'document_title',
+            'document_link',
+            'booking_group_id',
+            'traveler_id',
+        ]
 
 
 class DocumentsStatusSerializer(serializers.ModelSerializer):
@@ -802,13 +866,38 @@ class BookingAirlineSerializer(serializers.ModelSerializer):
         fields = ['booking_airline_id', 'flight_direction', 'flight_date', 'flight_time', 'flight_from', 'flight_to']
 
 
-class BookingHotelOrTransportSerializer(serializers.ModelSerializer):
+class BookingHotelFulfillmentSerializer(serializers.ModelSerializer):
+    package_hotel_id = serializers.UUIDField(read_only=True)
+
     class Meta:
-        model = BookingHotelAndTransport
-        fields = ['hotel_or_transport_id', 'detail_for', 'jeddah_name', 'jeddah_number', 'mecca_name',
-                  'mecca_number', 'madinah_name', 'madinah_number', 'taif_name', 'taif_number',
-                  'riyadh_name', 'riyadh_number', 'comment_1', 'comment_2',
-                  'shared_time']
+        model = BookingHotelFulfillment
+        fields = [
+            'fulfillment_id',
+            'city',
+            'hotel_name',
+            'contact_name',
+            'contact_phone',
+            'note',
+            'shared_time',
+            'package_hotel_id',
+        ]
+
+
+class BookingTransportFulfillmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BookingTransportFulfillment
+        fields = [
+            'transport_fulfillment_id',
+            'transport_mode',
+            'transport_name',
+            'transport_type',
+            'route_summary',
+            'contact_name',
+            'contact_phone',
+            'ticket_reference',
+            'note',
+            'shared_time',
+        ]
 
 
 class BookingRatingAndReviewSerializer(serializers.ModelSerializer):
@@ -819,10 +908,85 @@ class BookingRatingAndReviewSerializer(serializers.ModelSerializer):
 
 
 class PassportValiditySerializer(serializers.ModelSerializer):
+    booking_group_id = serializers.UUIDField(read_only=True)
+    booking_group_label = serializers.CharField(source="booking_group.label", read_only=True)
+    traveler_issues = serializers.SerializerMethodField()
+
     class Meta:
         model = PassportValidity
-        fields = ['passport_id', 'first_name', 'middle_name', 'last_name', 'date_of_birth', 'passport_number',
-                  'passport_country', 'expiry_date', 'user_passport', 'user_photo', 'report_rabbit']
+        fields = [
+            'passport_id',
+            'traveler_sequence',
+            'traveler_type',
+            'room_type',
+            'booking_group_id',
+            'booking_group_label',
+            'first_name',
+            'middle_name',
+            'last_name',
+            'date_of_birth',
+            'passport_number',
+            'passport_country',
+            'expiry_date',
+            'user_passport',
+            'user_photo',
+            'traveler_issues',
+        ]
+
+    def get_traveler_issues(self, obj):
+        issues = _list_related_items(obj, "traveler_issues")
+        return TravelerIssueSerializer(issues, many=True).data
+
+
+class TravelerIssueSerializer(serializers.ModelSerializer):
+    traveler_id = serializers.UUIDField(read_only=True)
+    booking_group_id = serializers.UUIDField(source="traveler.booking_group_id", read_only=True)
+    booking_group_label = serializers.CharField(source="traveler.booking_group.label", read_only=True)
+    traveler_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TravelerIssue
+        fields = [
+            "traveler_issue_id",
+            "traveler_id",
+            "booking_group_id",
+            "booking_group_label",
+            "traveler_name",
+            "issue_type",
+            "status",
+            "notes",
+            "created_at",
+            "resolved_at",
+        ]
+
+    def get_traveler_name(self, obj):
+        traveler = getattr(obj, "traveler", None)
+        if not traveler:
+            return ""
+        return " ".join(
+            [
+                str(getattr(traveler, "first_name", "") or "").strip(),
+                str(getattr(traveler, "middle_name", "") or "").strip(),
+                str(getattr(traveler, "last_name", "") or "").strip(),
+            ]
+        ).strip()
+
+
+class BookingGroupSerializer(serializers.ModelSerializer):
+    travelers = serializers.SerializerMethodField()
+    documents = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BookingGroup
+        fields = ["group_id", "label", "sequence", "notes", "travelers", "documents"]
+
+    def get_travelers(self, obj):
+        travelers = _list_related_items(obj, "travelers")
+        return PassportValiditySerializer(travelers, many=True).data
+
+    def get_documents(self, obj):
+        documents = _list_related_items(obj, "documents")
+        return BookingDocumentsSerializer(documents, many=True).data
 
 
 class PartnerRatingSerializer(serializers.ModelSerializer):

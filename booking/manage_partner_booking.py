@@ -1,10 +1,14 @@
+import json
+from decimal import Decimal
+
+from django.db import transaction
 from django.db.models import Sum, Count, Q
+from django.utils import timezone
 from django.utils.dateparse import parse_date
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
-from decimal import Decimal
 from common.authentication import (
     get_authenticated_partner_profile,
     is_authenticated_staff_user,
@@ -14,15 +18,29 @@ from common.pagination import CustomPagination
 from common.permissions import IsAdminOrAuthenticatedPartnerProfile
 from common.utility import validate_required_fields, check_file_format_and_size, save_file_in_directory, delete_file_from_directory, send_objection_email, send_booking_documents_email
 from common.logs_file import logger
-from partners.models import PartnerProfile, HuzBasicDetail
-from .models import Booking, BookingObjections, PassportValidity, DocumentsStatus, BookingDocuments, PartnersBookingPayment, BookingRatingAndReview, BookingComplaints, BookingAirlineDetail, BookingHotelAndTransport
+from partners.models import PartnerProfile, HuzBasicDetail, HuzHotelDetail
+from .models import (
+    Booking,
+    BookingAirlineDetail,
+    BookingComplaints,
+    BookingDocuments,
+    BookingGroup,
+    BookingHotelFulfillment,
+    BookingObjections,
+    BookingRatingAndReview,
+    BookingTransportFulfillment,
+    DocumentsStatus,
+    PartnersBookingPayment,
+    PassportValidity,
+    TravelerIssue,
+)
 from .querysets import (
     annotate_effective_booking_status,
     build_partner_workflow_bucket_q,
     filter_partner_booking_queryset,
 )
 from .serializers import (
-    LegacyDetailBookingSerializer,
+    DetailBookingSerializer,
     PartnerBookingListSerializer,
     PartnersBookingPaymentSerializer,
     BookingComplaintsSerializer,
@@ -47,7 +65,9 @@ from .statuses import (
 from .workflow import (
     booking_allows_operator_action,
     booking_airline_details_are_complete,
+    booking_hotel_fulfillments_are_complete,
     booking_requires_return_airline_detail,
+    booking_transport_fulfillment_is_complete,
     clear_booking_runtime_caches,
     normalize_booking_status,
     normalize_airline_direction,
@@ -91,8 +111,24 @@ VALID_BOOKING_STATUSES = tuple(status_name for status_name, _ in BOOKING_STATUS_
 BOOKING_STATUS_NORMALIZER = {status_name.lower(): status_name for status_name in VALID_BOOKING_STATUSES}
 VALID_BOOKING_UPDATE_STATUSES = (BOOKING_STATUS_IN_FULFILLMENT, BOOKING_STATUS_READY_FOR_TRAVEL)
 VALID_BOOKING_DOCUMENT_TYPES = ("eVisa", "airline", "hotel", "transport")
+VALID_BOOKING_DOCUMENT_SCOPES = (
+    BookingDocuments.DOCUMENT_SCOPE_BOOKING,
+    BookingDocuments.DOCUMENT_SCOPE_GROUP,
+    BookingDocuments.DOCUMENT_SCOPE_TRAVELER,
+)
 VALID_ARRANGEMENT_DETAIL_TYPES = ("Hotel", "Transport")
 VALID_COMPLAINT_STATUSES = ("Open", "InProgress", "Solved", "Close")
+REVIEW_SORT_ORDERING = {
+    "newest": ("-rating_time",),
+    "oldest": ("rating_time",),
+    "highest": ("-partner_total_stars", "-rating_time"),
+    "lowest": ("partner_total_stars", "-rating_time"),
+}
+VALID_TRAVELER_ISSUE_MUTABLE_STATUSES = (
+    BOOKING_STATUS_IN_FULFILLMENT,
+    BOOKING_STATUS_READY_FOR_TRAVEL,
+    BOOKING_STATUS_COMPLETED,
+)
 
 COMPLAINT_STATUS_NORMALIZER = {
     "open": "Open",
@@ -125,6 +161,50 @@ ARRANGEMENT_DETAIL_TYPE_NORMALIZER = {
     "transport": "Transport",
 }
 
+DOCUMENT_SCOPE_NORMALIZER = {
+    "booking": BookingDocuments.DOCUMENT_SCOPE_BOOKING,
+    "booking_wide": BookingDocuments.DOCUMENT_SCOPE_BOOKING,
+    "group": BookingDocuments.DOCUMENT_SCOPE_GROUP,
+    "group_wide": BookingDocuments.DOCUMENT_SCOPE_GROUP,
+    "traveler": BookingDocuments.DOCUMENT_SCOPE_TRAVELER,
+    "traveller": BookingDocuments.DOCUMENT_SCOPE_TRAVELER,
+    "traveler_specific": BookingDocuments.DOCUMENT_SCOPE_TRAVELER,
+    "traveller_specific": BookingDocuments.DOCUMENT_SCOPE_TRAVELER,
+}
+
+TRANSPORT_MODE_NORMALIZER = {
+    BookingTransportFulfillment.MODE_NONE: BookingTransportFulfillment.MODE_NONE,
+    "no_transport": BookingTransportFulfillment.MODE_NONE,
+    "none": BookingTransportFulfillment.MODE_NONE,
+    BookingTransportFulfillment.MODE_TICKET_ONLY: BookingTransportFulfillment.MODE_TICKET_ONLY,
+    "ticket": BookingTransportFulfillment.MODE_TICKET_ONLY,
+    "file_only": BookingTransportFulfillment.MODE_TICKET_ONLY,
+    BookingTransportFulfillment.MODE_DETAILS_ONLY: BookingTransportFulfillment.MODE_DETAILS_ONLY,
+    "details": BookingTransportFulfillment.MODE_DETAILS_ONLY,
+    "contact_only": BookingTransportFulfillment.MODE_DETAILS_ONLY,
+    BookingTransportFulfillment.MODE_DETAILS_AND_TICKET: BookingTransportFulfillment.MODE_DETAILS_AND_TICKET,
+    "both": BookingTransportFulfillment.MODE_DETAILS_AND_TICKET,
+}
+
+TRAVELER_ISSUE_ACTION_NORMALIZER = {
+    "report": "report",
+    "reported": "report",
+    "mark": "report",
+    "create": "report",
+    "reopen": "reopen",
+    "resolve": "resolve",
+    "resolved": "resolve",
+    "unreport": "resolve",
+    "close": "resolve",
+}
+
+TRAVELER_ISSUE_TYPE_NORMALIZER = {
+    TravelerIssue.ISSUE_TYPE_REPORTED.lower(): TravelerIssue.ISSUE_TYPE_REPORTED,
+    "reported": TravelerIssue.ISSUE_TYPE_REPORTED,
+    "rabbit": TravelerIssue.ISSUE_TYPE_RABBIT,
+    TravelerIssue.ISSUE_TYPE_RABBIT.lower(): TravelerIssue.ISSUE_TYPE_RABBIT,
+}
+
 COMPLETE_BOOKING_STATUS_FLAGS = (
     "is_visa_completed",
     "is_airline_completed",
@@ -137,10 +217,20 @@ BOOKING_LIST_SELECT_RELATED = ("order_by", "order_to", "package_token")
 BOOKING_LIST_PREFETCH_RELATED = (
     "order_by__mailing_session",
     "order_to__company_of_partner",
+    "passport_for_booking_number__booking_group",
+    "passport_for_booking_number__traveler_issues",
     "passport_for_booking_number",
     "booking_token",
+    "booking_groups",
+    "booking_groups__documents",
+    "booking_groups__travelers",
+    "booking_groups__travelers__traveler_issues",
+    "document_for_booking_token",
     "package_token__airline_for_package",
+    "package_token__hotel_for_package",
     "package_token__transport_for_package",
+    "hotel_fulfillments",
+    "traveler_issues",
 )
 BOOKING_STATS_PREFETCH_RELATED = (
     "passport_for_booking_number",
@@ -153,6 +243,7 @@ BOOKING_DETAIL_SELECT_RELATED = (
     "order_to",
     "package_token",
     "package_token__package_provider",
+    "transport_fulfillment",
 )
 BOOKING_DETAIL_PREFETCH_RELATED = (
     "order_by__mailing_session",
@@ -164,14 +255,21 @@ BOOKING_DETAIL_PREFETCH_RELATED = (
     "package_token__hotel_for_package__hotel_images",
     "package_token__hotel_for_package__catalog_hotel__hotel_images",
     "objection_for_booking",
+    "passport_for_booking_number__booking_group",
+    "passport_for_booking_number__traveler_issues",
     "passport_for_booking_number",
     "booking_token",
+    "booking_groups",
+    "booking_groups__documents",
+    "booking_groups__travelers",
+    "booking_groups__travelers__traveler_issues",
     "status_for_booking",
     "document_for_booking_token",
     "user_document_for_booking_token",
     "airline_for_booking",
-    "hotel_or_transport_for_booking",
+    "hotel_fulfillments",
     "rating_for_booking",
+    "traveler_issues",
 )
 
 
@@ -229,6 +327,98 @@ def normalize_arrangement_detail_type(detail_for):
     return ARRANGEMENT_DETAIL_TYPE_NORMALIZER.get(normalized, "")
 
 
+def normalize_document_scope(value):
+    normalized = str(value or "").strip().lower()
+    return DOCUMENT_SCOPE_NORMALIZER.get(normalized, "")
+
+
+def normalize_transport_mode(value):
+    normalized = str(value or "").strip().lower()
+    return TRANSPORT_MODE_NORMALIZER.get(normalized, "")
+
+
+def normalize_traveler_issue_action(value):
+    normalized = str(value or "").strip().lower()
+    return TRAVELER_ISSUE_ACTION_NORMALIZER.get(normalized, "")
+
+
+def normalize_traveler_issue_type(value):
+    normalized = str(value or "").strip().lower()
+    return TRAVELER_ISSUE_TYPE_NORMALIZER.get(normalized, "")
+
+
+def normalize_city_key(value):
+    normalized = str(value or "").strip().lower()
+    if normalized == "mecca":
+        return "makkah"
+    return normalized
+
+
+def _parse_jsonish(value):
+    if isinstance(value, (list, dict)):
+        return value
+    if value in (None, ""):
+        return None
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return None
+    return None
+
+
+def _has_meaningful_value(value):
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, dict, tuple, set)):
+        return bool(value)
+    return True
+
+
+def _build_partner_booking_response(request, booking_detail):
+    sync_booking_state(booking_detail, save=True)
+    booking_detail = get_booking_detail_for_request_context(
+        request,
+        booking_detail.booking_number,
+        partner_session_token=getattr(getattr(booking_detail, "order_to", None), "partner_session_token", ""),
+    ) or booking_detail
+    serialized_booking = DetailBookingSerializer(
+        booking_detail,
+        context={"request": request, "hide_payment_detail": True},
+    )
+    return serialized_booking.data
+
+
+def resolve_partner_for_request(request, partner_session_token=""):
+    partner = resolve_authenticated_partner_profile(request)
+    if partner:
+        return partner
+
+    normalized_token = str(partner_session_token or extract_partner_session_token(request) or "").strip()
+    if not normalized_token:
+        return None
+    return PartnerProfile.objects.filter(partner_session_token=normalized_token).first()
+
+
+def get_booking_detail_for_request_context(request, booking_number, *, partner_session_token=""):
+    allow_hidden = request_has_partner_visibility_override(request)
+    queryset = get_partner_bookings_queryset(include_detail_relations=True)
+    partner = resolve_partner_for_request(request, partner_session_token=partner_session_token)
+
+    if partner is not None:
+        booking = queryset.filter(order_to=partner, booking_number=booking_number).first()
+    elif allow_hidden:
+        booking = queryset.filter(booking_number=booking_number).first()
+    else:
+        return None
+
+    if not partner_booking_is_accessible(booking, allow_hidden=allow_hidden):
+        return None
+    return booking
+
+
 def get_airline_direction_label(direction):
     return "Return" if normalize_airline_direction(direction) == "return" else "Outbound"
 
@@ -246,6 +436,270 @@ def sync_airline_detail_completion(booking_detail, doc=None):
 def can_update_booking_documents(booking_detail):
     sync_booking_state(booking_detail, save=False)
     return booking_detail.booking_status in VALID_BOOKING_UPDATE_STATUSES
+
+
+def get_booking_documents_for_category(booking_detail, category):
+    normalized_category = str(category or "").strip().lower()
+    documents = BookingDocuments.objects.filter(document_for_booking_token=booking_detail)
+    matched_documents = []
+    for document in documents:
+        document_category = str(
+            getattr(document, "document_category", None)
+            or getattr(document, "document_for", "")
+            or ""
+        ).strip().lower()
+        if document_category == normalized_category:
+            matched_documents.append(document)
+    return matched_documents
+
+
+def sync_booking_document_status(booking_detail):
+    clear_booking_runtime_caches(booking_detail)
+    document_status, _ = DocumentsStatus.objects.get_or_create(status_for_booking=booking_detail)
+    updated_values = {
+        "is_visa_completed": bool(get_booking_documents_for_category(booking_detail, "evisa")),
+        "is_airline_completed": bool(get_booking_documents_for_category(booking_detail, "airline")),
+        "is_airline_detail_completed": booking_airline_details_are_complete(booking_detail),
+        "is_hotel_completed": booking_hotel_fulfillments_are_complete(booking_detail),
+        "is_transport_completed": booking_transport_fulfillment_is_complete(booking_detail),
+    }
+    dirty_fields = []
+    for field_name, field_value in updated_values.items():
+        if bool(getattr(document_status, field_name, False)) != bool(field_value):
+            setattr(document_status, field_name, bool(field_value))
+            dirty_fields.append(field_name)
+    if dirty_fields:
+        document_status.save(update_fields=dirty_fields)
+    clear_booking_runtime_caches(booking_detail)
+    return document_status
+
+
+def infer_document_scope(data):
+    explicit_scope = normalize_document_scope(data.get("document_scope"))
+    if explicit_scope:
+        return explicit_scope
+    if data.get("traveler_id"):
+        return BookingDocuments.DOCUMENT_SCOPE_TRAVELER
+    if data.get("booking_group_id"):
+        return BookingDocuments.DOCUMENT_SCOPE_GROUP
+    return BookingDocuments.DOCUMENT_SCOPE_BOOKING
+
+
+def resolve_booking_group_and_traveler(booking_detail, data, *, allow_empty=False):
+    booking_group = None
+    traveler = None
+    booking_group_id = data.get("booking_group_id")
+    traveler_id = data.get("traveler_id")
+
+    if booking_group_id:
+        booking_group = BookingGroup.objects.filter(
+            booking=booking_detail,
+            group_id=booking_group_id,
+        ).first()
+        if booking_group is None:
+            raise ValueError("Booking group not found for the provided booking.")
+
+    if traveler_id:
+        traveler = PassportValidity.objects.filter(
+            passport_for_booking_number=booking_detail,
+            passport_id=traveler_id,
+        ).first()
+        if traveler is None:
+            raise ValueError("Traveler not found for the provided booking.")
+        if booking_group is not None and traveler.booking_group_id != booking_group.group_id:
+            raise ValueError("Traveler does not belong to the provided booking group.")
+        if booking_group is None and traveler.booking_group_id:
+            booking_group = traveler.booking_group
+
+    if not allow_empty and booking_group is None and traveler is None:
+        return None, None
+    return booking_group, traveler
+
+
+def infer_document_category(data):
+    normalized_document_for = normalize_document_type(
+        data.get("document_category") or data.get("document_for")
+    )
+    return normalized_document_for or ""
+
+
+def build_hotel_fulfillment_payloads(data):
+    parsed_items = _parse_jsonish(data.get("hotel_items"))
+    if isinstance(parsed_items, dict):
+        parsed_items = [parsed_items]
+
+    hotel_items = []
+    if isinstance(parsed_items, list):
+        for item in parsed_items:
+            if not isinstance(item, dict):
+                continue
+            city_key = normalize_city_key(item.get("city"))
+            if not city_key:
+                continue
+            hotel_items.append(
+                {
+                    "city": city_key,
+                    "package_hotel_id": item.get("package_hotel_id"),
+                    "hotel_name": item.get("hotel_name"),
+                    "contact_name": item.get("contact_name"),
+                    "contact_phone": item.get("contact_phone"),
+                    "note": item.get("note"),
+                }
+            )
+    if hotel_items:
+        return hotel_items
+    return hotel_items
+
+
+def resolve_package_hotel(booking_detail, payload):
+    package_hotel_id = payload.get("package_hotel_id")
+    base_queryset = HuzHotelDetail.objects.filter(hotel_for_package=booking_detail.package_token)
+    if package_hotel_id:
+        return base_queryset.filter(hotel_id=package_hotel_id).first()
+
+    city_key = normalize_city_key(payload.get("city"))
+    hotel_name = str(payload.get("hotel_name") or "").strip()
+    if city_key and hotel_name:
+        return base_queryset.filter(
+            hotel_city__iexact=city_key,
+            hotel_name__iexact=hotel_name,
+        ).first()
+    if city_key:
+        return base_queryset.filter(hotel_city__iexact=city_key).first()
+    return None
+
+
+def replace_hotel_fulfillments(booking_detail, hotel_items):
+    BookingHotelFulfillment.objects.filter(hotel_for_booking=booking_detail).delete()
+    for hotel_item in hotel_items:
+        BookingHotelFulfillment.objects.create(
+            city=normalize_city_key(hotel_item.get("city")),
+            hotel_name=(hotel_item.get("hotel_name") or None),
+            contact_name=(hotel_item.get("contact_name") or None),
+            contact_phone=(hotel_item.get("contact_phone") or None),
+            note=(hotel_item.get("note") or None),
+            package_hotel=resolve_package_hotel(booking_detail, hotel_item),
+            hotel_for_booking=booking_detail,
+        )
+
+
+def build_transport_payload(data):
+    parsed_transport = _parse_jsonish(data.get("transport"))
+    if isinstance(parsed_transport, dict):
+        normalized_payload = dict(parsed_transport)
+    else:
+        normalized_payload = {
+            "transport_mode": data.get("transport_mode"),
+            "transport_name": data.get("transport_name"),
+            "transport_type": data.get("transport_type"),
+            "route_summary": data.get("route_summary"),
+            "contact_name": data.get("contact_name"),
+            "contact_phone": data.get("contact_phone"),
+            "ticket_reference": data.get("ticket_reference"),
+            "note": data.get("note"),
+        }
+    has_ticket = _has_meaningful_value(normalized_payload.get("ticket_reference"))
+    has_details = any(
+        _has_meaningful_value(normalized_payload.get(field_name))
+        for field_name in (
+            "transport_name",
+            "transport_type",
+            "route_summary",
+            "contact_name",
+            "contact_phone",
+        )
+    )
+    transport_mode = normalize_transport_mode(normalized_payload.get("transport_mode"))
+    if not transport_mode:
+        if has_ticket and has_details:
+            transport_mode = BookingTransportFulfillment.MODE_DETAILS_AND_TICKET
+        elif has_ticket:
+            transport_mode = BookingTransportFulfillment.MODE_TICKET_ONLY
+        elif has_details:
+            transport_mode = BookingTransportFulfillment.MODE_DETAILS_ONLY
+        else:
+            transport_mode = BookingTransportFulfillment.MODE_NONE
+    normalized_payload["transport_mode"] = transport_mode
+    return normalized_payload
+
+
+def replace_transport_fulfillment(booking_detail, transport_payload):
+    transport_mode = transport_payload["transport_mode"]
+    if transport_mode == BookingTransportFulfillment.MODE_NONE and not any(
+        _has_meaningful_value(transport_payload.get(field_name))
+        for field_name in (
+            "transport_name",
+            "transport_type",
+            "route_summary",
+            "contact_name",
+            "contact_phone",
+            "ticket_reference",
+            "note",
+        )
+    ):
+        BookingTransportFulfillment.objects.filter(transport_for_booking=booking_detail).delete()
+        return None
+
+    fulfillment, _ = BookingTransportFulfillment.objects.update_or_create(
+        transport_for_booking=booking_detail,
+        defaults={
+            "transport_mode": transport_mode,
+            "transport_name": transport_payload.get("transport_name") or None,
+            "transport_type": transport_payload.get("transport_type") or None,
+            "route_summary": transport_payload.get("route_summary") or None,
+            "contact_name": transport_payload.get("contact_name") or None,
+            "contact_phone": transport_payload.get("contact_phone") or None,
+            "ticket_reference": transport_payload.get("ticket_reference") or None,
+            "note": transport_payload.get("note") or None,
+        },
+    )
+    return fulfillment
+
+def mutate_traveler_issue(*, booking_detail, traveler, partner, issue_type, action, notes):
+    open_issue = TravelerIssue.objects.filter(
+        booking=booking_detail,
+        traveler=traveler,
+        issue_type=issue_type,
+        status=TravelerIssue.STATUS_OPEN,
+    ).order_by("-created_at").first()
+
+    if action in {"report", "reopen"}:
+        if open_issue:
+            dirty_fields = []
+            if notes is not None and open_issue.notes != notes:
+                open_issue.notes = notes
+                dirty_fields.append("notes")
+            if action == "reopen" and open_issue.status != TravelerIssue.STATUS_OPEN:
+                open_issue.status = TravelerIssue.STATUS_OPEN
+                open_issue.resolved_at = None
+                open_issue.resolved_by = None
+                dirty_fields.extend(["status", "resolved_at", "resolved_by"])
+            if dirty_fields:
+                open_issue.save(update_fields=list(dict.fromkeys(dirty_fields)))
+            return open_issue
+
+        issue = TravelerIssue.objects.create(
+            booking=booking_detail,
+            traveler=traveler,
+            issue_type=issue_type,
+            status=TravelerIssue.STATUS_OPEN,
+            notes=notes,
+            created_by=partner,
+        )
+        return issue
+
+    if open_issue is None:
+        raise ValueError("No open traveler issue exists for the selected traveler.")
+
+    open_issue.status = TravelerIssue.STATUS_RESOLVED
+    open_issue.resolved_at = timezone.now()
+    open_issue.resolved_by = partner
+    if notes is not None:
+        open_issue.notes = notes
+        open_issue.save(update_fields=["status", "resolved_at", "resolved_by", "notes"])
+    else:
+        open_issue.save(update_fields=["status", "resolved_at", "resolved_by"])
+    return open_issue
 
 
 def normalize_complaint_status(value):
@@ -373,7 +827,7 @@ class GetBookingDetailByBookingNumberForPartnerView(APIView):
             openapi.Parameter('booking_number', openapi.IN_QUERY, description="Booking number", type=openapi.TYPE_STRING, required=True)
         ],
         responses={
-            200: LegacyDetailBookingSerializer(many=False),
+            200: DetailBookingSerializer(many=False),
             400: "Bad Request: Missing or invalid input data",
             401: "Unauthorized: Admin permissions required",
             404: "Not Found: User, Partner, or Package not found.",
@@ -386,21 +840,20 @@ class GetBookingDetailByBookingNumberForPartnerView(APIView):
             booking_number = request.GET.get('booking_number')
 
             # Check for required parameters
-            if not partner_session_token or not booking_number:
+            if not booking_number or (not partner_session_token and not request_has_partner_visibility_override(request)):
                 return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
 
-            user = resolve_authenticated_partner_profile(request)
-            if not user:
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Retrieve booking by user and booking number
-            booking = get_request_partner_booking_detail(request, user, booking_number)
+            booking = get_booking_detail_for_request_context(
+                request,
+                booking_number,
+                partner_session_token=partner_session_token,
+            )
             if not booking:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
             sync_booking_state(booking, save=False)
 
             # Serialize and return booking data
-            serialized_package = LegacyDetailBookingSerializer(booking, context={"request": request, "hide_payment_detail": True})
+            serialized_package = DetailBookingSerializer(booking, context={"request": request, "hide_payment_detail": True})
             return Response(serialized_package.data, status=status.HTTP_200_OK)
 
         except Exception as e:
@@ -424,7 +877,7 @@ class TakeActionView(APIView):
             }
         ),
         responses={
-            201: openapi.Response('Created: Booking status updated successfully.', LegacyDetailBookingSerializer(many=False)),
+            201: openapi.Response('Created: Booking status updated successfully.', DetailBookingSerializer(many=False)),
             400: "Bad Request: Missing or invalid input data.",
             401: "Unauthorized: Admin permissions required.",
             404: "Not Found: User or booking detail not found.",
@@ -483,7 +936,7 @@ class TakeActionView(APIView):
                 booking_detail.save(update_fields=update_fields)
                 sync_booking_state(booking_detail, save=True)
 
-                serialized_package = LegacyDetailBookingSerializer(booking_detail, context={"request": request, "hide_payment_detail": True})
+                serialized_package = DetailBookingSerializer(booking_detail, context={"request": request, "hide_payment_detail": True})
                 return Response(serialized_package.data, status=status.HTTP_201_CREATED)
 
             return Response({"message": "Only ready-for-operator bookings can be updated."}, status=status.HTTP_409_CONFLICT)
@@ -505,7 +958,7 @@ class ManageBookingDocumentsView(APIView):
         ],
         responses={
 
-            201: openapi.Response('Created:', LegacyDetailBookingSerializer(many=False)),
+            201: openapi.Response('Created:', DetailBookingSerializer(many=False)),
             400: "Bad Request: Missing or invalid input data.",
             401: "Unauthorized: Admin permissions required.",
             404: "Not Found: Partner agency detail not found, Booking detail not found, Package detail not found, User not found.",
@@ -514,74 +967,92 @@ class ManageBookingDocumentsView(APIView):
         }
     )
     def post(self, request, *args, **kwargs):
-        files = request.FILES.getlist('document_link')
-        document_for = request.data.get('document_for')
-        normalized_document_for = normalize_document_type(document_for)
-        booking_number = request.data.get('booking_number')
-        partner_session_token = request.data.get('partner_session_token')
-
-        # Validate the presence of required data
-        if not all([files, document_for, booking_number, partner_session_token]):
-            return Response({"message": "Missing file or required information."},
-                            status=status.HTTP_400_BAD_REQUEST)
-
-        if normalized_document_for not in VALID_BOOKING_DOCUMENT_TYPES:
-            return Response(
-                {"message": f"Invalid document_for. Must be one of: {', '.join(VALID_BOOKING_DOCUMENT_TYPES)}."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Validate each file's format and size
-        for file in files:
-            if not check_file_format_and_size(file):
-                return Response({"message": "Invalid file format or size."}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Retrieve partner profile
-        partner = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-        if not partner:
-            return Response({"message": "Partner agency detail not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        # Retrieve booking detail
-        booking_detail = get_request_partner_booking_detail(request, partner, booking_number)
-        if not booking_detail:
-            return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        # Check booking status
-        if not can_update_booking_documents(booking_detail):
-            return Response({"message": "Only bookings that are in fulfillment or ready for travel can perform this task."}, status=status.HTTP_409_CONFLICT)
-
-        # Retrieve package detail
-        package_detail = booking_detail.package_token
-        if not package_detail:
-            return Response({"message": "Package detail not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        # Retrieve user profile
-        user = booking_detail.order_by
-        if not user:
-            return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        # logger.error(f"user email here -Post: {str(user.email)}")
-        # Process files and update documents and statuses
         try:
-            for file in files:
-                file_path = save_file_in_directory(file)
-                BookingDocuments.objects.create(
-                    document_link=file_path,
-                    document_for_booking_token=booking_detail,
-                    document_for=normalized_document_for
+            files = request.FILES.getlist('document_link')
+            booking_number = request.data.get('booking_number')
+            partner_session_token = request.data.get('partner_session_token')
+            normalized_document_for = infer_document_category(request.data)
+            if not files or not booking_number or (
+                not partner_session_token and not request_has_partner_visibility_override(request)
+            ):
+                return Response({"message": "Missing file or required information."},
+                                status=status.HTTP_400_BAD_REQUEST)
+
+            if normalized_document_for not in VALID_BOOKING_DOCUMENT_TYPES:
+                return Response(
+                    {"message": f"Invalid document_for. Must be one of: {', '.join(VALID_BOOKING_DOCUMENT_TYPES)}."},
+                    status=status.HTTP_400_BAD_REQUEST
                 )
 
-            doc, _ = DocumentsStatus.objects.get_or_create(status_for_booking=booking_detail)
+            for file in files:
+                if not check_file_format_and_size(file):
+                    return Response({"message": "Invalid file format or size."}, status=status.HTTP_400_BAD_REQUEST)
 
-            if normalized_document_for == "eVisa":
-                doc.is_visa_completed = True
-                doc.save(update_fields=["is_visa_completed"])
-                send_booking_documents_email(user.email, user.name, booking_number, "Visa")
+            partner = resolve_partner_for_request(request, partner_session_token=partner_session_token)
+            if partner is None and not request_has_partner_visibility_override(request):
+                return Response({"message": "Partner agency detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            elif normalized_document_for == "airline":
-                doc.is_airline_completed = True
-                doc.save(update_fields=["is_airline_completed"])
-                send_booking_documents_email(user.email, user.name, booking_number, "Airline Tickets")
+            booking_detail = get_booking_detail_for_request_context(
+                request,
+                booking_number,
+                partner_session_token=partner_session_token,
+            )
+            if not booking_detail:
+                return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
+            partner = partner or booking_detail.order_to
+
+            if not can_update_booking_documents(booking_detail):
+                return Response({"message": "Only bookings that are in fulfillment or ready for travel can perform this task."}, status=status.HTTP_409_CONFLICT)
+
+            package_detail = booking_detail.package_token
+            if not package_detail:
+                return Response({"message": "Package detail not found."}, status=status.HTTP_404_NOT_FOUND)
+
+            user = booking_detail.order_by
+            if not user:
+                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+
+            document_scope = infer_document_scope(request.data)
+            if document_scope not in VALID_BOOKING_DOCUMENT_SCOPES:
+                return Response(
+                    {"message": f"Invalid document_scope. Must be one of: {', '.join(VALID_BOOKING_DOCUMENT_SCOPES)}."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            try:
+                booking_group, traveler = resolve_booking_group_and_traveler(booking_detail, request.data)
+            except ValueError as exc:
+                return Response({"message": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+            if document_scope == BookingDocuments.DOCUMENT_SCOPE_GROUP and booking_group is None:
+                return Response({"message": "booking_group_id is required for group-scoped documents."}, status=status.HTTP_400_BAD_REQUEST)
+            if document_scope == BookingDocuments.DOCUMENT_SCOPE_TRAVELER and traveler is None:
+                return Response({"message": "traveler_id is required for traveler-scoped documents."}, status=status.HTTP_400_BAD_REQUEST)
+
+            with transaction.atomic():
+                document_title = str(request.data.get("document_title") or "").strip()
+                for file in files:
+                    file_path = save_file_in_directory(file)
+                    BookingDocuments.objects.create(
+                        document_link=file_path,
+                        document_for_booking_token=booking_detail,
+                        document_for=normalized_document_for,
+                        document_category=normalized_document_for,
+                        document_scope=document_scope,
+                        document_title=document_title or getattr(file, "name", normalized_document_for),
+                        booking_group=booking_group,
+                        traveler=traveler,
+                    )
+
+                doc = sync_booking_document_status(booking_detail)
+
+            notification_type = {
+                "eVisa": "Visa",
+                "airline": "Airline Tickets",
+                "hotel": "Hotel Details",
+                "transport": "Transport Details",
+            }.get(normalized_document_for, normalized_document_for)
+            send_booking_documents_email(user.email, user.name, booking_number, notification_type)
 
             finalize_booking_if_all_documents_completed(
                 booking_detail=booking_detail,
@@ -590,9 +1061,7 @@ class ManageBookingDocumentsView(APIView):
                 partner=partner,
             )
 
-            sync_booking_state(booking_detail, save=True)
-            serialized_booking = LegacyDetailBookingSerializer(booking_detail, context={"request": request, "hide_payment_detail": True})
-            return Response(serialized_booking.data, status=status.HTTP_201_CREATED)
+            return Response(_build_partner_booking_response(request, booking_detail), status=status.HTTP_201_CREATED)
         except Exception as e:
             logger.error(f"ManageBookingDocumentsView -Post: {str(e)}")
             return Response({"message": "Failed to submit data. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -617,21 +1086,27 @@ class DeleteBookingDocumentsView(APIView):
     def delete(self, request, *args, **kwargs):
 
         # Extract parameters from the request
-        booking_number = request.data.get('booking_number')
-        document_id = request.data.get('document_id')
-        partner_session_token = request.data.get('partner_session_token')
+        booking_number = request.data.get('booking_number') or request.query_params.get('booking_number')
+        document_id = request.data.get('document_id') or request.query_params.get('document_id')
+        partner_session_token = request.data.get('partner_session_token') or request.query_params.get('partner_session_token')
 
         # Validate the presence of required parameters
-        if not all([booking_number, document_id, partner_session_token]):
+        if not booking_number or not document_id or (
+            not partner_session_token and not request_has_partner_visibility_override(request)
+        ):
             return Response({"message": "Missing required information."}, status=status.HTTP_400_BAD_REQUEST)
 
         # Retrieve partner profile
-        partner = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-        if not partner:
+        partner = resolve_partner_for_request(request, partner_session_token=partner_session_token)
+        if not partner and not request_has_partner_visibility_override(request):
             return Response({"message": "Partner agency not found."}, status=status.HTTP_404_NOT_FOUND)
 
         # Retrieve booking detail
-        booking_detail = get_request_partner_booking_detail(request, partner, booking_number)
+        booking_detail = get_booking_detail_for_request_context(
+            request,
+            booking_number,
+            partner_session_token=partner_session_token,
+        )
         if not booking_detail:
             return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -654,6 +1129,8 @@ class DeleteBookingDocumentsView(APIView):
 
             # Delete the document record from the database
             check_document.delete()
+            sync_booking_document_status(booking_detail)
+            sync_booking_state(booking_detail, save=True)
 
             return Response({"message": "Record deleted successfully."}, status=status.HTTP_200_OK)
         except Exception as e:
@@ -680,7 +1157,7 @@ class BookingAirlineDetailsView(APIView):
             },
         ),
         responses={
-            201: openapi.Response('Airline details created successfully', LegacyDetailBookingSerializer),
+            201: openapi.Response('Airline details created successfully', DetailBookingSerializer),
             400: "Bad Request: Missing or invalid input data.",
             401: "Unauthorized: Admin permissions required.",
             404: "Not Found: Partner agency detail not found, Booking detail not found, Package detail not found, client not found.",
@@ -699,15 +1176,22 @@ class BookingAirlineDetailsView(APIView):
                 return error_response
 
             # Retrieve partner profile using session token
-            partner = PartnerProfile.objects.filter(
-                partner_session_token=request.data.get('partner_session_token')).first()
-            if not partner:
+            partner = resolve_partner_for_request(
+                request,
+                partner_session_token=request.data.get('partner_session_token'),
+            )
+            if not partner and not request_has_partner_visibility_override(request):
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Retrieve booking details using partner and booking number
-            booking_detail = get_request_partner_booking_detail(request, partner, request.data.get('booking_number'))
+            booking_detail = get_booking_detail_for_request_context(
+                request,
+                request.data.get('booking_number'),
+                partner_session_token=request.data.get('partner_session_token'),
+            )
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
+            partner = partner or booking_detail.order_to
 
             # # Retrieve client details from booking details
             # client_detail = booking_detail.order_by
@@ -748,7 +1232,7 @@ class BookingAirlineDetailsView(APIView):
                     airline_for_booking=booking_detail
                 )
 
-                doc, _ = sync_airline_detail_completion(booking_detail, doc)
+                doc = sync_booking_document_status(booking_detail)
 
                 finalize_booking_if_all_documents_completed(
                     booking_detail=booking_detail,
@@ -758,9 +1242,7 @@ class BookingAirlineDetailsView(APIView):
                 )
 
                 # Serialize and return the updated booking details
-                sync_booking_state(booking_detail, save=True)
-                serialized_package = LegacyDetailBookingSerializer(booking_detail, context={"request": request, "hide_payment_detail": True})
-                return Response(serialized_package.data, status=status.HTTP_201_CREATED)
+                return Response(_build_partner_booking_response(request, booking_detail), status=status.HTTP_201_CREATED)
 
             return Response({"message": "Only bookings that are in fulfillment or ready for travel can perform this task."}, status=status.HTTP_409_CONFLICT)
 
@@ -786,7 +1268,7 @@ class BookingAirlineDetailsView(APIView):
             },
         ),
         responses={
-            200: openapi.Response('Airline details updated successfully', LegacyDetailBookingSerializer),
+            200: openapi.Response('Airline details updated successfully', DetailBookingSerializer),
             400: "Bad Request: Missing or invalid input data.",
             401: "Unauthorized: Admin permissions required.",
             404: "Not Found: 'User, Booking detail, Client detail, or Airline details not found'",
@@ -803,13 +1285,21 @@ class BookingAirlineDetailsView(APIView):
             if error_response:
                 return error_response
 
-            partner = PartnerProfile.objects.filter(partner_session_token=data.get('partner_session_token')).first()
-            if not partner:
+            partner = resolve_partner_for_request(
+                request,
+                partner_session_token=data.get('partner_session_token'),
+            )
+            if not partner and not request_has_partner_visibility_override(request):
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            booking_detail = get_request_partner_booking_detail(request, partner, data.get('booking_number'))
+            booking_detail = get_booking_detail_for_request_context(
+                request,
+                data.get('booking_number'),
+                partner_session_token=data.get('partner_session_token'),
+            )
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
+            partner = partner or booking_detail.order_to
 
             # Retrieve the existing airline details for the booking
             airline_detail = BookingAirlineDetail.objects.filter(
@@ -844,11 +1334,15 @@ class BookingAirlineDetailsView(APIView):
                 airline_detail.flight_to = data.get('flight_to')
                 airline_detail.save()
 
-                sync_airline_detail_completion(booking_detail)
+                doc = sync_booking_document_status(booking_detail)
+                finalize_booking_if_all_documents_completed(
+                    booking_detail=booking_detail,
+                    doc=doc,
+                    package_detail=booking_detail.package_token,
+                    partner=partner,
+                )
 
-                sync_booking_state(booking_detail, save=True)
-                serialized_package = LegacyDetailBookingSerializer(booking_detail, context={"request": request, "hide_payment_detail": True})
-                return Response(serialized_package.data, status=status.HTTP_200_OK)
+                return Response(_build_partner_booking_response(request, booking_detail), status=status.HTTP_200_OK)
 
             return Response({"message": "Only bookings that are in fulfillment or ready for travel can be managed."}, status=status.HTTP_409_CONFLICT)
 
@@ -864,26 +1358,23 @@ class BookingHotelAndTransportDetailsView(APIView):
         operation_description="Add hotel and transport details for a booking.",
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
-            required=['partner_session_token', 'booking_number', 'jeddah_name', 'jeddah_number', 'mecca_name', 'mecca_number', 'madinah_name', 'madinah_number', 'comment_1', 'detail_for'],
+            required=['partner_session_token', 'booking_number', 'detail_for'],
             properties={
                 'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Partner session token'),
-                'jeddah_name': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Name for Jeddah hotel'),
-                'jeddah_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Number for Jeddah hotel'),
-                'mecca_name': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Name for Mecca hotel'),
-                'mecca_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Number for Mecca hotel'),
-                'madinah_name': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Name for Madinah hotel'),
-                'madinah_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Number for Madinah hotel'),
-                'taif_name': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Name for Taif hotel or transport'),
-                'taif_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Number for Taif hotel or transport'),
-                'riyadh_name': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Name for Riyadh hotel or transport'),
-                'riyadh_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact Number for Riyadh hotel or transport'),
-                'comment_1': openapi.Schema(type=openapi.TYPE_STRING, description='Traveler-facing arrangement note'),
-                'comment_2': openapi.Schema(type=openapi.TYPE_STRING, description='Legacy secondary arrangement note (optional)'),
                 'detail_for': openapi.Schema(type=openapi.TYPE_STRING, description='Detail type (Hotel or Transport)'),
+                'hotel_items': openapi.Schema(type=openapi.TYPE_STRING, description='JSON array of hotel fulfillment items when detail_for=Hotel'),
+                'transport_mode': openapi.Schema(type=openapi.TYPE_STRING, description='Transport mode when detail_for=Transport'),
+                'transport_name': openapi.Schema(type=openapi.TYPE_STRING, description='Transport name when detail_for=Transport'),
+                'transport_type': openapi.Schema(type=openapi.TYPE_STRING, description='Transport type when detail_for=Transport'),
+                'route_summary': openapi.Schema(type=openapi.TYPE_STRING, description='Route summary when detail_for=Transport'),
+                'contact_name': openapi.Schema(type=openapi.TYPE_STRING, description='Optional transport contact name'),
+                'contact_phone': openapi.Schema(type=openapi.TYPE_STRING, description='Optional transport contact phone'),
+                'ticket_reference': openapi.Schema(type=openapi.TYPE_STRING, description='Optional transport ticket reference'),
+                'note': openapi.Schema(type=openapi.TYPE_STRING, description='Traveler-facing hotel or transport note'),
             },
         ),
         responses={
-            201: openapi.Response('Hotel or transport details created successfully', LegacyDetailBookingSerializer),
+            201: openapi.Response('Hotel or transport details created successfully', DetailBookingSerializer),
             400: "Bad Request: Missing or invalid input data.",
             401: "Unauthorized: Admin permissions required.",
             404: "Not Found: User, Booking detail, Client detail, Package detail, or Record already exists",
@@ -894,12 +1385,10 @@ class BookingHotelAndTransportDetailsView(APIView):
     def post(self, request, *args, **kwargs):
         try:
             data = request.data
-            required_fields = ['partner_session_token', 'booking_number', 'jeddah_name', 'jeddah_number', 'mecca_name', 'mecca_number', 'madinah_name', 'madinah_number', 'comment_1', 'detail_for']
-
-            # Check for missing required fields
-            error_response = validate_required_fields(required_fields, data)
-            if error_response:
-                return error_response
+            if not data.get("booking_number") or not data.get("detail_for") or (
+                not data.get("partner_session_token") and not request_has_partner_visibility_override(request)
+            ):
+                return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
 
             normalized_detail_for = normalize_arrangement_detail_type(data.get('detail_for'))
             if normalized_detail_for not in VALID_ARRANGEMENT_DETAIL_TYPES:
@@ -909,14 +1398,21 @@ class BookingHotelAndTransportDetailsView(APIView):
                 )
 
             # Retrieve the user based on the provided session token
-            partner = PartnerProfile.objects.filter(partner_session_token=data.get('partner_session_token')).first()
-            if not partner:
+            partner = resolve_partner_for_request(
+                request,
+                partner_session_token=data.get('partner_session_token'),
+            )
+            if not partner and not request_has_partner_visibility_override(request):
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            # Retrieve booking details using the user and booking number
-            booking_detail = get_request_partner_booking_detail(request, partner, data.get('booking_number'))
+            booking_detail = get_booking_detail_for_request_context(
+                request,
+                data.get('booking_number'),
+                partner_session_token=data.get('partner_session_token'),
+            )
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
+            partner = partner or booking_detail.order_to
 
             # Retrieve client details using the session token from booking details
             client_detail = booking_detail.order_by
@@ -924,11 +1420,9 @@ class BookingHotelAndTransportDetailsView(APIView):
                 return Response({"message": "Client detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Check if the record already exists for the given detail type
-            check_exist = BookingHotelAndTransport.objects.filter(
-                hotel_or_transport_for_booking=booking_detail,
-                detail_for=normalized_detail_for
-            ).first()
-            if check_exist:
+            if normalized_detail_for == "Hotel" and BookingHotelFulfillment.objects.filter(hotel_for_booking=booking_detail).exists():
+                return Response({"message": "Record already exists."}, status=status.HTTP_409_CONFLICT)
+            if normalized_detail_for == "Transport" and BookingTransportFulfillment.objects.filter(transport_for_booking=booking_detail).exists():
                 return Response({"message": "Record already exists."}, status=status.HTTP_409_CONFLICT)
 
             # Retrieve package details using the package token from booking details
@@ -938,39 +1432,26 @@ class BookingHotelAndTransportDetailsView(APIView):
 
             # Check if the booking status allows for adding hotel or transport details
             if can_update_booking_documents(booking_detail):
-                # Retrieve the document status for the booking
-                doc, _ = DocumentsStatus.objects.get_or_create(status_for_booking=booking_detail)
-                BookingHotelAndTransport.objects.create(
-                    jeddah_name=data.get('jeddah_name'),
-                    jeddah_number=data.get('jeddah_number'),
-                    mecca_name=data.get('mecca_name'),
-                    mecca_number=data.get('mecca_number'),
-                    madinah_name=data.get('madinah_name'),
-                    madinah_number=data.get('madinah_number'),
-                    taif_name=data.get('taif_name'),
-                    taif_number=data.get('taif_number'),
-                    riyadh_name=data.get('riyadh_name'),
-                    riyadh_number=data.get('riyadh_number'),
-                    comment_1=data.get('comment_1'),
-                    comment_2=data.get('comment_2'),
-                    detail_for=normalized_detail_for,
-                    hotel_or_transport_for_booking=booking_detail
-                )
+                with transaction.atomic():
+                    if normalized_detail_for == "Hotel":
+                        hotel_items = build_hotel_fulfillment_payloads(data)
+                        if not hotel_items:
+                            return Response(
+                                {"message": "At least one hotel fulfillment item is required."},
+                                status=status.HTTP_400_BAD_REQUEST,
+                            )
+                        replace_hotel_fulfillments(booking_detail, hotel_items)
+                    else:
+                        replace_transport_fulfillment(booking_detail, build_transport_payload(data))
+
+                    doc = sync_booking_document_status(booking_detail)
+
                 send_booking_documents_email(
                     client_detail.email,
                     client_detail.name,
                     booking_detail.booking_number,
                     normalized_detail_for,
                 )
-                # send_email_notification(client_detail.email, booking_detail.booking_number, data.get('detail_for'))
-
-                # Update document status and send confirmation email based on the detail type
-                if normalized_detail_for == "Hotel":
-                    doc.is_hotel_completed = True
-                    doc.save(update_fields=["is_hotel_completed"])
-                elif normalized_detail_for == "Transport":
-                    doc.is_transport_completed = True
-                    doc.save(update_fields=["is_transport_completed"])
 
                 finalize_booking_if_all_documents_completed(
                     booking_detail=booking_detail,
@@ -980,9 +1461,7 @@ class BookingHotelAndTransportDetailsView(APIView):
                 )
 
                 # Serialize and return the updated booking details
-                sync_booking_state(booking_detail, save=True)
-                serialized_package = LegacyDetailBookingSerializer(booking_detail, context={"request": request, "hide_payment_detail": True})
-                return Response(serialized_package.data, status=status.HTTP_201_CREATED)
+                return Response(_build_partner_booking_response(request, booking_detail), status=status.HTTP_201_CREATED)
 
             return Response({"message": "Only bookings that are in fulfillment or ready for travel can be managed."}, status=status.HTTP_409_CONFLICT)
 
@@ -996,28 +1475,23 @@ class BookingHotelAndTransportDetailsView(APIView):
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
             properties={
-                'hotel_or_transport_id': openapi.Schema(type=openapi.TYPE_STRING, description='ID of the hotel or transport detail'),
                 'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Partner session token'),
                 'booking_number': openapi.Schema(type=openapi.TYPE_STRING, description='Booking number'),
-                'jeddah_name': openapi.Schema(type=openapi.TYPE_STRING, description='Name of the Jeddah hotel/transport'),
-                'jeddah_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact number for Jeddah hotel/transport'),
-                'mecca_name': openapi.Schema(type=openapi.TYPE_STRING, description='Name of the Mecca hotel/transport'),
-                'mecca_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact number for Mecca hotel/transport'),
-                'madinah_name': openapi.Schema(type=openapi.TYPE_STRING, description='Name of the Madinah hotel/transport'),
-                'madinah_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact number for Madinah hotel/transport'),
-                'taif_name': openapi.Schema(type=openapi.TYPE_STRING, description='Name of the Taif hotel/transport'),
-                'taif_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact number for Taif hotel/transport'),
-                'riyadh_name': openapi.Schema(type=openapi.TYPE_STRING, description='Name of the Riyadh hotel/transport'),
-                'riyadh_number': openapi.Schema(type=openapi.TYPE_STRING, description='Contact number for Riyadh hotel/transport'),
-                'comment_1': openapi.Schema(type=openapi.TYPE_STRING, description='Traveler-facing arrangement note'),
-                'comment_2': openapi.Schema(type=openapi.TYPE_STRING, description='Legacy secondary arrangement note (optional)'),
-                'detail_for': openapi.Schema(type=openapi.TYPE_STRING, description='Detail type (Hotel/Transport)')
+                'detail_for': openapi.Schema(type=openapi.TYPE_STRING, description='Detail type (Hotel/Transport)'),
+                'hotel_items': openapi.Schema(type=openapi.TYPE_STRING, description='JSON array of hotel fulfillment items when detail_for=Hotel'),
+                'transport_mode': openapi.Schema(type=openapi.TYPE_STRING, description='Transport mode when detail_for=Transport'),
+                'transport_name': openapi.Schema(type=openapi.TYPE_STRING, description='Transport name when detail_for=Transport'),
+                'transport_type': openapi.Schema(type=openapi.TYPE_STRING, description='Transport type when detail_for=Transport'),
+                'route_summary': openapi.Schema(type=openapi.TYPE_STRING, description='Route summary when detail_for=Transport'),
+                'contact_name': openapi.Schema(type=openapi.TYPE_STRING, description='Optional transport contact name'),
+                'contact_phone': openapi.Schema(type=openapi.TYPE_STRING, description='Optional transport contact phone'),
+                'ticket_reference': openapi.Schema(type=openapi.TYPE_STRING, description='Optional transport ticket reference'),
+                'note': openapi.Schema(type=openapi.TYPE_STRING, description='Traveler-facing hotel or transport note'),
             },
-            required=['hotel_or_transport_id', 'partner_session_token', 'booking_number', 'jeddah_name', 'jeddah_number', 'mecca_name',
-                      'mecca_number', 'madinah_name', 'madinah_number', 'comment_1', 'detail_for']
+            required=['partner_session_token', 'booking_number', 'detail_for']
         ),
         responses={
-            200: openapi.Response('Hotel or transport details updated successfully', LegacyDetailBookingSerializer),
+            200: openapi.Response('Hotel or transport details updated successfully', DetailBookingSerializer),
             400: "Bad Request: Missing or invalid input data.",
             401: "Unauthorized: Admin permissions required.",
             404: "Not Found: User, Booking detail, Client detail, Package detail, or Record not exists",
@@ -1028,14 +1502,10 @@ class BookingHotelAndTransportDetailsView(APIView):
     def put(self, request, *args, **kwargs):
         try:
             data = request.data
-            required_fields = ['hotel_or_transport_id', 'partner_session_token', 'booking_number', 'jeddah_name', 'jeddah_number',
-                               'mecca_name', 'mecca_number', 'madinah_name', 'madinah_number', 'comment_1',
-                               'detail_for']
-
-            # Check for missing required fields
-            error_response = validate_required_fields(required_fields, data)
-            if error_response:
-                return error_response
+            if not data.get("booking_number") or not data.get("detail_for") or (
+                not data.get("partner_session_token") and not request_has_partner_visibility_override(request)
+            ):
+                return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
 
             normalized_detail_for = normalize_arrangement_detail_type(data.get('detail_for'))
             if normalized_detail_for not in VALID_ARRANGEMENT_DETAIL_TYPES:
@@ -1045,42 +1515,54 @@ class BookingHotelAndTransportDetailsView(APIView):
                 )
 
             # Retrieve partner profile using session token
-            partner = PartnerProfile.objects.filter(partner_session_token=data.get('partner_session_token')).first()
-            if not partner:
+            partner = resolve_partner_for_request(
+                request,
+                partner_session_token=data.get('partner_session_token'),
+            )
+            if not partner and not request_has_partner_visibility_override(request):
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Retrieve booking details using partner and booking number
-            booking_detail = get_request_partner_booking_detail(request, partner, data.get('booking_number'))
+            booking_detail = get_booking_detail_for_request_context(
+                request,
+                data.get('booking_number'),
+                partner_session_token=data.get('partner_session_token'),
+            )
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
+            partner = partner or booking_detail.order_to
 
             # Check if hotel or transport details exist for the booking
-            detail_exists = BookingHotelAndTransport.objects.filter(hotel_or_transport_for_booking=booking_detail,
-                                                                    hotel_or_transport_id=data.get('hotel_or_transport_id'),
-                                                                    detail_for=normalized_detail_for).first()
+            detail_exists = (
+                BookingHotelFulfillment.objects.filter(hotel_for_booking=booking_detail).exists()
+                if normalized_detail_for == "Hotel"
+                else BookingTransportFulfillment.objects.filter(transport_for_booking=booking_detail).exists()
+            )
             if not detail_exists:
                 return Response({"message": "Details not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Check if the booking status allows for managing details
             if can_update_booking_documents(booking_detail):
-                detail_exists.jeddah_name = data.get('jeddah_name')
-                detail_exists.jeddah_number = data.get('jeddah_number')
-                detail_exists.mecca_name = data.get('mecca_name')
-                detail_exists.mecca_number = data.get('mecca_number')
-                detail_exists.madinah_name = data.get('madinah_name')
-                detail_exists.madinah_number = data.get('madinah_number')
-                detail_exists.taif_name = data.get('taif_name')
-                detail_exists.taif_number = data.get('taif_number')
-                detail_exists.riyadh_name = data.get('riyadh_name')
-                detail_exists.riyadh_number = data.get('riyadh_number')
-                detail_exists.comment_1 = data.get('comment_1')
-                detail_exists.comment_2 = data.get('comment_2')
-                detail_exists.detail_for = normalized_detail_for
-                detail_exists.save()
+                with transaction.atomic():
+                    if normalized_detail_for == "Hotel":
+                        hotel_items = build_hotel_fulfillment_payloads(data)
+                        if not hotel_items:
+                            return Response(
+                                {"message": "At least one hotel fulfillment item is required."},
+                                status=status.HTTP_400_BAD_REQUEST,
+                            )
+                        replace_hotel_fulfillments(booking_detail, hotel_items)
+                    else:
+                        replace_transport_fulfillment(booking_detail, build_transport_payload(data))
+                    doc = sync_booking_document_status(booking_detail)
 
-                sync_booking_state(booking_detail, save=True)
-                serialized_booking = LegacyDetailBookingSerializer(booking_detail, context={"request": request, "hide_payment_detail": True})
-                return Response(serialized_booking.data, status=status.HTTP_200_OK)
+                finalize_booking_if_all_documents_completed(
+                    booking_detail=booking_detail,
+                    doc=doc,
+                    package_detail=booking_detail.package_token,
+                    partner=partner,
+                )
+                return Response(_build_partner_booking_response(request, booking_detail), status=status.HTTP_200_OK)
 
             return Response({"message": "Only bookings that are in fulfillment or ready for travel can be managed."}, status=status.HTTP_409_CONFLICT)
 
@@ -1171,27 +1653,62 @@ class GetRatingPackageWiseView(APIView):
         operation_description="Retrieve ratings for a specific package",
         manual_parameters=[
             openapi.Parameter('partner_session_token', openapi.IN_QUERY, description="Session token of the partner requesting the ratings", type=openapi.TYPE_STRING, required=True ),
-            openapi.Parameter('huz_token', openapi.IN_QUERY, description="Token of the package for which ratings are to be fetched", type=openapi.TYPE_STRING, required=True)
+            openapi.Parameter('huz_token', openapi.IN_QUERY, description="Token of the package for which ratings are to be fetched", type=openapi.TYPE_STRING, required=True),
+            openapi.Parameter('search', openapi.IN_QUERY, description="Search by traveler name, email, or review comment", type=openapi.TYPE_STRING, required=False),
+            openapi.Parameter('sort', openapi.IN_QUERY, description="Sort order: newest, oldest, highest, lowest", type=openapi.TYPE_STRING, required=False),
+            openapi.Parameter('from_date', openapi.IN_QUERY, description="Filter rating date from YYYY-MM-DD", type=openapi.TYPE_STRING, required=False),
+            openapi.Parameter('to_date', openapi.IN_QUERY, description="Filter rating date to YYYY-MM-DD", type=openapi.TYPE_STRING, required=False),
+            openapi.Parameter('page', openapi.IN_QUERY, description="Page number", type=openapi.TYPE_INTEGER, required=False),
+            openapi.Parameter('page_size', openapi.IN_QUERY, description="Page size", type=openapi.TYPE_INTEGER, required=False),
         ],
         responses={
             200: openapi.Response('Success', PartnerRatingSerializer(many=True)),
             400: "Missing required query parameters.",
             401: "Unauthorized: Admin permissions required.",
-            404: "User or package detail not found. No ratings found for this package.",
+            404: "User or package detail not found.",
             500: "An unexpected error occurred while fetching the ratings."
         }
     )
     def get(self, request):
         try:
-            partner_session_token = request.GET.get('partner_session_token')
+            partner_session_token = extract_partner_session_token(request)
             huz_token = request.GET.get('huz_token')
+            search = str(request.GET.get('search') or "").strip()[:100]
+            requested_sort = str(request.GET.get('sort') or 'newest').strip().lower()
+            from_date_raw = str(request.GET.get('from_date') or '').strip()
+            to_date_raw = str(request.GET.get('to_date') or '').strip()
 
             # Check for missing required parameters
             if not partner_session_token or not huz_token:
                 return Response({"message": "Missing user or package info."},status=status.HTTP_400_BAD_REQUEST)
 
-            # Retrieve partner profile using session token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
+            if requested_sort and requested_sort not in REVIEW_SORT_ORDERING:
+                return Response(
+                    {"message": f"Invalid sort. Must be one of: {', '.join(REVIEW_SORT_ORDERING)}."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            from_date = None
+            if from_date_raw:
+                from_date = parse_date(from_date_raw)
+                if not from_date:
+                    return Response(
+                        {"message": "Invalid from_date. Expected YYYY-MM-DD."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+            to_date = None
+            if to_date_raw:
+                to_date = parse_date(to_date_raw)
+                if not to_date:
+                    return Response(
+                        {"message": "Invalid to_date. Expected YYYY-MM-DD."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+            user = resolve_authenticated_partner_profile(request)
+            if not user:
+                user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
             if not user:
                 return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -1201,19 +1718,35 @@ class GetRatingPackageWiseView(APIView):
                 return Response({"message": "Package detail not found for the provided detail."}, status=status.HTTP_404_NOT_FOUND)
 
             # Retrieve ratings for the package
-            check_rating = BookingRatingAndReview.objects.select_related(
+            ratings_queryset = BookingRatingAndReview.objects.select_related(
                 "rating_by_user"
             ).prefetch_related(
                 "rating_by_user__mailing_session"
             ).filter(
-                rating_for_package=package_detail
+                rating_for_partner=user,
+                rating_for_package=package_detail,
             )
 
-            if check_rating.exists():
-                serialized_bookings = PartnerRatingSerializer(check_rating, many=True)
-                return Response(serialized_bookings.data, status=status.HTTP_200_OK)
+            if search:
+                ratings_queryset = ratings_queryset.filter(
+                    Q(partner_comment__icontains=search)
+                    | Q(rating_by_user__name__icontains=search)
+                    | Q(rating_by_user__email__icontains=search)
+                )
 
-            return Response({"message": "No ratings found for this package."}, status=status.HTTP_404_NOT_FOUND )
+            if from_date:
+                ratings_queryset = ratings_queryset.filter(rating_time__date__gte=from_date)
+
+            if to_date:
+                ratings_queryset = ratings_queryset.filter(rating_time__date__lte=to_date)
+
+            ordering = REVIEW_SORT_ORDERING.get(requested_sort or "newest", REVIEW_SORT_ORDERING["newest"])
+            ratings_queryset = ratings_queryset.order_by(*ordering)
+
+            paginator = CustomPagination()
+            paginated_ratings = paginator.paginate_queryset(ratings_queryset, request)
+            serialized_ratings = PartnerRatingSerializer(paginated_ratings, many=True)
+            return paginator.get_paginated_response(serialized_ratings.data)
 
         except Exception as e:
             logger.error(f"Error in GetRatingPackageWiseView: {str(e)}", exc_info=True)
@@ -1726,7 +2259,7 @@ class CloseBookingView(APIView):
             },
         ),
         responses={
-            200: openapi.Response(description="Booking status successfully updated to 'COMPLETED'", schema=LegacyDetailBookingSerializer),
+            200: openapi.Response(description="Booking status successfully updated to 'COMPLETED'", schema=DetailBookingSerializer),
             400: openapi.Response(description="Bad Request - Missing or invalid fields"),
             401: 'Unauthorized: Partner permissions required',
             404: openapi.Response(description="Not Found - Partner or booking detail not found"),
@@ -1766,7 +2299,7 @@ class CloseBookingView(APIView):
 
             # Serialize updated booking details
             sync_booking_state(booking_detail, save=True)
-            serialized_booking = LegacyDetailBookingSerializer(booking_detail, context={"request": request, "hide_payment_detail": True})
+            serialized_booking = DetailBookingSerializer(booking_detail, context={"request": request, "hide_payment_detail": True})
             return Response(serialized_booking.data, status=status.HTTP_200_OK)
 
         except Exception as e:
@@ -1795,7 +2328,7 @@ class ReportBookingView(APIView):
         ),
         responses={
             200: openapi.Response(
-                description="Booking issue updated to 'REPORTED' and passport report_rabbit set to True."),
+                description="Traveler issue updated successfully."),
             400: openapi.Response(description="Bad Request - Missing required fields."),
             401: "Unauthorized: Admin permissions required.",
             404: openapi.Response(description="Not Found - Booking, partner, or passport not found."),
@@ -1805,58 +2338,82 @@ class ReportBookingView(APIView):
     )
     def put(self, request, *args, **kwargs):
         try:
-            # Extract required data from the request
             passport_id = request.data.get('passport_id')
+            traveler_issue_id = request.data.get("traveler_issue_id")
             partner_session_token = request.data.get('partner_session_token')
             booking_number = request.data.get('booking_number')
-
-            # Validate input parameters
-            if not passport_id or not partner_session_token or not booking_number:
+            if not booking_number or (
+                not partner_session_token and not request_has_partner_visibility_override(request)
+            ) or (not passport_id and not traveler_issue_id):
                 return Response(
                     {"message": "Missing required data fields."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            # Retrieve partner based on partner_session_token
-            partner = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not partner:
+            partner = resolve_partner_for_request(request, partner_session_token=partner_session_token)
+            if not partner and not request_has_partner_visibility_override(request):
                 return Response({"message": "Partner not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            # Retrieve the booking associated with the booking_number
-            booking = get_request_partner_booking_detail(request, partner, booking_number)
+            booking = get_booking_detail_for_request_context(
+                request,
+                booking_number,
+                partner_session_token=partner_session_token,
+            )
             if not booking:
                 return Response({"message": "Booking not found."}, status=status.HTTP_404_NOT_FOUND)
+            partner = partner or booking.order_to
 
             sync_booking_state(booking, save=True)
-            if booking.booking_status not in [BOOKING_STATUS_READY_FOR_TRAVEL, BOOKING_STATUS_COMPLETED]:
+            if booking.booking_status not in VALID_TRAVELER_ISSUE_MUTABLE_STATUSES:
                 return Response(
-                    {"message": "Booking status must be 'READY_FOR_TRAVEL' or 'COMPLETED' to be updated."},
+                    {"message": "Booking status must be IN_FULFILLMENT, READY_FOR_TRAVEL, or COMPLETED to manage traveler issues."},
                     status=status.HTTP_409_CONFLICT
                 )
 
-            passport = PassportValidity.objects.filter(
-                passport_id=passport_id,
-                passport_for_booking_number=booking
-            ).first()
-            if not passport:
-                return Response({"message": "Passport not found for the provided booking."},
-                                status=status.HTTP_404_NOT_FOUND)
+            action = normalize_traveler_issue_action(request.data.get("action") or "report")
+            if not action:
+                return Response({"message": "Invalid action."}, status=status.HTTP_400_BAD_REQUEST)
 
-            # Update the report_rabbit field to True
-            passport.report_rabbit = True
-            passport.save()
-
-            booking.issue_status = ISSUE_STATUS_REPORTED
-            booking.save(update_fields=["issue_status"])
-
-            # Return success response
-            sync_booking_state(booking, save=True)
-            booking = get_request_partner_booking_detail(request, partner, booking_number) or booking
-            serialized_booking = LegacyDetailBookingSerializer(
-                booking,
-                context={"request": request, "hide_payment_detail": True},
+            issue_type = normalize_traveler_issue_type(
+                request.data.get("issue_type") or TravelerIssue.ISSUE_TYPE_REPORTED
             )
-            return Response(serialized_booking.data, status=status.HTTP_200_OK)
+            if not issue_type:
+                return Response({"message": "Invalid issue_type."}, status=status.HTTP_400_BAD_REQUEST)
+
+            issue_record = None
+            traveler = None
+            if traveler_issue_id:
+                issue_record = TravelerIssue.objects.filter(
+                    traveler_issue_id=traveler_issue_id,
+                    booking=booking,
+                ).first()
+                if issue_record is None:
+                    return Response({"message": "Traveler issue not found for the provided booking."}, status=status.HTTP_404_NOT_FOUND)
+                traveler = issue_record.traveler
+            else:
+                traveler = PassportValidity.objects.filter(
+                    passport_id=passport_id,
+                    passport_for_booking_number=booking
+                ).first()
+                if traveler is None:
+                    return Response({"message": "Passport not found for the provided booking."},
+                                    status=status.HTTP_404_NOT_FOUND)
+
+            try:
+                with transaction.atomic():
+                    mutate_traveler_issue(
+                        booking_detail=booking,
+                        traveler=traveler,
+                        partner=partner,
+                        issue_type=issue_type if issue_record is None else issue_record.issue_type,
+                        action=action,
+                        notes=request.data.get("notes"),
+                    )
+                    sync_booking_state(booking, save=True)
+            except ValueError as exc:
+                return Response({"message": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+            return Response(_build_partner_booking_response(request, booking), status=status.HTTP_200_OK)
 
         except Exception as e:
             # Log the error and return an internal server error response

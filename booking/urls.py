@@ -21,5 +21,5 @@ urlpatterns = [
     path('get_yearly_earning_statistics/', manage_partner_booking.GetYearlyBookingStatisticsView.as_view()),
     path('get_receivable_payment_statistics/', manage_partner_booking.PartnersBookingPaymentView.as_view()),
     path('update_booking_status_into_close/', manage_partner_booking.CloseBookingView.as_view()),
-    path('update_booking_status_into_report_rabbit/', manage_partner_booking.ReportBookingView.as_view()),
+    path('manage_traveler_issues/', manage_partner_booking.ReportBookingView.as_view()),
 ]

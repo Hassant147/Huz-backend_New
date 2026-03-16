@@ -21,7 +21,7 @@ from partners.models import HuzBasicDetail, HuzPackageDateRange, PartnerProfile
 
 from .flow_utils import get_expected_traveller_count
 from .manage_partner_booking import get_partner_bookings_queryset
-from .models import Booking, DocumentsStatus, PassportValidity, Payment
+from .models import Booking, BookingGroup, DocumentsStatus, PassportValidity, Payment
 from .querysets import (
     annotate_effective_booking_status,
     annotate_resume_priority,
@@ -102,6 +102,53 @@ ROOM_COUNT_FIELDS = {
     ROOM_TYPE_QUAD: "quad",
     ROOM_TYPE_SHARING: "sharing",
 }
+TRAVELER_TYPE_CHILD_GENERIC = "Child"
+
+
+def _derive_default_traveler_type(booking, traveler_sequence):
+    adults = int(getattr(booking, "adults", 0) or 0)
+    children = int(getattr(booking, "child", 0) or 0)
+    if traveler_sequence <= adults:
+        return TRAVELER_TYPE_ADULT
+    if traveler_sequence <= adults + children:
+        return TRAVELER_TYPE_CHILD_GENERIC
+    return TRAVELER_TYPE_INFANT
+
+
+def ensure_booking_group_assignments(booking):
+    booking_groups = list(
+        BookingGroup.objects.filter(booking=booking).order_by("sequence", "label", "group_id")
+    )
+    if booking_groups:
+        default_group = booking_groups[0]
+    else:
+        default_group = BookingGroup.objects.create(
+            booking=booking,
+            label="Group 1",
+            sequence=1,
+        )
+
+    passports = list(
+        PassportValidity.objects.filter(passport_for_booking_number=booking).order_by(
+            "traveler_sequence",
+            "passport_id",
+        )
+    )
+    for traveler_sequence, passport in enumerate(passports, start=1):
+        update_fields = []
+        if not getattr(passport, "booking_group_id", None):
+            passport.booking_group = default_group
+            update_fields.append("booking_group")
+        if int(getattr(passport, "traveler_sequence", 0) or 0) != traveler_sequence:
+            passport.traveler_sequence = traveler_sequence
+            update_fields.append("traveler_sequence")
+        if not getattr(passport, "traveler_type", None):
+            passport.traveler_type = _derive_default_traveler_type(booking, traveler_sequence)
+            update_fields.append("traveler_type")
+        if update_fields:
+            passport.save(update_fields=update_fields)
+
+    return default_group
 
 
 class BookingServiceError(APIException):
@@ -315,6 +362,89 @@ def _validate_booking_breakdown_matches_request(validated_data, derived_summary)
             "Submitted total_price does not match the server-calculated booking total.",
             status_code=status.HTTP_409_CONFLICT,
         )
+
+
+def _build_booking_group_payloads(validated_data):
+    group_items = validated_data.get("groups") or []
+    if not group_items:
+        group_items = [
+            {
+                "label": "Group 1",
+                "notes": "",
+                "travelers": validated_data.get("traveler_breakdown") or [],
+            }
+        ]
+
+    normalized_groups = []
+    for group_index, group in enumerate(group_items, start=1):
+        travelers = []
+        for traveler in group.get("travelers") or []:
+            travelers.append(
+                {
+                    "traveler_type": _normalize_traveler_type(traveler.get("traveler_type"))
+                    or str(traveler.get("traveler_type") or "").strip(),
+                    "room_type": _normalize_room_type(traveler.get("room_type"))
+                    or str(traveler.get("room_type") or "").strip(),
+                }
+            )
+
+        normalized_groups.append(
+            {
+                "label": str(group.get("label") or f"Group {group_index}").strip()
+                or f"Group {group_index}",
+                "notes": str(group.get("notes") or "").strip(),
+                "sequence": group_index,
+                "travelers": travelers,
+            }
+        )
+
+    return normalized_groups
+
+
+def _validate_booking_groups(group_payloads, *, expected_traveller_count):
+    if not group_payloads:
+        raise BookingServiceError(
+            "At least one booking group is required.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+    calculated_total = 0
+    for group_index, group in enumerate(group_payloads, start=1):
+        traveler_count = len(group.get("travelers") or [])
+        if traveler_count <= 0:
+            raise BookingServiceError(
+                f"groups[{group_index}] must include at least one traveler.",
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        calculated_total += traveler_count
+
+    if calculated_total != expected_traveller_count:
+        raise BookingServiceError(
+            "Booking groups do not match the submitted traveler totals.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+def _replace_booking_group_structure(booking, group_payloads):
+    PassportValidity.objects.filter(passport_for_booking_number=booking).delete()
+    BookingGroup.objects.filter(booking=booking).delete()
+
+    for group in group_payloads:
+        booking_group = BookingGroup.objects.create(
+            booking=booking,
+            label=group["label"],
+            notes=group["notes"],
+            sequence=group["sequence"],
+        )
+
+        for traveler_index, traveler in enumerate(group.get("travelers") or [], start=1):
+            PassportValidity.objects.create(
+                passport_for_booking_number=booking,
+                booking_group=booking_group,
+                traveler_sequence=traveler_index,
+                traveler_type=traveler.get("traveler_type") or None,
+                room_type=traveler.get("room_type") or None,
+            )
 
 
 def get_total_approved_payment_amount_decimal(booking, *, exclude_payment_id=None):
@@ -961,7 +1091,12 @@ def _get_user_booking_detail_queryset(user_profile):
 def _get_user_booking_mutation_queryset(user_profile):
     return (
         Booking.objects.select_related("order_by", "order_to", "package_token")
-        .prefetch_related("order_to__company_of_partner", "booking_token")
+        .prefetch_related(
+            "order_to__company_of_partner",
+            "status_for_booking",
+            "passport_for_booking_number",
+            "booking_token",
+        )
         .filter(order_by=user_profile)
     )
 
@@ -1031,6 +1166,11 @@ def create_booking(validated_data):
     _validate_booking_breakdown_matches_request(validated_data, derived_booking_summary)
 
     requested_traveller_count = derived_booking_summary["traveller_count"]
+    booking_group_payloads = _build_booking_group_payloads(validated_data)
+    _validate_booking_groups(
+        booking_group_payloads,
+        expected_traveller_count=requested_traveller_count,
+    )
     package_date_range = _resolve_package_date_range(
         package,
         start_date=validated_data["start_date"],
@@ -1104,6 +1244,8 @@ def create_booking(validated_data):
                 if updated_fields:
                     resumable_booking.save(update_fields=updated_fields)
 
+                _replace_booking_group_structure(resumable_booking, booking_group_payloads)
+
             DocumentsStatus.objects.get_or_create(status_for_booking=resumable_booking)
             return _reload_booking_mutation_for_user(
                 user,
@@ -1139,6 +1281,7 @@ def create_booking(validated_data):
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             ) from last_collision_error
 
+        _replace_booking_group_structure(booking, booking_group_payloads)
         DocumentsStatus.objects.get_or_create(status_for_booking=booking)
         return _reload_booking_mutation_for_user(user, sync_booking_state(booking, save=True)), True
 
@@ -1282,6 +1425,7 @@ def validate_passport(validated_data):
             must_be_future=False,
             lock_for_update=True,
         )
+        default_group = ensure_booking_group_assignments(booking)
         if not booking_allows_client_traveller_updates(booking):
             raise BookingServiceError(
                 "Traveler details cannot be updated at the current booking stage.",
@@ -1311,7 +1455,13 @@ def validate_passport(validated_data):
                     "Traveller details already exist for all allocated travelers.",
                     status_code=status.HTTP_409_CONFLICT,
                 )
-            passport = PassportValidity(passport_for_booking_number=booking)
+            next_traveler_sequence = traveller_status.count() + 1
+            passport = PassportValidity(
+                passport_for_booking_number=booking,
+                booking_group=default_group,
+                traveler_sequence=next_traveler_sequence,
+                traveler_type=_derive_default_traveler_type(booking, next_traveler_sequence),
+            )
 
         passport.first_name = validated_data["first_name"]
         passport.middle_name = validated_data.get("middle_name")
@@ -1347,6 +1497,7 @@ def update_passport_validation(validated_data):
             must_be_future=False,
             lock_for_update=True,
         )
+        ensure_booking_group_assignments(booking)
         if not booking_allows_client_traveller_updates(booking):
             raise BookingServiceError(
                 "Traveler details cannot be updated at the current booking stage.",

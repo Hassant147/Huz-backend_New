@@ -7,7 +7,7 @@ class UserOTP(models.Model):
     # Primary key for the model, a unique identifier generated automatically using UUID
     otp_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     # Field to store the phone number associated with the OTP
-    phone_number = models.CharField(max_length=15, null=False)
+    phone_number = models.CharField(max_length=20, null=False)
     # Field to store the OTP password, can be null (e.g., if not generated yet)
     otp_password = models.CharField(max_length=10, null=True)
     # Timestamp indicating when the OTP was created, defaults to the current time
