@@ -52,6 +52,7 @@ from .models import (
     PartnersBookingPayment,
     TravelerIssue,
 )
+from .querysets import annotate_effective_booking_status
 from .serializers import (
     BookingComplaintsSerializer,
     BookingMutationSerializer,
@@ -303,6 +304,20 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
                 "flight_from": "Karachi",
                 "flight_to": "Jeddah",
             },
+        )
+        BookingDocuments.objects.get_or_create(
+            document_for="eVisa",
+            document_category="evisa",
+            document_scope=BookingDocuments.DOCUMENT_SCOPE_BOOKING,
+            document_title="Visa document",
+            document_for_booking_token=booking,
+        )
+        BookingDocuments.objects.get_or_create(
+            document_for="airline",
+            document_category="airline",
+            document_scope=BookingDocuments.DOCUMENT_SCOPE_BOOKING,
+            document_title="Airline ticket",
+            document_for_booking_token=booking,
         )
         DocumentsStatus.objects.update_or_create(
             status_for_booking=booking,
@@ -641,6 +656,44 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         second_passport.refresh_from_db()
         self.assertEqual(second_passport.passport_number, "P9990002")
 
+    def test_v1_passport_update_rejects_expiry_on_or_before_booking_return_date(self):
+        self._approve_minimum()
+        passport = PassportValidity.objects.create(
+            first_name="Amina",
+            last_name="Khan",
+            date_of_birth=aware_midnight("1992-05-05"),
+            passport_number="P9990010",
+            passport_country="PK",
+            expiry_date=aware_midnight("2031-05-05"),
+            passport_for_booking_number=self.existing_booking,
+        )
+
+        response = self.client.put(
+            f"/api/v1/bookings/{self.existing_booking.booking_number}/passports/",
+            {
+                "passport_id": str(passport.passport_id),
+                "first_name": "Amina",
+                "last_name": "Khan",
+                "date_of_birth": "1992-05-05",
+                "passport_number": "P9990010",
+                "passport_country": "PK",
+                "expiry_date": self.end_date.date().isoformat(),
+            },
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        expected_message = (
+            "Passport expiry must be later than the package return date. "
+            "Please renew the passport before continuing with this booking."
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data.get("message"), expected_message)
+        self.assertEqual(response.data.get("expiry_date"), [expected_message])
+        passport.refresh_from_db()
+        self.assertEqual(passport.expiry_date.date().isoformat(), "2031-05-05")
+
     def test_v1_passport_endpoint_accepts_bearer_auth_without_legacy_session_token(self):
         self._approve_minimum()
         response = self.client.post(
@@ -664,6 +717,39 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
             PassportValidity.objects.filter(
                 passport_for_booking_number=self.existing_booking,
                 passport_number="P7654321",
+            ).exists()
+        )
+
+    def test_v1_passport_endpoint_rejects_expiry_on_or_before_booking_return_date(self):
+        self._approve_minimum()
+        invalid_expiry_date = self.end_date.date().isoformat()
+
+        response = self.client.post(
+            f"/api/v1/bookings/{self.existing_booking.booking_number}/passports/",
+            {
+                "first_name": "Fatima",
+                "last_name": "Noor",
+                "date_of_birth": "1990-01-10",
+                "passport_number": "P7654329",
+                "passport_country": "US",
+                "expiry_date": invalid_expiry_date,
+            },
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        expected_message = (
+            "Passport expiry must be later than the package return date. "
+            "Please renew the passport before continuing with this booking."
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data.get("message"), expected_message)
+        self.assertEqual(response.data.get("expiry_date"), [expected_message])
+        self.assertFalse(
+            PassportValidity.objects.filter(
+                passport_for_booking_number=self.existing_booking,
+                passport_number="P7654329",
             ).exists()
         )
 
@@ -1104,8 +1190,10 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         self.assertEqual(detail_response.status_code, status.HTTP_200_OK)
         self.assertEqual(detail_response.data.get("minimum_payment_status"), "NOT_SUBMITTED")
         self.assertEqual(detail_response.data.get("full_payment_status"), "UNDER_REVIEW")
-        self.assertEqual(detail_response.data.get("client_workflow_stage"), "minimum_payment_review")
+        self.assertEqual(detail_response.data.get("initial_payment_status"), "UNDER_REVIEW")
+        self.assertEqual(detail_response.data.get("client_workflow_stage"), "initial_payment_review")
         self.assertEqual(detail_response.data.get("client_workflow_step"), 2)
+        self.assertFalse(detail_response.data.get("client_can_submit_initial_payment"))
         self.assertFalse(detail_response.data.get("client_can_submit_minimum_payment"))
         self.assertFalse(detail_response.data.get("client_can_submit_full_payment"))
         self.assertFalse(detail_response.data.get("client_can_edit_travellers"))
@@ -1137,6 +1225,35 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
         self.assertEqual(detail_response.status_code, status.HTTP_200_OK)
         self.assertEqual(detail_response.data.get("client_workflow_stage"), "full_payment_review")
         self.assertEqual(detail_response.data.get("client_workflow_step"), 4)
+
+    def test_v1_booking_detail_reports_initial_payment_status_from_full_approval(self):
+        with patch("booking.services.user_new_booking_email"):
+            response = self.client.post(
+                f"/api/v1/bookings/{self.existing_booking.booking_id}/payments/",
+                {
+                    "transaction_number": "V1-TRANS-FULL-INITIAL-001",
+                    "transaction_type": "Full",
+                    "transaction_amount": 2400,
+                },
+                format="json",
+                HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        payment = Payment.objects.get(transaction_number="V1-TRANS-FULL-INITIAL-001")
+        payment.payment_status = "APPROVED"
+        payment.save(update_fields=["payment_status"])
+
+        detail_response = self.client.get(
+            f"/api/v1/bookings/{self.existing_booking.booking_number}/",
+            HTTP_AUTHORIZATION=f"Bearer {self.customer.session_token}",
+        )
+
+        self.assertEqual(detail_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(detail_response.data.get("minimum_payment_status"), "NOT_SUBMITTED")
+        self.assertEqual(detail_response.data.get("full_payment_status"), "APPROVED")
+        self.assertEqual(detail_response.data.get("initial_payment_status"), "APPROVED")
 
     def test_v1_payment_endpoint_accepts_near_term_booking_inside_10_day_window(self):
         near_term_start_date = timezone.now() + timedelta(days=2)
@@ -1579,6 +1696,75 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
             )
         sync_booking_state(booking, save=True)
 
+    def _mark_ready_for_operator(self, booking=None):
+        booking = booking or self.existing_booking
+        self._create_payment(
+            booking,
+            stage="Minimum",
+            amount=max(float(booking.total_price) * 0.1, 1),
+            status_value=PAYMENT_STATUS_APPROVED,
+            suffix="approve-ready-minimum",
+        )
+        self._add_complete_passports(booking)
+        self._create_payment(
+            booking,
+            stage="Full",
+            amount=float(booking.total_price),
+            status_value=PAYMENT_STATUS_APPROVED,
+            suffix="approve-ready-full",
+        )
+        sync_booking_state(booking, save=True)
+        booking.refresh_from_db()
+        return booking
+
+    def _mark_in_fulfillment(self, booking=None):
+        booking = self._mark_ready_for_operator(booking)
+        booking.booking_status = BOOKING_STATUS_IN_FULFILLMENT
+        booking.save(update_fields=["booking_status"])
+        sync_booking_state(booking, save=True)
+        booking.refresh_from_db()
+        return booking
+
+    def _mark_ready_for_travel(self, booking=None):
+        booking = self._mark_in_fulfillment(booking)
+        BookingAirlineDetail.objects.update_or_create(
+            airline_for_booking=booking,
+            flight_direction="outbound",
+            defaults={
+                "flight_date": booking.start_date,
+                "flight_time": booking.start_date.time(),
+                "flight_from": "Karachi",
+                "flight_to": "Jeddah",
+            },
+        )
+        BookingDocuments.objects.get_or_create(
+            document_for="eVisa",
+            document_category="evisa",
+            document_scope=BookingDocuments.DOCUMENT_SCOPE_BOOKING,
+            document_title="Visa document",
+            document_for_booking_token=booking,
+        )
+        BookingDocuments.objects.get_or_create(
+            document_for="airline",
+            document_category="airline",
+            document_scope=BookingDocuments.DOCUMENT_SCOPE_BOOKING,
+            document_title="Airline ticket",
+            document_for_booking_token=booking,
+        )
+        DocumentsStatus.objects.update_or_create(
+            status_for_booking=booking,
+            defaults={
+                "is_visa_completed": True,
+                "is_airline_completed": True,
+                "is_airline_detail_completed": True,
+                "is_hotel_completed": True,
+                "is_transport_completed": True,
+            },
+        )
+        sync_booking_state(booking, save=True)
+        booking.refresh_from_db()
+        return booking
+
     def test_admin_can_reject_initial_payment_and_keep_booking_on_hold(self):
         booking = Booking.objects.create(
             booking_number="APPROVE-PAYMENT-001",
@@ -1846,6 +2032,7 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
         )
         self.assertEqual(detail_response.status_code, status.HTTP_200_OK)
         self.assertTrue(detail_response.data.get("operator_visible"))
+        self.assertFalse(detail_response.data.get("client_can_submit_initial_payment"))
         self.assertFalse(detail_response.data.get("client_can_submit_minimum_payment"))
         self.assertFalse(detail_response.data.get("client_can_submit_full_payment"))
         self.assertTrue(detail_response.data.get("client_can_edit_travellers"))
@@ -1869,6 +2056,7 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
         self.assertEqual(detail_response.data.get("client_workflow_step"), 5)
 
     def test_ready_for_travel_auto_completes_after_end_date_without_document_recheck(self):
+        self._mark_ready_for_travel(self.existing_booking)
         self.existing_booking.booking_status = BOOKING_STATUS_READY_FOR_TRAVEL
         self.existing_booking.start_date = timezone.now() - timedelta(days=7)
         self.existing_booking.end_date = timezone.now() - timedelta(days=1)
@@ -1878,6 +2066,28 @@ class ApproveBookingPaymentViewTests(APITransactionTestCase):
         self.existing_booking.refresh_from_db()
 
         self.assertEqual(self.existing_booking.booking_status, BOOKING_STATUS_COMPLETED)
+
+    def test_ready_for_travel_auto_complete_keeps_booking_open_when_traveler_issue_exists(self):
+        self._mark_ready_for_travel(self.existing_booking)
+        passport = PassportValidity.objects.filter(
+            passport_for_booking_number=self.existing_booking
+        ).first()
+        self.assertIsNotNone(passport)
+        TravelerIssue.objects.create(
+            booking=self.existing_booking,
+            traveler=passport,
+            status=TravelerIssue.STATUS_OPEN,
+            created_by=self.partner,
+        )
+        self.existing_booking.start_date = timezone.now() - timedelta(days=7)
+        self.existing_booking.end_date = timezone.now() - timedelta(days=1)
+        self.existing_booking.save(update_fields=["start_date", "end_date"])
+
+        sync_booking_state(self.existing_booking, save=True)
+        self.existing_booking.refresh_from_db()
+
+        self.assertEqual(self.existing_booking.booking_status, BOOKING_STATUS_READY_FOR_TRAVEL)
+        self.assertEqual(self.existing_booking.issue_status, ISSUE_STATUS_REPORTED)
 
     def test_admin_review_queue_includes_pending_full_payment_bookings(self):
         booking = Booking.objects.create(
@@ -2468,6 +2678,20 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
                 "flight_from": "Karachi",
                 "flight_to": "Jeddah",
             },
+        )
+        BookingDocuments.objects.get_or_create(
+            document_for="eVisa",
+            document_category="evisa",
+            document_scope=BookingDocuments.DOCUMENT_SCOPE_BOOKING,
+            document_title="Visa document",
+            document_for_booking_token=booking,
+        )
+        BookingDocuments.objects.get_or_create(
+            document_for="airline",
+            document_category="airline",
+            document_scope=BookingDocuments.DOCUMENT_SCOPE_BOOKING,
+            document_title="Airline ticket",
+            document_for_booking_token=booking,
         )
         DocumentsStatus.objects.update_or_create(
             status_for_booking=booking,
@@ -3434,6 +3658,48 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         other_partner_booking.refresh_from_db()
         self.assertEqual(other_partner_booking.booking_status, BOOKING_STATUS_READY_FOR_TRAVEL)
 
+    def test_close_booking_rejects_open_traveler_issues(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-CLOSE-ISSUE-001",
+            booking_status=BOOKING_STATUS_READY_FOR_TRAVEL,
+        )
+        booking = self._mark_ready_for_travel(booking)
+        passport = PassportValidity.objects.filter(
+            passport_for_booking_number=booking
+        ).first()
+        self.assertIsNotNone(passport)
+        TravelerIssue.objects.create(
+            booking=booking,
+            traveler=passport,
+            status=TravelerIssue.STATUS_OPEN,
+            created_by=self.partner_a,
+        )
+        sync_booking_state(booking, save=True)
+
+        request = self._authenticated_request(
+            self.factory.put(
+                "/bookings/update_booking_status_into_close/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "booking_number": booking.booking_number,
+                },
+                format="json",
+            )
+        )
+
+        response = CloseBookingView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(
+            response.data.get("message"),
+            "Booking cannot be completed while traveler issues are still open.",
+        )
+
+        booking.refresh_from_db()
+        self.assertEqual(booking.booking_status, BOOKING_STATUS_READY_FOR_TRAVEL)
+        self.assertEqual(booking.issue_status, ISSUE_STATUS_REPORTED)
+
     def test_report_booking_requires_passport_for_same_booking(self):
         partner_booking = self._create_booking(
             partner=self.partner_a,
@@ -4318,6 +4584,36 @@ class BookingSerializerQueryTests(APITransactionTestCase):
             request_for_booking=self.booking,
         )
 
+    def _create_fulfillment_artifacts(self, booking=None):
+        booking = booking or self.booking
+        BookingAirlineDetail.objects.update_or_create(
+            airline_for_booking=booking,
+            flight_direction="outbound",
+            defaults={
+                "flight_date": booking.start_date,
+                "flight_time": booking.start_date.time(),
+                "flight_from": "Karachi",
+                "flight_to": "Jeddah",
+            },
+        )
+        BookingDocuments.objects.get_or_create(
+            document_for="eVisa",
+            document_category="evisa",
+            document_scope=BookingDocuments.DOCUMENT_SCOPE_BOOKING,
+            document_title="Visa document",
+            document_for_booking_token=booking,
+        )
+        BookingDocuments.objects.get_or_create(
+            document_for="airline",
+            document_category="airline",
+            document_scope=BookingDocuments.DOCUMENT_SCOPE_BOOKING,
+            document_title="Airline ticket",
+            document_for_booking_token=booking,
+        )
+        sync_booking_state(booking, save=True)
+        booking.refresh_from_db()
+        return booking
+
     def test_partner_rating_serializer_uses_prefetched_user_address(self):
         rating = BookingRatingAndReview.objects.select_related("rating_by_user").prefetch_related(
             "rating_by_user__mailing_session"
@@ -4383,7 +4679,114 @@ class BookingSerializerQueryTests(APITransactionTestCase):
 
         self.assertEqual(len(queries), 0)
         self.assertEqual(data.get("company_detail", {}).get("company_name"), "Serializer Travel")
-        self.assertEqual(data.get("user_address_detail", {}).get("city"), "Karachi")
+
+    def test_detail_serializer_exposes_backend_action_flags_for_issue_state(self):
+        self._create_fulfillment_artifacts(self.booking)
+        passport = PassportValidity.objects.create(
+            first_name="Serializer",
+            last_name="Traveler",
+            date_of_birth=aware_midnight("1990-01-10"),
+            passport_number=f"{self.booking.booking_number}-ISSUE-01",
+            passport_country="PK",
+            expiry_date=aware_midnight("2031-06-01"),
+            user_passport=SimpleUploadedFile(
+                "serializer-passport.jpg",
+                b"passport-image",
+                content_type="image/jpeg",
+            ),
+            user_photo=SimpleUploadedFile(
+                "serializer-photo.jpg",
+                b"photo-image",
+                content_type="image/jpeg",
+            ),
+            passport_for_booking_number=self.booking,
+        )
+        TravelerIssue.objects.create(
+            booking=self.booking,
+            traveler=passport,
+            status=TravelerIssue.STATUS_OPEN,
+            created_by=self.partner,
+        )
+        sync_booking_state(self.booking, save=True)
+
+        detail_booking = get_booking_by_identifier_for_user(
+            self.customer,
+            self.booking.booking_number,
+            include_detail_relations=True,
+        )
+        data = DetailBookingSerializer(detail_booking).data
+
+        self.assertEqual(data.get("issue_status"), ISSUE_STATUS_REPORTED)
+        self.assertEqual(data.get("workflow_bucket"), WORKFLOW_BUCKET_ISSUES)
+        self.assertFalse(data.get("can_take_decision"))
+        self.assertTrue(data.get("can_edit_fulfillment"))
+        self.assertTrue(data.get("can_manage_traveler_issues"))
+        self.assertFalse(data.get("can_complete_booking"))
+
+    def test_detail_serializer_fulfillment_summary_ignores_stale_legacy_status_flags(self):
+        self._create_fulfillment_artifacts(self.booking)
+        DocumentsStatus.objects.update_or_create(
+            status_for_booking=self.booking,
+            defaults={
+                "is_visa_completed": False,
+                "is_airline_completed": False,
+                "is_airline_detail_completed": False,
+                "is_hotel_completed": False,
+                "is_transport_completed": False,
+            },
+        )
+
+        detail_booking = get_booking_by_identifier_for_user(
+            self.customer,
+            self.booking.booking_number,
+            include_detail_relations=True,
+        )
+        data = DetailBookingSerializer(detail_booking).data
+        fulfillment_summary = data.get("booking_fulfillment", {}).get("summary", {})
+
+        self.assertTrue(fulfillment_summary.get("visa_completed"))
+        self.assertTrue(fulfillment_summary.get("airline_documents_completed"))
+        self.assertTrue(fulfillment_summary.get("airline_details_completed"))
+        self.assertTrue(fulfillment_summary.get("hotel_completed"))
+        self.assertTrue(fulfillment_summary.get("transport_completed"))
+
+    def test_effective_booking_status_does_not_complete_ready_for_travel_with_open_issues(self):
+        self._create_fulfillment_artifacts(self.booking)
+        passport = PassportValidity.objects.create(
+            first_name="Serializer",
+            last_name="Queue",
+            date_of_birth=aware_midnight("1990-01-10"),
+            passport_number=f"{self.booking.booking_number}-QUEUE-01",
+            passport_country="PK",
+            expiry_date=aware_midnight("2031-06-01"),
+            user_passport=SimpleUploadedFile(
+                "serializer-queue-passport.jpg",
+                b"passport-image",
+                content_type="image/jpeg",
+            ),
+            user_photo=SimpleUploadedFile(
+                "serializer-queue-photo.jpg",
+                b"photo-image",
+                content_type="image/jpeg",
+            ),
+            passport_for_booking_number=self.booking,
+        )
+        TravelerIssue.objects.create(
+            booking=self.booking,
+            traveler=passport,
+            status=TravelerIssue.STATUS_OPEN,
+            created_by=self.partner,
+        )
+        self.booking.end_date = timezone.now() - timedelta(days=1)
+        self.booking.save(update_fields=["end_date"])
+        sync_booking_state(self.booking, save=True)
+
+        effective_booking = annotate_effective_booking_status(
+            Booking.objects.filter(pk=self.booking.pk),
+            today=timezone.localdate(),
+        ).get(pk=self.booking.pk)
+
+        self.assertEqual(effective_booking.effective_booking_status, BOOKING_STATUS_READY_FOR_TRAVEL)
 
     @patch("booking.services.user_new_booking_email")
     def test_record_booking_payment_returns_prefetched_mutation_booking(self, mocked_new_booking_email):

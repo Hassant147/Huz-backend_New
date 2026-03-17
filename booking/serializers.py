@@ -32,12 +32,18 @@ from partners.serializers import (
 )
 from .statuses import ISSUE_STATUS_NONE
 from .workflow import (
+    booking_can_complete,
+    booking_can_edit_fulfillment,
+    booking_can_manage_traveler_issues,
+    booking_can_take_decision,
     booking_allows_client_traveller_updates,
     booking_allows_full_payment_submission,
     booking_allows_minimum_payment_submission,
     booking_allows_operator_action,
     get_booking_airline_details,
+    get_initial_payment_status,
     get_open_traveler_issues,
+    booking_fulfillment_summary,
     booking_hotel_fulfillments_are_complete,
     booking_has_operator_visibility,
     booking_transport_fulfillment_is_complete,
@@ -218,7 +224,6 @@ def get_package_defaults(obj):
 
 
 def get_booking_fulfillment(obj):
-    document_status = _get_first_related_item(obj, "status_for_booking")
     booking_documents = _list_related_items(obj, "document_for_booking_token")
     hotel_fulfillments = _list_related_items(obj, "hotel_fulfillments")
     try:
@@ -227,13 +232,7 @@ def get_booking_fulfillment(obj):
         transport_fulfillment = None
 
     return {
-        "summary": {
-            "visa_completed": bool(getattr(document_status, "is_visa_completed", False)),
-            "airline_documents_completed": bool(getattr(document_status, "is_airline_completed", False)),
-            "airline_details_completed": bool(getattr(document_status, "is_airline_detail_completed", False)),
-            "hotel_completed": booking_hotel_fulfillments_are_complete(obj),
-            "transport_completed": booking_transport_fulfillment_is_complete(obj),
-        },
+        "summary": booking_fulfillment_summary(obj),
         "documents": BookingDocumentsSerializer(booking_documents, many=True).data,
         "airlines": BookingAirlineSerializer(get_booking_airline_details(obj), many=True).data,
         "hotels": BookingHotelFulfillmentSerializer(hotel_fulfillments, many=True).data,
@@ -258,6 +257,7 @@ def should_hide_payment_detail(serializer):
 
 
 class BookingWorkflowFieldsMixin(serializers.Serializer):
+    initial_payment_status = serializers.SerializerMethodField()
     issue_status = serializers.CharField(read_only=True)
     minimum_payment_status = serializers.SerializerMethodField()
     full_payment_status = serializers.SerializerMethodField()
@@ -265,7 +265,12 @@ class BookingWorkflowFieldsMixin(serializers.Serializer):
     client_workflow_step = serializers.SerializerMethodField()
     operator_visible = serializers.SerializerMethodField()
     operator_can_act = serializers.SerializerMethodField()
+    can_take_decision = serializers.SerializerMethodField()
+    can_edit_fulfillment = serializers.SerializerMethodField()
+    can_manage_traveler_issues = serializers.SerializerMethodField()
+    can_complete_booking = serializers.SerializerMethodField()
     client_can_edit_travellers = serializers.SerializerMethodField()
+    client_can_submit_initial_payment = serializers.SerializerMethodField()
     client_can_submit_minimum_payment = serializers.SerializerMethodField()
     client_can_submit_full_payment = serializers.SerializerMethodField()
     remaining_amount_due = serializers.SerializerMethodField()
@@ -283,6 +288,10 @@ class BookingWorkflowFieldsMixin(serializers.Serializer):
         _resolve_workflow_read_state(obj)
         return get_payment_stage_status(obj, "Full")
 
+    def get_initial_payment_status(self, obj):
+        _resolve_workflow_read_state(obj)
+        return get_initial_payment_status(obj)
+
     def get_client_workflow_stage(self, obj):
         _resolve_workflow_read_state(obj)
         return resolve_client_workflow_stage(obj)
@@ -299,9 +308,29 @@ class BookingWorkflowFieldsMixin(serializers.Serializer):
         _resolve_workflow_read_state(obj)
         return booking_allows_operator_action(obj)
 
+    def get_can_take_decision(self, obj):
+        _resolve_workflow_read_state(obj)
+        return booking_can_take_decision(obj)
+
+    def get_can_edit_fulfillment(self, obj):
+        _resolve_workflow_read_state(obj)
+        return booking_can_edit_fulfillment(obj)
+
+    def get_can_manage_traveler_issues(self, obj):
+        _resolve_workflow_read_state(obj)
+        return booking_can_manage_traveler_issues(obj)
+
+    def get_can_complete_booking(self, obj):
+        _resolve_workflow_read_state(obj)
+        return booking_can_complete(obj)
+
     def get_client_can_edit_travellers(self, obj):
         _resolve_workflow_read_state(obj)
         return booking_allows_client_traveller_updates(obj)
+
+    def get_client_can_submit_initial_payment(self, obj):
+        _resolve_workflow_read_state(obj)
+        return booking_allows_minimum_payment_submission(obj)
 
     def get_client_can_submit_minimum_payment(self, obj):
         _resolve_workflow_read_state(obj)
@@ -367,13 +396,19 @@ class CurrentUserBookingListSerializer(BookingWorkflowFieldsMixin, serializers.M
             "payment_type",
             "hold_expires_at",
             "payment_correction_expires_at",
+            "initial_payment_status",
             "minimum_payment_status",
             "full_payment_status",
             "client_workflow_stage",
             "client_workflow_step",
             "operator_visible",
             "operator_can_act",
+            "can_take_decision",
+            "can_edit_fulfillment",
+            "can_manage_traveler_issues",
+            "can_complete_booking",
             "client_can_edit_travellers",
+            "client_can_submit_initial_payment",
             "client_can_submit_minimum_payment",
             "client_can_submit_full_payment",
             "remaining_amount_due",
@@ -446,13 +481,19 @@ class BookingMutationSerializer(CurrentUserBookingListSerializer):
             "payment_type",
             "hold_expires_at",
             "payment_correction_expires_at",
+            "initial_payment_status",
             "minimum_payment_status",
             "full_payment_status",
             "client_workflow_stage",
             "client_workflow_step",
             "operator_visible",
             "operator_can_act",
+            "can_take_decision",
+            "can_edit_fulfillment",
+            "can_manage_traveler_issues",
+            "can_complete_booking",
             "client_can_edit_travellers",
+            "client_can_submit_initial_payment",
             "client_can_submit_minimum_payment",
             "client_can_submit_full_payment",
             "remaining_amount_due",
@@ -509,13 +550,19 @@ class PartnerBookingListSerializer(BookingWorkflowFieldsMixin, serializers.Model
             "payment_type",
             "hold_expires_at",
             "payment_correction_expires_at",
+            "initial_payment_status",
             "minimum_payment_status",
             "full_payment_status",
             "client_workflow_stage",
             "client_workflow_step",
             "operator_visible",
             "operator_can_act",
+            "can_take_decision",
+            "can_edit_fulfillment",
+            "can_manage_traveler_issues",
+            "can_complete_booking",
             "client_can_edit_travellers",
+            "client_can_submit_initial_payment",
             "client_can_submit_minimum_payment",
             "client_can_submit_full_payment",
             "remaining_amount_due",
@@ -574,10 +621,12 @@ class ShortBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSerial
             'booking_number', 'adults', 'child', 'infants', 'start_date', 'end_date', 'sharing', 'quad', 'triple',
             'double', 'single', 'total_price', 'special_request', 'booking_status', 'issue_status',
             'order_time', 'payment_type', 'is_payment_received', 'hold_expires_at',
-            'payment_correction_expires_at', 'minimum_payment_status', 'full_payment_status',
+            'payment_correction_expires_at', 'initial_payment_status', 'minimum_payment_status', 'full_payment_status',
             'client_workflow_stage', 'client_workflow_step',
-            'operator_visible', 'operator_can_act', 'client_can_edit_travellers',
-            'client_can_submit_minimum_payment', 'client_can_submit_full_payment',
+            'operator_visible', 'operator_can_act', 'can_take_decision',
+            'can_edit_fulfillment', 'can_manage_traveler_issues', 'can_complete_booking',
+            'client_can_edit_travellers',
+            'client_can_submit_initial_payment', 'client_can_submit_minimum_payment', 'client_can_submit_full_payment',
             'remaining_amount_due', 'workflow_bucket',
 
             'partner_session_token',
@@ -663,10 +712,12 @@ class DetailBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSeria
             'triple', 'double', 'single', 'total_price',
             'special_request', 'booking_status', 'issue_status', 'order_time', 'payment_type',
             'is_payment_received', 'partner_remarks', 'hold_expires_at',
-            'payment_correction_expires_at', 'minimum_payment_status', 'full_payment_status',
+            'payment_correction_expires_at', 'initial_payment_status', 'minimum_payment_status', 'full_payment_status',
             'client_workflow_stage', 'client_workflow_step',
-            'operator_visible', 'operator_can_act', 'client_can_edit_travellers',
-            'client_can_submit_minimum_payment', 'client_can_submit_full_payment',
+            'operator_visible', 'operator_can_act', 'can_take_decision',
+            'can_edit_fulfillment', 'can_manage_traveler_issues', 'can_complete_booking',
+            'client_can_edit_travellers',
+            'client_can_submit_initial_payment', 'client_can_submit_minimum_payment', 'client_can_submit_full_payment',
             'remaining_amount_due', 'workflow_bucket',
 
             'partner_session_token', 'partner_email', 'partner_name', 'partner_username', 'company_detail',
@@ -776,10 +827,12 @@ class AdminPaidBookingSerializer(BookingWorkflowFieldsMixin, serializers.ModelSe
             'booking_number', 'adults', 'child', 'infants', 'start_date', 'end_date', 'sharing', 'quad', 'triple',
             'double', 'single', 'total_price', 'special_request', 'booking_status', 'issue_status',
             'order_time', 'payment_type', 'is_payment_received', 'hold_expires_at',
-            'payment_correction_expires_at', 'minimum_payment_status', 'full_payment_status',
+            'payment_correction_expires_at', 'initial_payment_status', 'minimum_payment_status', 'full_payment_status',
             'client_workflow_stage', 'client_workflow_step',
-            'operator_visible', 'operator_can_act', 'client_can_edit_travellers',
-            'client_can_submit_minimum_payment', 'client_can_submit_full_payment',
+            'operator_visible', 'operator_can_act', 'can_take_decision',
+            'can_edit_fulfillment', 'can_manage_traveler_issues', 'can_complete_booking',
+            'client_can_edit_travellers',
+            'client_can_submit_initial_payment', 'client_can_submit_minimum_payment', 'client_can_submit_full_payment',
             'remaining_amount_due', 'workflow_bucket',
 
             'partner_session_token', 'partner_email', 'partner_name', 'partner_username',

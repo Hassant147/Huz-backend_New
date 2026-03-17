@@ -145,6 +145,31 @@ def booking_has_under_review_payment(booking):
     )
 
 
+def get_initial_payment_status(booking):
+    minimum_payment_status = get_payment_stage_status(booking, "Minimum")
+    full_payment_status = get_payment_stage_status(booking, "Full")
+
+    if (
+        minimum_payment_status == PAYMENT_STATUS_APPROVED
+        or full_payment_status == PAYMENT_STATUS_APPROVED
+    ):
+        return PAYMENT_STATUS_APPROVED
+
+    if (
+        minimum_payment_status == PAYMENT_STATUS_UNDER_REVIEW
+        or full_payment_status == PAYMENT_STATUS_UNDER_REVIEW
+    ):
+        return PAYMENT_STATUS_UNDER_REVIEW
+
+    if (
+        minimum_payment_status == PAYMENT_STATUS_REJECTED
+        or full_payment_status == PAYMENT_STATUS_REJECTED
+    ):
+        return PAYMENT_STATUS_REJECTED
+
+    return PAYMENT_STATUS_NOT_SUBMITTED
+
+
 def booking_has_minimum_approval(booking):
     return (
         get_payment_stage_status(booking, "Minimum") == PAYMENT_STATUS_APPROVED
@@ -369,6 +394,14 @@ def _get_booking_documents_by_category(booking, category):
     return filtered_documents
 
 
+def booking_visa_documents_are_complete(booking):
+    return bool(_get_booking_documents_by_category(booking, "evisa"))
+
+
+def booking_airline_documents_are_complete(booking):
+    return bool(_get_booking_documents_by_category(booking, "airline"))
+
+
 def _package_has_transport_default(booking):
     package = getattr(booking, "package_token", None)
     if package is None:
@@ -425,15 +458,25 @@ def get_open_traveler_issues(booking):
     ]
 
 
-def booking_operator_documents_are_complete(booking):
-    document_statuses = _get_related_items(booking, "status_for_booking")
-    if not document_statuses:
-        return False
+def booking_fulfillment_summary(booking):
+    return {
+        "visa_completed": booking_visa_documents_are_complete(booking),
+        "airline_documents_completed": booking_airline_documents_are_complete(booking),
+        "airline_details_completed": booking_airline_details_are_complete(booking),
+        "hotel_completed": booking_hotel_fulfillments_are_complete(booking),
+        "transport_completed": booking_transport_fulfillment_is_complete(booking),
+    }
 
-    document_status = document_statuses[0]
+
+def booking_fulfillment_is_complete(booking):
+    summary = booking_fulfillment_summary(booking)
+    return all(summary.values())
+
+
+def booking_operator_documents_are_complete(booking):
     return (
-        bool(getattr(document_status, "is_visa_completed", False))
-        and bool(getattr(document_status, "is_airline_completed", False))
+        booking_visa_documents_are_complete(booking)
+        and booking_airline_documents_are_complete(booking)
         and booking_airline_details_are_complete(booking)
         and booking_hotel_fulfillments_are_complete(booking)
         and booking_transport_fulfillment_is_complete(booking)
@@ -479,6 +522,32 @@ def booking_allows_full_payment_submission(booking):
     return booking_passports_are_complete(booking)
 
 
+def booking_can_take_decision(booking):
+    return normalize_booking_status(getattr(booking, "booking_status", "")) == BOOKING_STATUS_READY_FOR_OPERATOR
+
+
+def booking_can_edit_fulfillment(booking):
+    return normalize_booking_status(getattr(booking, "booking_status", "")) in {
+        BOOKING_STATUS_IN_FULFILLMENT,
+        BOOKING_STATUS_READY_FOR_TRAVEL,
+    }
+
+
+def booking_can_manage_traveler_issues(booking):
+    return normalize_booking_status(getattr(booking, "booking_status", "")) in {
+        BOOKING_STATUS_IN_FULFILLMENT,
+        BOOKING_STATUS_READY_FOR_TRAVEL,
+        BOOKING_STATUS_COMPLETED,
+    }
+
+
+def booking_can_complete(booking):
+    return (
+        normalize_booking_status(getattr(booking, "booking_status", "")) == BOOKING_STATUS_READY_FOR_TRAVEL
+        and not get_open_traveler_issues(booking)
+    )
+
+
 def resolve_client_workflow_stage(booking):
     booking_status = normalize_booking_status(getattr(booking, "booking_status", ""))
     minimum_status = get_payment_stage_status(booking, "Minimum")
@@ -493,8 +562,8 @@ def resolve_client_workflow_stage(booking):
             minimum_status == PAYMENT_STATUS_UNDER_REVIEW
             or full_status == PAYMENT_STATUS_UNDER_REVIEW
         ):
-            return "minimum_payment_review"
-        return "minimum_payment"
+            return "initial_payment_review"
+        return "initial_payment"
 
     if not booking_passports_are_complete(booking):
         return "traveler_details"
@@ -511,8 +580,8 @@ def resolve_client_workflow_stage(booking):
 def resolve_client_workflow_step(booking):
     stage = resolve_client_workflow_stage(booking)
     return {
-        "minimum_payment": 2,
-        "minimum_payment_review": 2,
+        "initial_payment": 2,
+        "initial_payment_review": 2,
         "traveler_details": 3,
         "remaining_payment": 4,
         "full_payment_review": 4,
@@ -597,11 +666,14 @@ def sync_booking_state(booking, *, now=None, save=True):
         ) and now > correction_expires_at:
             target_status = BOOKING_STATUS_EXPIRED
         elif current_status == BOOKING_STATUS_READY_FOR_TRAVEL:
-            target_status = BOOKING_STATUS_COMPLETED if has_trip_ended else BOOKING_STATUS_READY_FOR_TRAVEL
+            if has_trip_ended and booking_can_complete(booking):
+                target_status = BOOKING_STATUS_COMPLETED
+            else:
+                target_status = BOOKING_STATUS_READY_FOR_TRAVEL
         elif current_status == BOOKING_STATUS_IN_FULFILLMENT:
             has_operator_documents = booking_operator_documents_are_complete(booking)
             if has_operator_documents:
-                target_status = BOOKING_STATUS_COMPLETED if has_trip_ended else BOOKING_STATUS_READY_FOR_TRAVEL
+                target_status = BOOKING_STATUS_READY_FOR_TRAVEL
             else:
                 target_status = BOOKING_STATUS_IN_FULFILLMENT
         elif not has_minimum_approval:

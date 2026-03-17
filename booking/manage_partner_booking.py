@@ -63,6 +63,7 @@ from .statuses import (
     WORKFLOW_BUCKET_CHOICES,
 )
 from .workflow import (
+    booking_can_complete,
     booking_allows_operator_action,
     booking_airline_details_are_complete,
     booking_hotel_fulfillments_are_complete,
@@ -2291,6 +2292,11 @@ class CloseBookingView(APIView):
             if booking_detail.booking_status != BOOKING_STATUS_READY_FOR_TRAVEL:
                 return Response(
                     {"message": "Booking can only be completed if its status is 'READY_FOR_TRAVEL'."},
+                    status=status.HTTP_409_CONFLICT
+                )
+            if not booking_can_complete(booking_detail):
+                return Response(
+                    {"message": "Booking cannot be completed while traveler issues are still open."},
                     status=status.HTTP_409_CONFLICT
                 )
 

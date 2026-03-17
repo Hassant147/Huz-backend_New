@@ -115,6 +115,7 @@ def annotate_effective_booking_status(queryset, *, now=None, today=None):
             ),
             When(
                 Q(booking_status=BOOKING_STATUS_READY_FOR_TRAVEL)
+                & ~Q(issue_status__in=ISSUE_STATUSES)
                 & Q(end_date__date__lt=today),
                 then=Value(BOOKING_STATUS_COMPLETED),
             ),

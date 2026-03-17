@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import random
 from pathlib import Path
@@ -12,7 +12,7 @@ from django.db.models import Q, Sum
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.exceptions import APIException
+from rest_framework.exceptions import APIException, ValidationError
 
 from common.logs_file import logger
 from common.models import UserProfile
@@ -103,6 +103,9 @@ ROOM_COUNT_FIELDS = {
     ROOM_TYPE_SHARING: "sharing",
 }
 TRAVELER_TYPE_CHILD_GENERIC = "Child"
+PASSPORT_EXPIRY_AFTER_RETURN_DATE_MESSAGE = (
+    "Passport expiry must be later than the package return date. Please renew the passport before continuing with this booking."
+)
 
 
 def _derive_default_traveler_type(booking, traveler_sequence):
@@ -113,6 +116,36 @@ def _derive_default_traveler_type(booking, traveler_sequence):
     if traveler_sequence <= adults + children:
         return TRAVELER_TYPE_CHILD_GENERIC
     return TRAVELER_TYPE_INFANT
+
+
+def _normalize_booking_calendar_date(value):
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        localized_value = timezone.localtime(value) if timezone.is_aware(value) else value
+        return localized_value.date()
+
+    if isinstance(value, date):
+        return value
+
+    return None
+
+
+def _validate_passport_expiry_after_return_date(booking, expiry_date):
+    booking_return_date = _normalize_booking_calendar_date(getattr(booking, "end_date", None))
+    passport_expiry_date = _normalize_booking_calendar_date(expiry_date)
+
+    if booking_return_date is None or passport_expiry_date is None:
+        return
+
+    if passport_expiry_date <= booking_return_date:
+        raise ValidationError(
+            {
+                "message": PASSPORT_EXPIRY_AFTER_RETURN_DATE_MESSAGE,
+                "expiry_date": [PASSPORT_EXPIRY_AFTER_RETURN_DATE_MESSAGE],
+            }
+        )
 
 
 def ensure_booking_group_assignments(booking):
@@ -1431,6 +1464,7 @@ def validate_passport(validated_data):
                 "Traveler details cannot be updated at the current booking stage.",
                 status_code=status.HTTP_409_CONFLICT,
             )
+        _validate_passport_expiry_after_return_date(booking, validated_data.get("expiry_date"))
         traveller_status = PassportValidity.objects.select_for_update().filter(
             passport_for_booking_number=booking
         ).order_by("passport_id")
@@ -1503,6 +1537,7 @@ def update_passport_validation(validated_data):
                 "Traveler details cannot be updated at the current booking stage.",
                 status_code=status.HTTP_409_CONFLICT,
             )
+        _validate_passport_expiry_after_return_date(booking, validated_data.get("expiry_date"))
         passport_queryset = PassportValidity.objects.select_for_update().filter(
             passport_for_booking_number=booking
         )
