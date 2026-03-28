@@ -25,3 +25,4 @@ nginx*.log*
 
 # Runtime artifacts
 view_logs.txt
+staticfiles/

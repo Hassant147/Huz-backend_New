@@ -13,7 +13,7 @@ from rest_framework.test import APIRequestFactory, APITestCase
 from .models import MailingDetail, UserBankAccount, UserOTP, UserProfile, UserTransactionHistory, Wallet
 from .phone_utils import resolve_phone_identity
 from .serializers import UserProfileSerializer
-from .user_profile import CreateMemberProfileView, SendOTPSMSAPIView
+from .user_profile import CreateMemberProfileView, SendOTPSMSAPIView, send_otp_via_sms_gateway
 from huz import urls as huz_urls
 
 
@@ -82,6 +82,41 @@ class SendOTPSMSAPIViewThrottleTests(APITestCase):
         throttled_response = view(throttled_request)
 
         self.assertEqual(throttled_response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+
+class OTPGatewayRequestTests(APITestCase):
+    @patch("common.user_profile.upsert_user_otp")
+    @patch("common.user_profile.requests.post")
+    @patch("common.user_profile.random_six_digits", return_value="123456")
+    @patch(
+        "common.user_profile.config",
+        side_effect=lambda key, default='': {
+            "SMS_GATEWAY_API_KEY": "",
+            "APIKey": "legacy-api-key",
+        }.get(key, default),
+    )
+    def test_send_otp_uses_encoded_query_params_and_legacy_api_key_fallback(
+        self,
+        _mocked_config,
+        _mocked_random_six_digits,
+        mocked_post,
+        mocked_upsert_user_otp,
+    ):
+        mocked_post.return_value = Mock(status_code=200, text="ok")
+
+        send_otp_via_sms_gateway("+923395690614")
+
+        mocked_post.assert_called_once()
+        call_args, call_kwargs = mocked_post.call_args
+        self.assertEqual(
+            call_args[0],
+            "https://api.veevotech.com/v3/sendsms",
+        )
+        self.assertEqual(call_kwargs["params"]["hash"], "legacy-api-key")
+        self.assertEqual(call_kwargs["params"]["receivernum"], "+923395690614")
+        self.assertIn("123456", call_kwargs["params"]["textmessage"])
+        self.assertEqual(call_kwargs["timeout"], 6)
+        mocked_upsert_user_otp.assert_called_once_with("+923395690614", "123456")
 
 
 class CreateMemberProfileViewTransactionTests(APITestCase):

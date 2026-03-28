@@ -20,11 +20,24 @@ from corsheaders.defaults import default_headers
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
+def csv_config(name, default=""):
+    values = config(name, cast=Csv(), default=default)
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = config('SECRET_KEY')
+SECRET_KEY_FALLBACKS = [
+    key
+    for key in (
+        config('SECRET_KEY1', default='').strip(),
+        config('SECRET_KEY2', default='').strip(),
+    )
+    if key
+]
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = False
@@ -37,9 +50,8 @@ SERVE_MEDIA_AND_STATIC_FROM_DJANGO = config(
     default=IS_RUNSERVER,
 )
 
-ALLOWED_HOSTS = config(
+ALLOWED_HOSTS = csv_config(
     'ALLOWED_HOSTS',
-    cast=Csv(),
     default=(
         'hajjumrah.org,'
         'www.hajjumrah.org,'
@@ -48,9 +60,8 @@ ALLOWED_HOSTS = config(
         'localhost,'
         '.ngrok-free.app,'
         '.ngrok.io'
-    )
+    ),
 )
-# ALLOWED_HOSTS = ['209.97.172.88']
 
 
 # Application definition
@@ -97,6 +108,7 @@ DEFAULT_API_PAGE_SIZE = 10
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -105,13 +117,11 @@ MIDDLEWARE = [
     'common.middleware.LegacyAuthDeprecationHeaderMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
-    'whitenoise.middleware.WhiteNoiseMiddleware',
 ]
 
 CORS_ALLOW_ALL_ORIGINS = config('CORS_ALLOW_ALL_ORIGINS', cast=bool, default=False)
-CORS_ALLOWED_ORIGINS = config(
+CORS_ALLOWED_ORIGINS = csv_config(
     'CORS_ALLOWED_ORIGINS',
-    cast=Csv(),
     default=(
         'https://hajjumrah.co,'
         'https://hajjumrah.org,'
@@ -125,17 +135,17 @@ CORS_ALLOWED_ORIGINS = config(
         'http://127.0.0.1:3002,'
         'http://localhost:5173,'
         'http://127.0.0.1:5173'
-    )
+    ),
 )
-CORS_ALLOWED_ORIGIN_REGEXES = config(
+CORS_ALLOWED_ORIGIN_REGEXES = csv_config(
     'CORS_ALLOWED_ORIGIN_REGEXES',
-    cast=Csv(),
     default=(
         r'^https://[a-z0-9-]+\.ngrok-free\.app$,'
         r'^https://[a-z0-9-]+\.ngrok\.io$'
-    )
+    ),
 )
-extra_cors_allow_headers = config("CORS_ALLOW_HEADERS", cast=Csv(), default="")
+CSRF_TRUSTED_ORIGINS = csv_config('CSRF_TRUSTED_ORIGINS', default="")
+extra_cors_allow_headers = csv_config("CORS_ALLOW_HEADERS", default="")
 CORS_ALLOW_HEADERS = list(
     dict.fromkeys(
         [
@@ -176,6 +186,13 @@ WSGI_APPLICATION = 'huz.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/5.0/ref/settings/#databases
 
+database_options = {
+    'connect_timeout': config('DB_CONNECT_TIMEOUT_SECONDS', cast=int, default=10),
+}
+db_ssl_ca = config('DB_SSL_CA', default='').strip()
+if db_ssl_ca:
+    database_options['ssl'] = {'ca': db_ssl_ca}
+
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.mysql',
@@ -188,11 +205,19 @@ DATABASES = {
         # when using a remote MySQL host during local/dev runs.
         'CONN_MAX_AGE': config('DB_CONN_MAX_AGE', cast=int, default=300),
         'CONN_HEALTH_CHECKS': config('DB_CONN_HEALTH_CHECKS', cast=bool, default=True),
-        'OPTIONS': {
-            'connect_timeout': config('DB_CONNECT_TIMEOUT_SECONDS', cast=int, default=10),
-        },
+        'OPTIONS': database_options,
     }
 }
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+USE_X_FORWARDED_HOST = config('USE_X_FORWARDED_HOST', cast=bool, default=True)
+SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', cast=bool, default=False)
+SESSION_COOKIE_SECURE = config('SESSION_COOKIE_SECURE', cast=bool, default=False)
+CSRF_COOKIE_SECURE = config('CSRF_COOKIE_SECURE', cast=bool, default=False)
+SECURE_HSTS_SECONDS = config('SECURE_HSTS_SECONDS', cast=int, default=0)
+SECURE_HSTS_INCLUDE_SUBDOMAINS = config('SECURE_HSTS_INCLUDE_SUBDOMAINS', cast=bool, default=False)
+SECURE_HSTS_PRELOAD = config('SECURE_HSTS_PRELOAD', cast=bool, default=False)
+SECURE_CONTENT_TYPE_NOSNIFF = config('SECURE_CONTENT_TYPE_NOSNIFF', cast=bool, default=True)
+SECURE_REFERRER_POLICY = config('SECURE_REFERRER_POLICY', default='same-origin')
 
 
 # Password validation
@@ -233,9 +258,12 @@ STATIC_URL = '/static/'
 MEDIA_URL = '/media/'
 
 
-STATIC_ROOT = os.path.join(BASE_DIR, 'static')
+STATIC_ROOT = config(
+    'STATIC_ROOT',
+    default=str(BASE_DIR / ('static' if SERVE_MEDIA_AND_STATIC_FROM_DJANGO else 'staticfiles')),
+)
 
-MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+MEDIA_ROOT = config('MEDIA_ROOT', default=str(BASE_DIR / 'media'))
 FIREBASE_CREDENTIAL_PATH = config(
     'FIREBASE_CREDENTIAL_PATH',
     default=str(BASE_DIR / 'common' / 'firebase.json'),

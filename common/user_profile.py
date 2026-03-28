@@ -23,6 +23,7 @@ from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 
 GENDER_CHOICES = ['male', 'female', 'non_binary', 'prefer_not_to_say', 'other']
+SMS_GATEWAY_URL = "https://api.veevotech.com/v3/sendsms"
 SMS_GATEWAY_TIMEOUT_SECONDS = 6
 SMS_GATEWAY_MAX_ATTEMPTS = 2
 SMS_GATEWAY_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
@@ -32,12 +33,16 @@ class OTPDeliveryError(Exception):
     pass
 
 
-def send_sms_gateway_request(url):
+def send_sms_gateway_request(params):
     last_exception = None
 
     for attempt in range(1, SMS_GATEWAY_MAX_ATTEMPTS + 1):
         try:
-            response = requests.post(url, timeout=SMS_GATEWAY_TIMEOUT_SECONDS)
+            response = requests.post(
+                SMS_GATEWAY_URL,
+                params=params,
+                timeout=SMS_GATEWAY_TIMEOUT_SECONDS,
+            )
             if (
                 response.status_code in SMS_GATEWAY_RETRYABLE_STATUS_CODES
                 and attempt < SMS_GATEWAY_MAX_ATTEMPTS
@@ -76,32 +81,45 @@ def upsert_user_otp(phone_number, otp_code):
     return user_otp
 
 
+def get_sms_gateway_api_key():
+    primary_key = config('SMS_GATEWAY_API_KEY', default='').strip()
+    if primary_key:
+        return primary_key
+    return config('APIKey', default='').strip()
+
+
 def send_otp_via_sms_gateway(phone_number):
     otp_code = random_six_digits()
     sender = 'VTvOTP'
     otp_message = f'HajjUmrah.co One-Time Password: {otp_code}. Please do not share OTP with anyone.'
-    api_key = config('APIKey', default='').strip()
+    api_key = get_sms_gateway_api_key()
 
     if not api_key:
-        logger.error("SMS gateway API key is missing while sending OTP to %s.", phone_number)
+        logger.error(
+            "SMS gateway API key is missing while sending OTP to %s. Checked SMS_GATEWAY_API_KEY and APIKey.",
+            phone_number,
+        )
         raise OTPDeliveryError("Failed to send OTP. Please try again later.")
 
-    url = (
-        f'https://api.veevotech.com/v3/sendsms?hash={api_key}'
-        f'&receivernum={phone_number}&sendernum={sender}&textmessage={otp_message}'
-    )
+    params = {
+        'hash': api_key,
+        'receivernum': phone_number,
+        'sendernum': sender,
+        'textmessage': otp_message,
+    }
 
     try:
-        response = send_sms_gateway_request(url)
+        response = send_sms_gateway_request(params)
     except requests.exceptions.RequestException as exc:
         logger.error("OTP delivery request failed for %s: %s", phone_number, str(exc))
         raise OTPDeliveryError("An error occurred while sending OTP.")
 
     if response.status_code != 200:
         logger.error(
-            "OTP delivery failed for %s with gateway status %s.",
+            "OTP delivery failed for %s with gateway status %s and body %r.",
             phone_number,
             response.status_code,
+            getattr(response, 'text', ''),
         )
         raise OTPDeliveryError("Failed to send OTP. Please try again later.")
 

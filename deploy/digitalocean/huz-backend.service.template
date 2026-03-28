@@ -1,0 +1,18 @@
+[Unit]
+Description=Huz Backend Gunicorn Service
+After=network.target
+
+[Service]
+User=__APP_USER__
+Group=www-data
+WorkingDirectory=__APP_DIR__
+EnvironmentFile=/etc/huz-backend.env
+ExecStart=__APP_DIR__/.venv/bin/gunicorn --config __APP_DIR__/deploy/digitalocean/gunicorn.conf.py huz.wsgi:application
+Restart=always
+RestartSec=5
+KillSignal=SIGQUIT
+TimeoutStopSec=30
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
