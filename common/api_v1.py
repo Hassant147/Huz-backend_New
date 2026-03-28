@@ -3,7 +3,7 @@ from rest_framework import serializers, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from common.auth_utils import require_user_profile
+from common.auth_utils import resolve_request_user_profile
 from common.permissions import IsAdminOrAuthenticatedUserProfile
 
 from .models import MailingDetail, UserBankAccount, UserTransactionHistory, UserWithdraw, Wallet
@@ -62,12 +62,12 @@ class CurrentUserProfileView(APIView):
     permission_classes = [IsAdminOrAuthenticatedUserProfile]
 
     def get(self, request):
-        user = require_user_profile(request)
+        user = resolve_request_user_profile(request, request.query_params)
         serializer = UserProfileSerializer(user)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     def put(self, request):
-        user = require_user_profile(request)
+        user = resolve_request_user_profile(request, request.data)
         input_serializer = CurrentUserProfileUpdateSerializer(data=request.data)
         input_serializer.is_valid(raise_exception=True)
         validated_data = input_serializer.validated_data
@@ -88,7 +88,7 @@ class CurrentUserAddressView(APIView):
     permission_classes = [IsAdminOrAuthenticatedUserProfile]
 
     def get(self, request):
-        user = require_user_profile(request)
+        user = resolve_request_user_profile(request, request.query_params)
         address_detail = MailingDetail.objects.filter(mailing_session=user).first()
         if not address_detail:
             return Response({"message": "Address detail not exist."}, status=status.HTTP_404_NOT_FOUND)
@@ -97,7 +97,7 @@ class CurrentUserAddressView(APIView):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     def post(self, request):
-        user = require_user_profile(request)
+        user = resolve_request_user_profile(request, request.data)
         input_serializer = CurrentUserAddressUpsertSerializer(data=request.data)
         input_serializer.is_valid(raise_exception=True)
 
@@ -112,7 +112,7 @@ class CurrentUserAddressView(APIView):
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     def put(self, request):
-        user = require_user_profile(request)
+        user = resolve_request_user_profile(request, request.data)
         input_serializer = CurrentUserAddressUpsertSerializer(data=request.data)
         input_serializer.is_valid(raise_exception=True)
         validated_data = input_serializer.validated_data
@@ -143,13 +143,13 @@ class CurrentUserWalletBankAccountsView(APIView):
     permission_classes = [IsAdminOrAuthenticatedUserProfile]
 
     def get(self, request):
-        user = require_user_profile(request)
+        user = resolve_request_user_profile(request, request.query_params)
         bank_accounts = UserBankAccount.objects.filter(bank_account_for_user=user).order_by("-created_time")
         serializer = UserBankAccountSerializer(bank_accounts, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     def post(self, request):
-        user = require_user_profile(request)
+        user = resolve_request_user_profile(request, request.data)
         input_serializer = CurrentUserBankAccountCreateSerializer(data=request.data)
         input_serializer.is_valid(raise_exception=True)
         validated_data = input_serializer.validated_data
@@ -174,7 +174,7 @@ class CurrentUserWalletBankAccountsView(APIView):
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     def delete(self, request):
-        user = require_user_profile(request)
+        user = resolve_request_user_profile(request, request.data)
         input_serializer = CurrentUserBankAccountDeleteSerializer(data=request.data)
         input_serializer.is_valid(raise_exception=True)
         account_id = input_serializer.validated_data["account_id"]
@@ -197,13 +197,13 @@ class CurrentUserWalletWithdrawalsView(APIView):
     permission_classes = [IsAdminOrAuthenticatedUserProfile]
 
     def get(self, request):
-        user = require_user_profile(request)
+        user = resolve_request_user_profile(request, request.query_params)
         withdrawals = UserWithdraw.objects.filter(withdraw_for_user=user).order_by("-request_time")
         serializer = UserWithdrawSerializer(withdrawals, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     def post(self, request):
-        user = require_user_profile(request)
+        user = resolve_request_user_profile(request, request.data)
         input_serializer = CurrentUserWithdrawCreateSerializer(data=request.data)
         input_serializer.is_valid(raise_exception=True)
         validated_data = input_serializer.validated_data
@@ -262,7 +262,7 @@ class CurrentUserWalletTransactionsView(APIView):
     permission_classes = [IsAdminOrAuthenticatedUserProfile]
 
     def get(self, request):
-        user = require_user_profile(request)
+        user = resolve_request_user_profile(request, request.query_params)
         transactions = UserTransactionHistory.objects.filter(
             transaction_for_user=user
         ).order_by("-transaction_time")

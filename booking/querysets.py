@@ -23,6 +23,7 @@ from .statuses import (
     WORKFLOW_BUCKET_FULFILLMENT,
     WORKFLOW_BUCKET_HISTORY,
     WORKFLOW_BUCKET_ISSUES,
+    WORKFLOW_BUCKET_REPORTED,
     WORKFLOW_BUCKET_READY,
     WORKFLOW_BUCKET_READY_FOR_TRAVEL,
     WORKFLOW_BUCKET_VIEW_ONLY,
@@ -184,8 +185,10 @@ def build_partner_workflow_bucket_q(workflow_bucket):
     normalized_bucket = str(workflow_bucket or "").strip().upper()
     non_issue_q = ~Q(issue_status__in=ISSUE_STATUSES)
 
+    if normalized_bucket == WORKFLOW_BUCKET_REPORTED:
+        return Q(issue_status=ISSUE_STATUS_REPORTED)
     if normalized_bucket == WORKFLOW_BUCKET_ISSUES:
-        return Q(issue_status__in=ISSUE_STATUSES)
+        return Q(issue_status=ISSUE_STATUS_OPERATOR_OBJECTION)
     if normalized_bucket == WORKFLOW_BUCKET_VIEW_ONLY:
         return non_issue_q & Q(
             effective_booking_status__in=(

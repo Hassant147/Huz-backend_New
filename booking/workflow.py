@@ -29,6 +29,7 @@ from .statuses import (
     WORKFLOW_BUCKET_FULFILLMENT,
     WORKFLOW_BUCKET_HISTORY,
     WORKFLOW_BUCKET_ISSUES,
+    WORKFLOW_BUCKET_REPORTED,
     WORKFLOW_BUCKET_READY,
     WORKFLOW_BUCKET_READY_FOR_TRAVEL,
     WORKFLOW_BUCKET_VIEW_ONLY,
@@ -599,8 +600,10 @@ def resolve_operator_workflow_bucket(booking):
 
     booking_status = normalize_booking_status(getattr(booking, "booking_status", ""))
     issue_status = str(getattr(booking, "issue_status", ISSUE_STATUS_NONE) or ISSUE_STATUS_NONE).strip().upper()
-    if issue_status == ISSUE_STATUS_OPERATOR_OBJECTION or get_open_traveler_issues(booking):
+    if issue_status == ISSUE_STATUS_OPERATOR_OBJECTION:
         return WORKFLOW_BUCKET_ISSUES
+    if issue_status == ISSUE_STATUS_REPORTED or get_open_traveler_issues(booking):
+        return WORKFLOW_BUCKET_REPORTED
 
     if booking_status in {BOOKING_STATUS_TRAVELER_DETAILS_PENDING, BOOKING_STATUS_AWAITING_FINAL_PAYMENT}:
         return WORKFLOW_BUCKET_VIEW_ONLY

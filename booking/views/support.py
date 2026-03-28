@@ -2,7 +2,7 @@ from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from common.auth_utils import require_user_profile
+from common.auth_utils import resolve_request_user_profile
 from common.permissions import IsAdminOrAuthenticatedUserProfile
 
 from ..models import BookingComplaints, BookingRequest
@@ -13,7 +13,7 @@ class CurrentUserComplaintListView(APIView):
     permission_classes = [IsAdminOrAuthenticatedUserProfile]
 
     def get(self, request):
-        user = require_user_profile(request)
+        user = resolve_request_user_profile(request, request.query_params)
         complaints = (
             BookingComplaints.objects.select_related(
                 "complaint_by_user",
@@ -36,7 +36,7 @@ class CurrentUserRequestListView(APIView):
     permission_classes = [IsAdminOrAuthenticatedUserProfile]
 
     def get(self, request):
-        user = require_user_profile(request)
+        user = resolve_request_user_profile(request, request.query_params)
         requests = (
             BookingRequest.objects.select_related(
                 "request_by_user",
