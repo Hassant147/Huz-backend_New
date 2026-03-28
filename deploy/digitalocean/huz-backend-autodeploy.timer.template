@@ -1,0 +1,11 @@
+[Unit]
+Description=Check GitHub for Huz backend updates
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+Persistent=true
+Unit=__AUTO_DEPLOY_SERVICE_NAME__.service
+
+[Install]
+WantedBy=timers.target

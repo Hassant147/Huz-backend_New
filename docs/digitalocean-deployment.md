@@ -50,7 +50,7 @@ cd /Users/macbook/Desktop/Huz/Huz-Backend
 git status
 git add .gitignore huz/settings.py requirements.txt deploy docs
 git commit -m "Prepare DigitalOcean deployment"
-git push origin 12-March
+git push origin main
 ```
 
 If you prefer another branch, push to that branch instead.
@@ -134,7 +134,7 @@ Still on the server:
 ```bash
 apt update
 apt install -y git
-git clone --branch 12-March https://github.com/Hassant147/Huz-backend_New.git /root/huz-backend-src
+git clone --branch main https://github.com/Hassant147/Huz-backend_New.git /root/huz-backend-src
 cd /root/huz-backend-src
 ```
 
@@ -248,6 +248,15 @@ sudo bash /srv/huz-backend/deploy/digitalocean/release.sh
 ```
 
 If the service starts correctly, the last lines should show `active (running)`.
+
+Because the server keeps the repository as a real Git checkout, you can also enable automatic deploys from GitHub. The bootstrap script in this repository installs a 1-minute systemd timer that watches the `main` branch and runs the same release script whenever new commits land on GitHub.
+
+To inspect that automation later:
+
+```bash
+sudo systemctl status huz-backend-autodeploy.timer --no-pager
+sudo journalctl -u huz-backend-autodeploy.service -n 100 --no-pager
+```
 
 ## Step 9: Test over plain HTTP first
 
