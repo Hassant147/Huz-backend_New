@@ -26,3 +26,18 @@ nginx*.log*
 # Runtime artifacts
 view_logs.txt
 staticfiles/
+
+# Runtime media uploads and generated duplicates
+media/passport_uploads/
+media/user_images/
+media/payment_uploads/
+media/hassan*.jpg
+media/traveler-passport*.jpg
+media/traveler-photo*.jpg
+media/logo_*.png
+media/Invoice_SDI-01_*.docx
+media/objection-response_*.pdf
+media/hotel_images/*_*.avif
+media/hotel_images/*_*.jpg
+media/hotel_images/*_*.jpeg
+media/hotel_images/*_*.webp

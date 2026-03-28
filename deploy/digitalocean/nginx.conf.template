@@ -25,7 +25,7 @@ server {
     }
 
     location /media/ {
-        alias __APP_DIR__/media/;
+        alias __MEDIA_ROOT__/;
         access_log off;
         expires 1d;
         add_header Cache-Control "public";

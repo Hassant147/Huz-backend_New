@@ -163,6 +163,7 @@ What this script does:
 - installs Python, Nginx, Certbot, and MySQL build packages
 - creates the `huz` Linux user
 - copies the repo into `/srv/huz-backend`
+- creates a separate live media directory at `/srv/huz-media`
 - creates the Python virtual environment
 - installs Python dependencies
 - installs the `systemd` service
@@ -190,6 +191,7 @@ Replace every placeholder value. The important ones are:
 - `CORS_ALLOWED_ORIGINS`
 - `SERVER_EMAIL_PASSWORD`
 - `OPERATOR_PANEL_BASE_URL`
+- `MEDIA_ROOT`
 
 For your current setup, use these exact values unless something is different in your environment:
 
@@ -199,6 +201,7 @@ CSRF_TRUSTED_ORIGINS=https://hajjumrah.org,https://www.hajjumrah.org
 CORS_ALLOW_ALL_ORIGINS=False
 CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001,http://localhost:3002,http://127.0.0.1:3002,http://localhost:5173,http://127.0.0.1:5173,https://hajjumrah.org,https://www.hajjumrah.org
 OPERATOR_PANEL_BASE_URL=http://localhost:3000
+MEDIA_ROOT=/srv/huz-media
 ```
 
 Why these values are correct:

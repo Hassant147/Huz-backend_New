@@ -10,6 +10,7 @@ DOMAIN="${1:-}"
 SERVER_NAMES="${SERVER_NAMES:-${DOMAIN}}"
 APP_USER="${APP_USER:-huz}"
 APP_DIR="${APP_DIR:-/srv/huz-backend}"
+MEDIA_ROOT="${MEDIA_ROOT:-/srv/huz-media}"
 SERVICE_NAME="${SERVICE_NAME:-huz-backend}"
 
 if [[ -z "${DOMAIN}" ]]; then
@@ -37,7 +38,9 @@ apt install -y \
 echo "Creating application user and folders..."
 id -u "${APP_USER}" >/dev/null 2>&1 || adduser --disabled-password --gecos "" "${APP_USER}"
 mkdir -p "${APP_DIR}"
+mkdir -p "${MEDIA_ROOT}"
 chown -R "${APP_USER}":"${APP_USER}" "${APP_DIR}"
+chown -R "${APP_USER}":"${APP_USER}" "${MEDIA_ROOT}"
 
 echo "Copying repository into ${APP_DIR}..."
 rsync -a --delete \
@@ -71,6 +74,7 @@ echo "Installing nginx site..."
 sed \
   -e "s|__SERVER_NAMES__|${SERVER_NAMES}|g" \
   -e "s|__APP_DIR__|${APP_DIR}|g" \
+  -e "s|__MEDIA_ROOT__|${MEDIA_ROOT}|g" \
   "${APP_DIR}/deploy/digitalocean/nginx.conf.template" \
   > "/etc/nginx/sites-available/${SERVICE_NAME}"
 
