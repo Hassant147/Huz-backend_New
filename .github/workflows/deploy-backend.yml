@@ -1,0 +1,30 @@
+name: Deploy Backend
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: huz-backend-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Load deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.HUZ_GITHUB_DEPLOY_KEY }}
+
+      - name: Trust production host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H 64.227.173.238 >> ~/.ssh/known_hosts
+
+      - name: Trigger production deploy
+        run: ssh -o BatchMode=yes huz@64.227.173.238

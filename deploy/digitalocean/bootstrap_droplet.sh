@@ -12,8 +12,6 @@ APP_USER="${APP_USER:-huz}"
 APP_DIR="${APP_DIR:-/srv/huz-backend}"
 MEDIA_ROOT="${MEDIA_ROOT:-/srv/huz-media}"
 SERVICE_NAME="${SERVICE_NAME:-huz-backend}"
-AUTO_DEPLOY_SERVICE_NAME="${AUTO_DEPLOY_SERVICE_NAME:-huz-backend-autodeploy}"
-DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
 
 if [[ -z "${DOMAIN}" ]]; then
   echo "Usage: sudo bash deploy/digitalocean/bootstrap_droplet.sh your-api-domain.com"
@@ -72,19 +70,6 @@ sed \
   "${APP_DIR}/deploy/digitalocean/huz-backend.service.template" \
   > "/etc/systemd/system/${SERVICE_NAME}.service"
 
-echo "Installing auto-deploy timer..."
-sed \
-  -e "s|__APP_USER__|${APP_USER}|g" \
-  -e "s|__APP_DIR__|${APP_DIR}|g" \
-  -e "s|__BRANCH__|${DEPLOY_BRANCH}|g" \
-  "${APP_DIR}/deploy/digitalocean/huz-backend-autodeploy.service.template" \
-  > "/etc/systemd/system/${AUTO_DEPLOY_SERVICE_NAME}.service"
-
-sed \
-  -e "s|__AUTO_DEPLOY_SERVICE_NAME__|${AUTO_DEPLOY_SERVICE_NAME}|g" \
-  "${APP_DIR}/deploy/digitalocean/huz-backend-autodeploy.timer.template" \
-  > "/etc/systemd/system/${AUTO_DEPLOY_SERVICE_NAME}.timer"
-
 echo "Installing nginx site..."
 sed \
   -e "s|__SERVER_NAMES__|${SERVER_NAMES}|g" \
@@ -101,7 +86,6 @@ nginx -t
 systemctl restart nginx
 systemctl enable nginx
 systemctl enable "${SERVICE_NAME}"
-systemctl enable --now "${AUTO_DEPLOY_SERVICE_NAME}.timer"
 
 cat <<EOF
 
@@ -112,8 +96,7 @@ Next steps:
 2. Copy your firebase credentials file to ${APP_DIR}/common/firebase.json if you use Firebase.
 3. Run:
    sudo bash ${APP_DIR}/deploy/digitalocean/release.sh
-4. Auto-deploy now watches GitHub branch ${DEPLOY_BRANCH} on a 1-minute timer.
-5. After the app is responding on HTTP, run:
+4. After the app is responding on HTTP, run:
    sudo certbot --nginx -d ${SERVER_NAMES// / -d }
 
 EOF

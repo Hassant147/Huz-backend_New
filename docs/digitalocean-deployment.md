@@ -249,13 +249,14 @@ sudo bash /srv/huz-backend/deploy/digitalocean/release.sh
 
 If the service starts correctly, the last lines should show `active (running)`.
 
-Because the server keeps the repository as a real Git checkout, you can also enable automatic deploys from GitHub. The bootstrap script in this repository installs a 1-minute systemd timer that watches the `main` branch and runs the same release script whenever new commits land on GitHub.
+This repository also includes a GitHub Actions workflow at `.github/workflows/deploy-backend.yml` for push-to-production deploys from `main`. That workflow needs one repository secret named `HUZ_GITHUB_DEPLOY_KEY`, which should contain the private SSH key used only for deploys.
 
-To inspect that automation later:
+On the server side, that deploy key should be attached to the `huz` user with a forced command so the key can only run the deploy script and cannot open a normal shell.
+
+To inspect production deploy activity on the server later:
 
 ```bash
-sudo systemctl status huz-backend-autodeploy.timer --no-pager
-sudo journalctl -u huz-backend-autodeploy.service -n 100 --no-pager
+sudo journalctl -u huz-backend -n 100 --no-pager
 ```
 
 ## Step 9: Test over plain HTTP first
