@@ -93,7 +93,7 @@ Bootstrap finished.
 
 Next steps:
 1. Edit /etc/huz-backend.env and replace all placeholder values.
-2. Copy your firebase credentials file to ${APP_DIR}/common/firebase.json if you use Firebase.
+2. If you use Firebase, upload its JSON key outside the git checkout and set FIREBASE_CREDENTIAL_PATH in /etc/huz-backend.env.
 3. Run:
    sudo bash ${APP_DIR}/deploy/digitalocean/release.sh
 4. After the app is responding on HTTP, run:

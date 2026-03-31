@@ -266,7 +266,7 @@ STATIC_ROOT = config(
 MEDIA_ROOT = config('MEDIA_ROOT', default=str(BASE_DIR / 'media'))
 FIREBASE_CREDENTIAL_PATH = config(
     'FIREBASE_CREDENTIAL_PATH',
-    default=str(BASE_DIR / 'common' / 'firebase.json'),
+    default='',
 )
 VIEW_LOG_PATH = config(
     'VIEW_LOG_PATH',

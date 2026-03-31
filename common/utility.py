@@ -33,7 +33,13 @@ def get_firebase_app():
         _firebase_app = firebase_admin.get_app()
         return _firebase_app
 
-    credentials_path = Path(settings.FIREBASE_CREDENTIAL_PATH).expanduser()
+    credentials_setting = str(getattr(settings, "FIREBASE_CREDENTIAL_PATH", "") or "").strip()
+    if not credentials_setting:
+        raise FileNotFoundError(
+            "Firebase credentials are not configured. Set FIREBASE_CREDENTIAL_PATH to enable push notifications."
+        )
+
+    credentials_path = Path(credentials_setting).expanduser()
     if not credentials_path.is_absolute():
         credentials_path = Path(settings.BASE_DIR) / credentials_path
 
@@ -474,18 +480,3 @@ def check_password(hashed_password, user_password):
     if isinstance(user_password, str):
         user_password = user_password.encode('utf-8')
     return bcrypt.checkpw(user_password, hashed_password)
-
-
-# def send_docuements_emails(email, name, title, type, file_url):
-#     try:
-#         msg = MIMEMultipart()
-#         msg['From'] = settings.EMAIL_ADDRESS
-#         msg['To'] = email
-#         msg['Subject'] = title
-#         html = f"{mailbody2.part_one}{name}{mailbody2.part_two}{type}{mailbody2.part_three}{file_url}{mailbody2.part_four}"
-#         msg.attach(MIMEText(html, 'html'))
-#         with smtplib.SMTP_SSL(settings.EMAIL_HOST, 465) as mailserver:
-#             mailserver.login(settings.SERVER_EMAIL, settings.SERVER_EMAIL_PASSWORD)
-#             mailserver.sendmail(settings.EMAIL_ADDRESS, email, msg.as_string())
-#     except Exception as e:
-#         print(f"Failed to send verification email: {str(e)}")

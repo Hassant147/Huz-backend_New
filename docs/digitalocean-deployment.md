@@ -227,16 +227,23 @@ Why this matters:
 
 ## Step 7: Upload the Firebase credentials file if you use Firebase
 
-If production uses Firebase, copy the JSON file from your computer to the server:
+If production uses Firebase, copy the JSON file from your computer to a path outside the git checkout, for example:
 
 ```bash
-scp /absolute/path/to/firebase.json root@YOUR_DROPLET_IP:/srv/huz-backend/common/firebase.json
-ssh root@YOUR_DROPLET_IP "chown huz:huz /srv/huz-backend/common/firebase.json && chmod 600 /srv/huz-backend/common/firebase.json"
+ssh root@YOUR_DROPLET_IP "mkdir -p /srv/huz-secrets && chown huz:huz /srv/huz-secrets"
+scp /absolute/path/to/firebase.json root@YOUR_DROPLET_IP:/srv/huz-secrets/firebase.json
+ssh root@YOUR_DROPLET_IP "chown huz:huz /srv/huz-secrets/firebase.json && chmod 600 /srv/huz-secrets/firebase.json"
+```
+
+Then set this in `/etc/huz-backend.env`:
+
+```env
+FIREBASE_CREDENTIAL_PATH=/srv/huz-secrets/firebase.json
 ```
 
 Why this matters:
 
-- your settings expect the file at `/srv/huz-backend/common/firebase.json`
+- the credential file should not live in git
 - the app will fail if it needs Firebase and the file is missing
 
 ## Step 8: Run the release script
