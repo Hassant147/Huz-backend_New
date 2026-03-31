@@ -13,6 +13,7 @@ from rest_framework.test import APIRequestFactory, APITestCase
 from .models import MailingDetail, UserBankAccount, UserOTP, UserProfile, UserTransactionHistory, Wallet
 from .phone_utils import resolve_phone_identity
 from .serializers import UserProfileSerializer
+from .utility import _send_email
 from .user_profile import CreateMemberProfileView, SendOTPSMSAPIView, send_otp_via_sms_gateway
 from huz import urls as huz_urls
 
@@ -117,6 +118,77 @@ class OTPGatewayRequestTests(APITestCase):
         self.assertIn("123456", call_kwargs["params"]["textmessage"])
         self.assertEqual(call_kwargs["timeout"], 6)
         mocked_upsert_user_otp.assert_called_once_with("+923395690614", "123456")
+
+
+class EmailUtilityTests(SimpleTestCase):
+    @override_settings(
+        EMAIL_DELIVERY_BACKEND="smtp",
+        EMAIL_ADDRESS="HajjUmrah.co <no-reply@example.com>",
+        EMAIL_ENVELOPE_SENDER="",
+        EMAIL_HOST="smtp.hostinger.com",
+        EMAIL_PORT=465,
+        SERVER_EMAIL="no-reply@example.com",
+        SERVER_EMAIL_PASSWORD="secret",
+        EMAIL_SEND_TIMEOUT_SECONDS=20,
+        EMAIL_USE_SSL=True,
+        EMAIL_USE_TLS=False,
+        EMAIL_STARTTLS_PORT=587,
+        EMAIL_ALLOW_STARTTLS_FALLBACK=True,
+        EMAIL_LOCAL_HOSTNAME="",
+    )
+    @patch("common.utility.smtplib.SMTP")
+    @patch("common.utility.smtplib.SMTP_SSL", side_effect=TimeoutError("ssl timeout"))
+    def test_send_email_retries_with_starttls_when_ssl_transport_times_out(
+        self,
+        mocked_smtp_ssl,
+        mocked_smtp,
+    ):
+        smtp_connection = mocked_smtp.return_value
+        smtp_instance = smtp_connection.__enter__.return_value
+
+        result = _send_email("recipient@example.com", "OTP test", "<p>otp</p>")
+
+        self.assertTrue(result)
+        mocked_smtp_ssl.assert_called_once()
+        mocked_smtp.assert_called_once_with(
+            host="smtp.hostinger.com",
+            port=587,
+            timeout=20,
+        )
+        smtp_connection.starttls.assert_called_once()
+        smtp_instance.login.assert_called_once_with("no-reply@example.com", "secret")
+        smtp_instance.sendmail.assert_called_once()
+        sendmail_args = smtp_instance.sendmail.call_args[0]
+        self.assertEqual(sendmail_args[0], "no-reply@example.com")
+        self.assertEqual(sendmail_args[1], ["recipient@example.com"])
+
+    @override_settings(
+        EMAIL_DELIVERY_BACKEND="smtp",
+        EMAIL_ADDRESS="HajjUmrah.co <no-reply@example.com>",
+        EMAIL_ENVELOPE_SENDER="",
+        EMAIL_HOST="smtp.hostinger.com",
+        EMAIL_PORT=465,
+        SERVER_EMAIL="no-reply@example.com",
+        SERVER_EMAIL_PASSWORD="secret",
+        EMAIL_SEND_TIMEOUT_SECONDS=20,
+        EMAIL_USE_SSL=True,
+        EMAIL_USE_TLS=False,
+        EMAIL_STARTTLS_PORT=587,
+        EMAIL_ALLOW_STARTTLS_FALLBACK=True,
+        EMAIL_LOCAL_HOSTNAME="",
+    )
+    @patch("common.utility.smtplib.SMTP")
+    @patch("common.utility.smtplib.SMTP_SSL")
+    def test_send_email_rejects_blank_recipient_before_opening_smtp_connection(
+        self,
+        mocked_smtp_ssl,
+        mocked_smtp,
+    ):
+        result = _send_email(None, "OTP test", "<p>otp</p>")
+
+        self.assertFalse(result)
+        mocked_smtp_ssl.assert_not_called()
+        mocked_smtp.assert_not_called()
 
 
 class CreateMemberProfileViewTransactionTests(APITestCase):

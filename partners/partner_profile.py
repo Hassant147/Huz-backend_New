@@ -6,8 +6,10 @@ from .models import PartnerProfile, IndividualProfile, BusinessProfile, PartnerS
 from .serializers import PartnerProfileSerializer, PartnerMailingDetailSerializer
 from django.db import transaction
 import re
+import threading
 from common.logs_file import logger
 from common.utility import generate_token, random_six_digits, send_verification_email, hash_password, check_password, validate_required_fields, check_photo_format_and_size, check_file_format_and_size, save_file_in_directory, delete_file_from_directory
+from common.user_profile import OTPDeliveryError, get_sms_gateway_api_key, send_sms_gateway_request
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from datetime import datetime
 from drf_yasg.utils import swagger_auto_schema
@@ -33,15 +35,100 @@ def normalize_legacy_review_status(user):
     return user
 
 
-def dispatch_partner_verification_email(email, name, otp):
+def build_partner_full_phone_number(partner):
+    if not partner:
+        return ""
+
+    country_code = (partner.country_code or "").strip()
+    phone_number = (partner.phone_number or "").strip().replace(" ", "")
+    if not country_code or not phone_number:
+        return ""
+    if phone_number.startswith("+"):
+        return phone_number
+    return f"{country_code}{phone_number}"
+
+
+def send_partner_verification_sms(phone_number, otp):
+    if not phone_number:
+        raise OTPDeliveryError("Failed to send OTP. Missing phone number.")
+
+    api_key = get_sms_gateway_api_key()
+    if not api_key:
+        logger.error("Partner OTP SMS skipped for %s because SMS gateway API key is missing.", phone_number)
+        raise OTPDeliveryError("Failed to send OTP. Please try again later.")
+
+    params = {
+        "hash": api_key,
+        "receivernum": phone_number,
+        "sendernum": "VTvOTP",
+        "textmessage": f"HajjUmrah.co One-Time Password: {otp}. Please do not share OTP with anyone.",
+    }
+
     try:
-        send_verification_email(email, name, otp)
+        response = send_sms_gateway_request(params)
+    except Exception as exc:
+        logger.error("Partner OTP SMS request failed for %s: %s", phone_number, str(exc))
+        raise OTPDeliveryError("An error occurred while sending OTP.")
+
+    if response.status_code != 200:
+        logger.error(
+            "Partner OTP SMS failed for %s with gateway status %s and body %r.",
+            phone_number,
+            response.status_code,
+            getattr(response, "text", ""),
+        )
+        raise OTPDeliveryError("Failed to send OTP. Please try again later.")
+
+    return True
+
+
+def _deliver_partner_verification_otp(email, name, otp, phone_number=""):
+    try:
+        is_sent = send_verification_email(email, name, otp, wait_for_result=True)
+        if is_sent:
+            return True
+        logger.error(
+            "Post - CreatePartnerProfileView email delivery returned false for %s.",
+            email,
+        )
     except Exception as email_error:
         logger.error(
             "Post - CreatePartnerProfileView email dispatch error for %s: %s",
             email,
             str(email_error),
         )
+
+    if not phone_number:
+        return False
+
+    try:
+        send_partner_verification_sms(phone_number, otp)
+        logger.warning(
+            "Post - CreatePartnerProfileView email delivery failed for %s. OTP delivered via SMS to %s.",
+            email,
+            phone_number,
+        )
+        return True
+    except Exception as sms_error:
+        logger.error(
+            "Post - CreatePartnerProfileView SMS fallback error for %s (%s): %s",
+            email,
+            phone_number,
+            str(sms_error),
+        )
+        return False
+
+
+def dispatch_partner_verification_email(email, name, otp, phone_number="", wait_for_result=False):
+    if wait_for_result:
+        return _deliver_partner_verification_otp(email, name, otp, phone_number)
+
+    threading.Thread(
+        target=_deliver_partner_verification_otp,
+        args=(email, name, otp, phone_number),
+        daemon=True,
+    ).start()
+    return True
 
 
 class PartnerLoginView(APIView):
@@ -325,10 +412,12 @@ class CreatePartnerProfileView(APIView):
 
                         # Dispatch the initial verification email after the user transaction commits.
                         transaction.on_commit(
-                            lambda email=user.email, name=user.name, otp=otp: dispatch_partner_verification_email(
+                            lambda email=user.email, name=user.name, otp=otp, phone_number=build_partner_full_phone_number(user): dispatch_partner_verification_email(
                                 email,
                                 name,
                                 otp,
+                                phone_number,
+                                wait_for_result=False,
                             )
                         )
 
@@ -413,9 +502,16 @@ class SendEmailOTPView(APIView):
                 return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
 
             otp = random_six_digits()
-            is_sent = send_verification_email(user.email, user.name, otp, wait_for_result=True)
+            full_phone_number = build_partner_full_phone_number(user)
+            is_sent = dispatch_partner_verification_email(
+                user.email,
+                user.name,
+                otp,
+                full_phone_number,
+                wait_for_result=True,
+            )
             if not is_sent:
-                return Response({"message": "Failed to send OTP email. Please try again."}, status=status.HTTP_502_BAD_GATEWAY)
+                return Response({"message": "Failed to send OTP. Please try again."}, status=status.HTTP_502_BAD_GATEWAY)
             user.otp = otp
             user.save()
             return Response({"message": "OTP sent successfully."}, status=status.HTTP_200_OK)

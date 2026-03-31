@@ -25,6 +25,7 @@ nginx*.log*
 
 # Runtime artifacts
 view_logs.txt
+local.sqlite3
 staticfiles/
 
 # Runtime media uploads and generated duplicates

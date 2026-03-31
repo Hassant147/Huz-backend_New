@@ -275,10 +275,17 @@ VIEW_LOG_PATH = config(
 
 
 EMAIL_ADDRESS = config('EMAIL_ADDRESS', default='HajjUmrah.co <no-reply@hajjumrah.co>')
+EMAIL_ENVELOPE_SENDER = config('EMAIL_ENVELOPE_SENDER', default='').strip()
 EMAIL_HOST = config('EMAIL_HOST', default='smtp.hostinger.com')
 EMAIL_PORT = config('EMAIL_PORT', cast=int, default=465)
 SERVER_EMAIL = config('SERVER_EMAIL', default='no-reply@hajjumrah.co')
 SERVER_EMAIL_PASSWORD = config('SERVER_EMAIL_PASSWORD', default='')
+EMAIL_DELIVERY_BACKEND = config('EMAIL_DELIVERY_BACKEND', default='smtp').strip().lower()
+EMAIL_USE_SSL = config('EMAIL_USE_SSL', cast=bool, default=EMAIL_PORT == 465)
+EMAIL_USE_TLS = config('EMAIL_USE_TLS', cast=bool, default=(EMAIL_PORT == 587 and not EMAIL_USE_SSL))
+EMAIL_STARTTLS_PORT = config('EMAIL_STARTTLS_PORT', cast=int, default=587)
+EMAIL_ALLOW_STARTTLS_FALLBACK = config('EMAIL_ALLOW_STARTTLS_FALLBACK', cast=bool, default=True)
+EMAIL_LOCAL_HOSTNAME = config('EMAIL_LOCAL_HOSTNAME', default='').strip()
 EMAIL_SEND_TIMEOUT_SECONDS = config('EMAIL_SEND_TIMEOUT_SECONDS', cast=int, default=20)
 EMAIL_OTP_EXPIRY_MINUTES = config('EMAIL_OTP_EXPIRY_MINUTES', cast=int, default=5)
 PASSWORD_RESET_EXPIRY_MINUTES = config('PASSWORD_RESET_EXPIRY_MINUTES', cast=int, default=60)

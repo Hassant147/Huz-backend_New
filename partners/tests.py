@@ -34,7 +34,11 @@ from .package_management_operator import (
     GetHuzPackageDetailByTokenView,
     GetHuzShortPackageByTokenView,
 )
-from .partner_profile import CreatePartnerProfileView, PartnerServicesView
+from .partner_profile import (
+    CreatePartnerProfileView,
+    PartnerServicesView,
+    dispatch_partner_verification_email,
+)
 
 
 def ensure_tables_for_apps(app_labels):
@@ -81,8 +85,8 @@ class PartnerProfileSignupTests(APITransactionTestCase):
         self.factory = APIRequestFactory()
         PartnerProfile.objects.filter(email__iexact="operator-signup@example.com").delete()
 
-    @patch("partners.partner_profile.send_verification_email", side_effect=RuntimeError("smtp unavailable"))
-    def test_create_partner_profile_persists_user_when_initial_email_dispatch_fails(self, mocked_email):
+    @patch("partners.partner_profile.dispatch_partner_verification_email", return_value=True)
+    def test_create_partner_profile_persists_user_and_dispatches_otp_after_commit(self, mocked_dispatch):
         request = self.factory.post(
             "/partner/create_partner_profile/",
             {
@@ -102,7 +106,37 @@ class PartnerProfileSignupTests(APITransactionTestCase):
         self.assertEqual(created_partner.country_code, "+92")
         self.assertEqual(created_partner.phone_number, "3001234567")
         self.assertTrue(Wallet.objects.filter(wallet_session=created_partner).exists())
-        mocked_email.assert_called_once()
+        mocked_dispatch.assert_called_once_with(
+            created_partner.email,
+            created_partner.name,
+            created_partner.otp,
+            "+923001234567",
+            wait_for_result=False,
+        )
+
+    @patch("partners.partner_profile.send_partner_verification_sms", return_value=True)
+    @patch("partners.partner_profile.send_verification_email", return_value=False)
+    def test_dispatch_partner_verification_email_falls_back_to_sms_when_email_send_fails(
+        self,
+        mocked_email,
+        mocked_sms,
+    ):
+        is_sent = dispatch_partner_verification_email(
+            "operator-signup@example.com",
+            "Operator Signup",
+            "123456",
+            "+923001234567",
+            wait_for_result=True,
+        )
+
+        self.assertTrue(is_sent)
+        mocked_email.assert_called_once_with(
+            "operator-signup@example.com",
+            "Operator Signup",
+            "123456",
+            wait_for_result=True,
+        )
+        mocked_sms.assert_called_once_with("+923001234567", "123456")
 
     @patch("partners.partner_profile.send_verification_email", return_value=True)
     def test_resend_otp_returns_success_and_updates_partner_otp(self, mocked_email):
@@ -131,6 +165,75 @@ class PartnerProfileSignupTests(APITransactionTestCase):
         self.assertEqual(response.data["message"], "OTP sent successfully.")
         self.assertRegex(partner.otp or "", r"^\d{6}$")
         mocked_email.assert_called_once_with(partner.email, partner.name, partner.otp, wait_for_result=True)
+
+    @patch("partners.partner_profile.send_partner_verification_sms", return_value=True)
+    @patch("partners.partner_profile.send_verification_email", return_value=False)
+    def test_resend_otp_falls_back_to_sms_when_email_send_fails(
+        self,
+        mocked_email,
+        mocked_sms,
+    ):
+        partner = PartnerProfile.objects.create(
+            partner_session_token="partner-otp-fallback-session-token",
+            email="operator-resend-fallback@example.com",
+            name="Operator Resend Fallback",
+            country_code="+92",
+            phone_number="3001234570",
+            partner_type="NA",
+            sign_type="Email",
+        )
+
+        request = self.factory.put(
+            "/partner/resend_otp/",
+            {"partner_session_token": partner.partner_session_token},
+            format="json",
+        )
+
+        from .partner_profile import SendEmailOTPView
+
+        response = SendEmailOTPView.as_view()(request)
+
+        partner.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertRegex(partner.otp or "", r"^\d{6}$")
+        mocked_email.assert_called_once_with(partner.email, partner.name, partner.otp, wait_for_result=True)
+        mocked_sms.assert_called_once_with("+923001234570", partner.otp)
+
+    @patch("partners.partner_profile.send_partner_verification_sms", side_effect=Exception("sms unavailable"))
+    @patch("partners.partner_profile.send_verification_email", return_value=False)
+    def test_resend_otp_returns_502_when_email_and_sms_delivery_fail(
+        self,
+        mocked_email,
+        mocked_sms,
+    ):
+        partner = PartnerProfile.objects.create(
+            partner_session_token="partner-otp-failure-session-token",
+            email="operator-resend-failure@example.com",
+            name="Operator Resend Failure",
+            country_code="+92",
+            phone_number="3001234571",
+            partner_type="NA",
+            sign_type="Email",
+        )
+
+        request = self.factory.put(
+            "/partner/resend_otp/",
+            {"partner_session_token": partner.partner_session_token},
+            format="json",
+        )
+
+        from .partner_profile import SendEmailOTPView
+
+        response = SendEmailOTPView.as_view()(request)
+
+        partner.refresh_from_db()
+        attempted_otp = mocked_email.call_args.args[2]
+        self.assertEqual(response.status_code, status.HTTP_502_BAD_GATEWAY)
+        self.assertIn("Failed to send OTP", response.data["message"])
+        self.assertFalse(partner.otp)
+        self.assertRegex(attempted_otp, r"^\d{6}$")
+        mocked_email.assert_called_once_with(partner.email, partner.name, attempted_otp, wait_for_result=True)
+        mocked_sms.assert_called_once_with("+923001234571", attempted_otp)
 
     def test_verify_otp_marks_email_verified(self):
         partner = PartnerProfile.objects.create(

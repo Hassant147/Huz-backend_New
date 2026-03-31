@@ -3,9 +3,12 @@ from firebase_admin import credentials, messaging
 import base64, random
 import bcrypt
 import smtplib
+import socket
+import ssl
 from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formataddr, parseaddr
 from django.conf import settings
 from rest_framework.response import Response
 from rest_framework import status
@@ -135,22 +138,149 @@ class EmailThread(threading.Thread):
             self.error = RuntimeError(f"Unable to send email to {self.email}.")
 
 
-def _send_email(email, subject, html_content):
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = settings.EMAIL_ADDRESS
-        msg['To'] = email
-        msg['Subject'] = subject
-        msg.attach(MIMEText(html_content, 'html'))
-        with smtplib.SMTP_SSL(settings.EMAIL_HOST, settings.EMAIL_PORT, timeout=settings.EMAIL_SEND_TIMEOUT_SECONDS) as mailserver:
-            mailserver.login(settings.SERVER_EMAIL, settings.SERVER_EMAIL_PASSWORD)
-            mailserver.sendmail(settings.EMAIL_ADDRESS, email, msg.as_string())
-        return True
-    except smtplib.SMTPException as smtp_err:
-        logger.error("SMTP Error while sending email to %s: %s", email, str(smtp_err))
+def _resolve_email_sender():
+    display_name, parsed_header_address = parseaddr(settings.EMAIL_ADDRESS)
+    envelope_sender = (
+        settings.EMAIL_ENVELOPE_SENDER
+        or parsed_header_address
+        or settings.SERVER_EMAIL
+    )
+    header_sender = (
+        formataddr((display_name, parsed_header_address or envelope_sender))
+        if display_name
+        else (parsed_header_address or envelope_sender)
+    )
+    return header_sender, envelope_sender
+
+
+def _resolve_email_recipient(email):
+    if not email:
+        return ""
+    return parseaddr(str(email))[1].strip()
+
+
+def _build_email_message(email, subject, html_content):
+    header_sender, envelope_sender = _resolve_email_sender()
+    recipient_address = _resolve_email_recipient(email)
+    if not recipient_address:
+        logger.error("Email sending aborted for subject '%s': missing recipient address.", subject)
+        return None, None, None
+
+    msg = MIMEMultipart()
+    msg['From'] = header_sender
+    msg['To'] = recipient_address
+    msg['Subject'] = subject
+    msg.attach(MIMEText(html_content, 'html'))
+    return msg, envelope_sender, recipient_address
+
+
+def _open_smtp_connection(host, port, use_ssl, use_tls):
+    connection_kwargs = {
+        "host": host,
+        "port": port,
+        "timeout": settings.EMAIL_SEND_TIMEOUT_SECONDS,
+    }
+    if settings.EMAIL_LOCAL_HOSTNAME:
+        connection_kwargs["local_hostname"] = settings.EMAIL_LOCAL_HOSTNAME
+
+    if use_ssl:
+        return smtplib.SMTP_SSL(**connection_kwargs)
+
+    mailserver = smtplib.SMTP(**connection_kwargs)
+    mailserver.ehlo()
+    if use_tls:
+        mailserver.starttls(context=ssl.create_default_context())
+        mailserver.ehlo()
+    return mailserver
+
+
+def _send_email_via_smtp(email, subject, html_content, *, host, port, use_ssl, use_tls):
+    msg, envelope_sender, recipient_address = _build_email_message(email, subject, html_content)
+    if not msg:
         return False
-    except Exception as e:
-        logger.error("Email sending error for %s: %s", email, str(e))
+
+    with _open_smtp_connection(host, port, use_ssl, use_tls) as mailserver:
+        mailserver.login(settings.SERVER_EMAIL, settings.SERVER_EMAIL_PASSWORD)
+        mailserver.sendmail(envelope_sender, [recipient_address], msg.as_string())
+    return True
+
+
+def _should_retry_with_starttls(error):
+    retriable_error_types = (
+        TimeoutError,
+        socket.timeout,
+        socket.gaierror,
+        ssl.SSLError,
+        smtplib.SMTPConnectError,
+        smtplib.SMTPServerDisconnected,
+    )
+    return isinstance(error, retriable_error_types)
+
+
+def _send_email(email, subject, html_content):
+    delivery_backend = getattr(settings, "EMAIL_DELIVERY_BACKEND", "smtp").strip().lower()
+    if delivery_backend == "console":
+        recipient_address = _resolve_email_recipient(email)
+        if not recipient_address:
+            logger.error("Console email aborted for subject '%s': missing recipient address.", subject)
+            return False
+        logger.info(
+            "Console email to %s with subject '%s'. HTML length=%s",
+            recipient_address,
+            subject,
+            len(html_content or ""),
+        )
+        return True
+
+    if delivery_backend == "disabled":
+        logger.warning("Email delivery disabled. Skipping subject '%s'.", subject)
+        return True
+
+    primary_transport = {
+        "host": settings.EMAIL_HOST,
+        "port": settings.EMAIL_PORT,
+        "use_ssl": settings.EMAIL_USE_SSL,
+        "use_tls": settings.EMAIL_USE_TLS,
+    }
+
+    try:
+        return _send_email_via_smtp(email, subject, html_content, **primary_transport)
+    except Exception as primary_error:
+        should_retry = (
+            settings.EMAIL_ALLOW_STARTTLS_FALLBACK
+            and primary_transport["use_ssl"]
+            and settings.EMAIL_STARTTLS_PORT != settings.EMAIL_PORT
+            and _should_retry_with_starttls(primary_error)
+        )
+        if should_retry:
+            logger.warning(
+                "Primary SMTP transport failed for %s: %s. Retrying with STARTTLS on port %s.",
+                email,
+                str(primary_error),
+                settings.EMAIL_STARTTLS_PORT,
+            )
+            try:
+                return _send_email_via_smtp(
+                    email,
+                    subject,
+                    html_content,
+                    host=settings.EMAIL_HOST,
+                    port=settings.EMAIL_STARTTLS_PORT,
+                    use_ssl=False,
+                    use_tls=True,
+                )
+            except Exception as fallback_error:
+                logger.error(
+                    "Email sending error for %s after STARTTLS fallback: %s",
+                    email,
+                    str(fallback_error),
+                )
+                return False
+
+        if isinstance(primary_error, smtplib.SMTPException):
+            logger.error("SMTP Error while sending email to %s: %s", email, str(primary_error))
+        else:
+            logger.error("Email sending error for %s: %s", email, str(primary_error))
         return False
 
 
