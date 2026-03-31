@@ -1,4 +1,5 @@
 from datetime import timedelta
+from unittest.mock import patch
 
 from django.apps import apps
 from django.db import connection
@@ -33,7 +34,7 @@ from .package_management_operator import (
     GetHuzPackageDetailByTokenView,
     GetHuzShortPackageByTokenView,
 )
-from .partner_profile import PartnerServicesView
+from .partner_profile import CreatePartnerProfileView, PartnerServicesView
 
 
 def ensure_tables_for_apps(app_labels):
@@ -68,6 +69,96 @@ def ensure_tables_for_apps(app_labels):
             )
 
         pending_models = remaining_models
+
+
+class PartnerProfileSignupTests(APITransactionTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        ensure_tables_for_apps(["common", "partners"])
+
+    def setUp(self):
+        self.factory = APIRequestFactory()
+        PartnerProfile.objects.filter(email__iexact="operator-signup@example.com").delete()
+
+    @patch("partners.partner_profile.send_verification_email", side_effect=RuntimeError("smtp unavailable"))
+    def test_create_partner_profile_persists_user_when_initial_email_dispatch_fails(self, mocked_email):
+        request = self.factory.post(
+            "/partner/create_partner_profile/",
+            {
+                "email": "operator-signup@example.com",
+                "name": "Operator Signup",
+                "phone_number": "+923001234567",
+                "password": "SecurePass1!",
+                "sign_type": "Email",
+            },
+            format="json",
+        )
+
+        response = CreatePartnerProfileView.as_view()(request)
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        created_partner = PartnerProfile.objects.get(email="operator-signup@example.com")
+        self.assertEqual(created_partner.country_code, "+92")
+        self.assertEqual(created_partner.phone_number, "3001234567")
+        self.assertTrue(Wallet.objects.filter(wallet_session=created_partner).exists())
+        mocked_email.assert_called_once()
+
+    @patch("partners.partner_profile.send_verification_email", return_value=True)
+    def test_resend_otp_returns_success_and_updates_partner_otp(self, mocked_email):
+        partner = PartnerProfile.objects.create(
+            partner_session_token="partner-otp-session-token",
+            email="operator-resend@example.com",
+            name="Operator Resend",
+            country_code="+92",
+            phone_number="3001234568",
+            partner_type="NA",
+            sign_type="Email",
+        )
+
+        request = self.factory.put(
+            "/partner/resend_otp/",
+            {"partner_session_token": partner.partner_session_token},
+            format="json",
+        )
+
+        from .partner_profile import SendEmailOTPView
+
+        response = SendEmailOTPView.as_view()(request)
+
+        partner.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["message"], "OTP sent successfully.")
+        self.assertRegex(partner.otp or "", r"^\d{6}$")
+        mocked_email.assert_called_once_with(partner.email, partner.name, partner.otp, wait_for_result=True)
+
+    def test_verify_otp_marks_email_verified(self):
+        partner = PartnerProfile.objects.create(
+            partner_session_token="partner-verify-session-token",
+            email="operator-verify@example.com",
+            name="Operator Verify",
+            country_code="+92",
+            phone_number="3001234569",
+            partner_type="NA",
+            sign_type="Email",
+            otp="123456",
+            is_email_verified=False,
+        )
+
+        request = self.factory.put(
+            "/partner/verify_otp/",
+            {"partner_session_token": partner.partner_session_token, "otp": "123456"},
+            format="json",
+        )
+
+        from .partner_profile import MatchEmailOTPView
+
+        response = MatchEmailOTPView.as_view()(request)
+
+        partner.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(partner.is_email_verified)
+        self.assertEqual(partner.otp, "")
 
 
 class PackageManagementOperatorViewTests(APITransactionTestCase):

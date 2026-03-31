@@ -33,6 +33,17 @@ def normalize_legacy_review_status(user):
     return user
 
 
+def dispatch_partner_verification_email(email, name, otp):
+    try:
+        send_verification_email(email, name, otp)
+    except Exception as email_error:
+        logger.error(
+            "Post - CreatePartnerProfileView email dispatch error for %s: %s",
+            email,
+            str(email_error),
+        )
+
+
 class PartnerLoginView(APIView):
     permission_classes = [AllowAny]
 
@@ -312,10 +323,14 @@ class CreatePartnerProfileView(APIView):
                         wallet_token = generate_token(f'wallet{datetime.now()}0.0')
                         Wallet.objects.create(wallet_code=wallet_token, wallet_session=user)
 
-                        # Send a verification email with the OTP and fail fast if SMTP delivery fails.
-                        is_sent = send_verification_email(user.email, user.name, otp, wait_for_result=True)
-                        if not is_sent:
-                            raise RuntimeError("Unable to send verification OTP email.")
+                        # Dispatch the initial verification email after the user transaction commits.
+                        transaction.on_commit(
+                            lambda email=user.email, name=user.name, otp=otp: dispatch_partner_verification_email(
+                                email,
+                                name,
+                                otp,
+                            )
+                        )
 
                         # Serialize and return the user data
                         serialized_user = PartnerProfileSerializer(user)
