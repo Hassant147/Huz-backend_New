@@ -1,4 +1,5 @@
 from django.contrib.auth import authenticate, login as django_login, logout as django_logout
+from django.middleware.csrf import get_token
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
@@ -22,6 +23,12 @@ def _build_session_payload(*, user=None, authenticated=False, message=None):
     if message is not None:
         payload["message"] = message
     return payload
+
+
+def _ensure_csrf_cookie(request):
+    raw_request = getattr(request, "_request", None)
+    if raw_request is not None:
+        get_token(raw_request)
 
 
 class AdminLoginView(APIView):
@@ -69,6 +76,7 @@ class AdminLoginView(APIView):
             )
 
         django_login(raw_request, user)
+        _ensure_csrf_cookie(request)
         return Response(
             _build_session_payload(authenticated=True, user=user),
             status=status.HTTP_200_OK,
@@ -133,6 +141,7 @@ class AdminSessionMeView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
+        _ensure_csrf_cookie(request)
         return Response(
             _build_session_payload(authenticated=True, user=user),
             status=status.HTTP_200_OK,
