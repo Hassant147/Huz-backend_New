@@ -11,6 +11,7 @@ from rest_framework import serializers, status
 from rest_framework.test import APIRequestFactory, APITestCase
 
 from .models import MailingDetail, UserBankAccount, UserOTP, UserProfile, UserTransactionHistory, Wallet
+from .checks import production_origin_contract_check
 from .phone_utils import resolve_phone_identity
 from .serializers import UserProfileSerializer
 from .utility import _send_email
@@ -49,6 +50,60 @@ class PhoneIdentityTests(SimpleTestCase):
                 country_iso_code="US",
                 local_phone_number="5062345678",
             )
+
+
+class ProductionOriginContractCheckTests(SimpleTestCase):
+    def _base_settings(self):
+        return {
+            "IS_PRODUCTION": True,
+            "CORS_ALLOW_ALL_ORIGINS": False,
+            "ALLOW_LOCALHOST_ORIGINS": False,
+            "ALLOWED_HOSTS": ["hajjumrah.org", "www.hajjumrah.org"],
+            "CORS_ALLOWED_ORIGINS": [
+                "https://hajjumrah.co",
+                "https://operator.hajjumrah.co",
+                "https://huzadmin.hajjumrah.co",
+            ],
+            "CSRF_TRUSTED_ORIGINS": [
+                "https://hajjumrah.org",
+                "https://www.hajjumrah.org",
+                "https://hajjumrah.co",
+                "https://operator.hajjumrah.co",
+                "https://huzadmin.hajjumrah.co",
+            ],
+            "API_PUBLIC_ORIGIN": "https://hajjumrah.org",
+            "WEB_APP_ORIGIN": "https://hajjumrah.co",
+            "OPERATOR_APP_ORIGIN": "https://operator.hajjumrah.co",
+            "ADMIN_APP_ORIGIN": "https://huzadmin.hajjumrah.co",
+            "OPERATOR_PANEL_BASE_URL": "https://operator.hajjumrah.co",
+            "CORS_ALLOW_CREDENTIALS": True,
+            "SESSION_COOKIE_SAMESITE": "None",
+            "CSRF_COOKIE_SAMESITE": "None",
+            "SESSION_COOKIE_SECURE": True,
+            "CSRF_COOKIE_SECURE": True,
+        }
+
+    def test_cross_site_admin_origin_requires_credentialed_and_secure_cookie_settings(self):
+        insecure_settings = {
+            **self._base_settings(),
+            "CORS_ALLOW_CREDENTIALS": False,
+            "SESSION_COOKIE_SAMESITE": "Lax",
+            "CSRF_COOKIE_SAMESITE": "Lax",
+            "SESSION_COOKIE_SECURE": False,
+            "CSRF_COOKIE_SECURE": False,
+        }
+
+        with override_settings(**insecure_settings):
+            errors = production_origin_contract_check(None)
+
+        error_ids = {error.id for error in errors}
+        self.assertTrue({"common.E012", "common.E013", "common.E014", "common.E015"}.issubset(error_ids))
+
+    def test_cross_site_admin_origin_passes_when_credential_settings_are_explicit(self):
+        with override_settings(**self._base_settings()):
+            errors = production_origin_contract_check(None)
+
+        self.assertEqual(errors, [])
 
 
 class SendOTPSMSAPIViewThrottleTests(APITestCase):

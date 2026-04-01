@@ -28,6 +28,27 @@ def _hostname(value):
     return (parsed.hostname or "").lower()
 
 
+def _site_key(value):
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return ""
+
+    if host in LOCAL_HOSTS:
+        registrable_host = host
+    else:
+        labels = [label for label in host.split(".") if label]
+        # Best-effort registrable-domain normalization for deployment checks.
+        registrable_host = ".".join(labels[-2:]) if len(labels) >= 2 else host
+
+    scheme = (parsed.scheme or "https").lower()
+    return f"{scheme}://{registrable_host}"
+
+
 def _is_local_target(value):
     host = _hostname(value)
     return host in LOCAL_HOSTS or host.endswith(".localhost")
@@ -212,5 +233,59 @@ def production_origin_contract_check(app_configs, **kwargs):
                 id="common.E011",
             )
         )
+
+    admin_origin = _origin_key(getattr(settings, "ADMIN_APP_ORIGIN", ""))
+    if admin_origin and api_origin and admin_origin != api_origin and not getattr(settings, "CORS_ALLOW_CREDENTIALS", False):
+        errors.append(
+            Error(
+                "Admin frontend is cross-origin to the API but CORS_ALLOW_CREDENTIALS is disabled.",
+                hint=(
+                    "Set CORS_ALLOW_CREDENTIALS=True for deployed admin auth. "
+                    "The admin frontend uses credentialed browser requests against "
+                    "the API origin."
+                ),
+                id="common.E012",
+            )
+        )
+
+    if admin_origin and api_origin and _site_key(admin_origin) != _site_key(api_origin):
+        session_cookie_samesite = str(getattr(settings, "SESSION_COOKIE_SAMESITE", "")).strip().lower()
+        csrf_cookie_samesite = str(getattr(settings, "CSRF_COOKIE_SAMESITE", "")).strip().lower()
+
+        if session_cookie_samesite != "none":
+            errors.append(
+                Error(
+                    "Cross-site admin deployment requires SESSION_COOKIE_SAMESITE=None.",
+                    hint=(
+                        "The deployed admin origin and API origin are on different "
+                        "sites, so session cookies must use SameSite=None."
+                    ),
+                    id="common.E013",
+                )
+            )
+
+        if csrf_cookie_samesite != "none":
+            errors.append(
+                Error(
+                    "Cross-site admin deployment requires CSRF_COOKIE_SAMESITE=None.",
+                    hint=(
+                        "The deployed admin origin and API origin are on different "
+                        "sites, so the CSRF cookie must use SameSite=None."
+                    ),
+                    id="common.E014",
+                )
+            )
+
+        if not getattr(settings, "SESSION_COOKIE_SECURE", False) or not getattr(settings, "CSRF_COOKIE_SECURE", False):
+            errors.append(
+                Error(
+                    "Cross-site admin deployment requires secure session and CSRF cookies.",
+                    hint=(
+                        "Set SESSION_COOKIE_SECURE=True and CSRF_COOKIE_SECURE=True "
+                        "when the admin frontend is deployed on a different site."
+                    ),
+                    id="common.E015",
+                )
+            )
 
     return errors
