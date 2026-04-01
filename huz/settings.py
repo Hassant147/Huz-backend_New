@@ -25,6 +25,30 @@ def csv_config(name, default=""):
     return [str(value).strip() for value in values if str(value).strip()]
 
 
+LOCAL_ALLOWED_HOSTS = [
+    "127.0.0.1",
+    "localhost",
+    ".ngrok-free.app",
+    ".ngrok.io",
+]
+
+LOCAL_BROWSER_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
+    "http://localhost:3002",
+    "http://127.0.0.1:3002",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
+LOCAL_BROWSER_ORIGIN_REGEXES = [
+    r"^https://[a-z0-9-]+\.ngrok-free\.app$",
+    r"^https://[a-z0-9-]+\.ngrok\.io$",
+]
+
+
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.0/howto/deployment/checklist/
 
@@ -44,6 +68,23 @@ DEBUG = False
 # DEBUG = True
 ENABLE_API_DOCS = config('ENABLE_API_DOCS', cast=bool, default=False)
 IS_RUNSERVER = len(sys.argv) > 1 and sys.argv[1].startswith("runserver")
+APP_ENV = config("APP_ENV", default="development").strip().lower()
+IS_PRODUCTION = APP_ENV == "production"
+ALLOW_LOCALHOST_ORIGINS = config(
+    "ALLOW_LOCALHOST_ORIGINS",
+    cast=bool,
+    default=not IS_PRODUCTION,
+)
+
+# These origin env vars are the reviewed deployment contract for the deployed
+# web, operator, and admin browser clients. They make the intended production
+# topology visible even when Django still uses the explicit host/CORS/CSRF
+# lists below.
+API_PUBLIC_ORIGIN = config("API_PUBLIC_ORIGIN", default="").strip().rstrip("/")
+WEB_APP_ORIGIN = config("WEB_APP_ORIGIN", default="").strip().rstrip("/")
+OPERATOR_APP_ORIGIN = config("OPERATOR_APP_ORIGIN", default="").strip().rstrip("/")
+ADMIN_APP_ORIGIN = config("ADMIN_APP_ORIGIN", default="").strip().rstrip("/")
+
 SERVE_MEDIA_AND_STATIC_FROM_DJANGO = config(
     'SERVE_MEDIA_AND_STATIC_FROM_DJANGO',
     cast=bool,
@@ -52,15 +93,7 @@ SERVE_MEDIA_AND_STATIC_FROM_DJANGO = config(
 
 ALLOWED_HOSTS = csv_config(
     'ALLOWED_HOSTS',
-    default=(
-        'hajjumrah.org,'
-        'www.hajjumrah.org,'
-        '165.232.160.29,'
-        '127.0.0.1,'
-        'localhost,'
-        '.ngrok-free.app,'
-        '.ngrok.io'
-    ),
+    default=",".join(LOCAL_ALLOWED_HOSTS),
 )
 
 
@@ -120,31 +153,19 @@ MIDDLEWARE = [
 ]
 
 CORS_ALLOW_ALL_ORIGINS = config('CORS_ALLOW_ALL_ORIGINS', cast=bool, default=False)
+CORS_ALLOW_CREDENTIALS = config('CORS_ALLOW_CREDENTIALS', cast=bool, default=False)
 CORS_ALLOWED_ORIGINS = csv_config(
     'CORS_ALLOWED_ORIGINS',
-    default=(
-        'https://hajjumrah.co,'
-        'https://hajjumrah.org,'
-        'https://www.hajjumrah.co,'
-        'http://hajjumrah.org,'
-        'http://localhost:3000,'
-        'http://127.0.0.1:3000,'
-        'http://localhost:3001,'
-        'http://127.0.0.1:3001,'
-        'http://localhost:3002,'
-        'http://127.0.0.1:3002,'
-        'http://localhost:5173,'
-        'http://127.0.0.1:5173'
-    ),
+    default=",".join(LOCAL_BROWSER_ORIGINS if ALLOW_LOCALHOST_ORIGINS else []),
 )
 CORS_ALLOWED_ORIGIN_REGEXES = csv_config(
     'CORS_ALLOWED_ORIGIN_REGEXES',
-    default=(
-        r'^https://[a-z0-9-]+\.ngrok-free\.app$,'
-        r'^https://[a-z0-9-]+\.ngrok\.io$'
-    ),
+    default=",".join(LOCAL_BROWSER_ORIGIN_REGEXES if ALLOW_LOCALHOST_ORIGINS else []),
 )
-CSRF_TRUSTED_ORIGINS = csv_config('CSRF_TRUSTED_ORIGINS', default="")
+CSRF_TRUSTED_ORIGINS = csv_config(
+    'CSRF_TRUSTED_ORIGINS',
+    default=",".join(LOCAL_BROWSER_ORIGINS if ALLOW_LOCALHOST_ORIGINS else []),
+)
 extra_cors_allow_headers = csv_config("CORS_ALLOW_HEADERS", default="")
 CORS_ALLOW_HEADERS = list(
     dict.fromkeys(
@@ -213,6 +234,8 @@ USE_X_FORWARDED_HOST = config('USE_X_FORWARDED_HOST', cast=bool, default=True)
 SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', cast=bool, default=False)
 SESSION_COOKIE_SECURE = config('SESSION_COOKIE_SECURE', cast=bool, default=False)
 CSRF_COOKIE_SECURE = config('CSRF_COOKIE_SECURE', cast=bool, default=False)
+SESSION_COOKIE_SAMESITE = config('SESSION_COOKIE_SAMESITE', default='Lax')
+CSRF_COOKIE_SAMESITE = config('CSRF_COOKIE_SAMESITE', default='Lax')
 SECURE_HSTS_SECONDS = config('SECURE_HSTS_SECONDS', cast=int, default=0)
 SECURE_HSTS_INCLUDE_SUBDOMAINS = config('SECURE_HSTS_INCLUDE_SUBDOMAINS', cast=bool, default=False)
 SECURE_HSTS_PRELOAD = config('SECURE_HSTS_PRELOAD', cast=bool, default=False)
@@ -289,7 +312,10 @@ EMAIL_LOCAL_HOSTNAME = config('EMAIL_LOCAL_HOSTNAME', default='').strip()
 EMAIL_SEND_TIMEOUT_SECONDS = config('EMAIL_SEND_TIMEOUT_SECONDS', cast=int, default=20)
 EMAIL_OTP_EXPIRY_MINUTES = config('EMAIL_OTP_EXPIRY_MINUTES', cast=int, default=5)
 PASSWORD_RESET_EXPIRY_MINUTES = config('PASSWORD_RESET_EXPIRY_MINUTES', cast=int, default=60)
-OPERATOR_PANEL_BASE_URL = config('OPERATOR_PANEL_BASE_URL', default='http://localhost:3000')
+OPERATOR_PANEL_BASE_URL = config(
+    'OPERATOR_PANEL_BASE_URL',
+    default=(OPERATOR_APP_ORIGIN or 'http://localhost:3000'),
+).strip().rstrip("/")
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.0/ref/settings/#default-auto-field

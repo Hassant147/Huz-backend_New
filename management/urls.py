@@ -1,9 +1,12 @@
 from django.urls import path
 
-from . import approval_task
+from . import approval_task, auth_views
 
 
 urlpatterns = [
+    path('auth/login/', auth_views.AdminLoginView.as_view()),
+    path('auth/logout/', auth_views.AdminLogoutView.as_view()),
+    path('auth/me/', auth_views.AdminSessionMeView.as_view()),
     path('approved_or_reject_company/', approval_task.ApprovedORRejectCompanyView.as_view()),
     path('fetch_all_pending_companies/', approval_task.GetAllPendingApprovalsView.as_view()),
     path('fetch_all_sale_directors/', approval_task.GetAllSaleDirectorsView.as_view()),
