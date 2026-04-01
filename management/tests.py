@@ -37,6 +37,7 @@ class AdminAuthSessionApiTests(APITestCase):
         self.assertEqual(response.data.get("authenticated"), True)
         self.assertIn("csrftoken", response.cookies)
         self.assertTrue(response.cookies["csrftoken"].value)
+        self.assertTrue(response.data.get("csrf_token"))
         self.assertEqual(
             response.data.get("user"),
             {
@@ -51,6 +52,7 @@ class AdminAuthSessionApiTests(APITestCase):
         bootstrap_response = self.client.get("/management/auth/me/")
         self.assertEqual(bootstrap_response.status_code, status.HTTP_200_OK)
         self.assertEqual(bootstrap_response.data.get("authenticated"), True)
+        self.assertTrue(bootstrap_response.data.get("csrf_token"))
         self.assertEqual(
             bootstrap_response.data.get("user", {}).get("username"),
             self.staff_user.username,
@@ -64,6 +66,7 @@ class AdminAuthSessionApiTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn("csrftoken", response.cookies)
         self.assertTrue(response.cookies["csrftoken"].value)
+        self.assertTrue(response.data.get("csrf_token"))
 
     def test_admin_login_rejects_invalid_credentials(self):
         response = self.client.post(

@@ -27,3 +27,4 @@ class AdminSessionEnvelopeSerializer(serializers.Serializer):
     authenticated = serializers.BooleanField()
     user = AdminSessionUserSerializer(allow_null=True)
     message = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    csrf_token = serializers.CharField(required=False, allow_blank=True, allow_null=True)

@@ -15,20 +15,23 @@ from .serializers import (
 from .authentication import ManagementSessionAuthentication
 
 
-def _build_session_payload(*, user=None, authenticated=False, message=None):
+def _build_session_payload(*, user=None, authenticated=False, message=None, csrf_token=None):
     payload = {
         "authenticated": authenticated,
         "user": AdminSessionUserSerializer(user).data if user is not None else None,
     }
     if message is not None:
         payload["message"] = message
+    if csrf_token is not None:
+        payload["csrf_token"] = csrf_token
     return payload
 
 
-def _ensure_csrf_cookie(request):
+def _issue_csrf_token(request):
     raw_request = getattr(request, "_request", None)
     if raw_request is not None:
-        get_token(raw_request)
+        return get_token(raw_request)
+    return None
 
 
 class AdminLoginView(APIView):
@@ -76,9 +79,9 @@ class AdminLoginView(APIView):
             )
 
         django_login(raw_request, user)
-        _ensure_csrf_cookie(request)
+        csrf_token = _issue_csrf_token(request)
         return Response(
-            _build_session_payload(authenticated=True, user=user),
+            _build_session_payload(authenticated=True, user=user, csrf_token=csrf_token),
             status=status.HTTP_200_OK,
         )
 
@@ -141,8 +144,8 @@ class AdminSessionMeView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        _ensure_csrf_cookie(request)
+        csrf_token = _issue_csrf_token(request)
         return Response(
-            _build_session_payload(authenticated=True, user=user),
+            _build_session_payload(authenticated=True, user=user, csrf_token=csrf_token),
             status=status.HTTP_200_OK,
         )
