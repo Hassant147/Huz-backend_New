@@ -16,6 +16,13 @@ class IsAdminOrAuthenticatedUserProfile(BasePermission):
         return get_authenticated_user_profile(request) is not None
 
 
+class IsAuthenticatedPartnerProfile(BasePermission):
+    message = "Authentication credentials were not provided."
+
+    def has_permission(self, request, view):
+        return get_authenticated_partner_profile(request) is not None
+
+
 class IsAdminOrAuthenticatedPartnerProfile(BasePermission):
     message = "Authentication credentials were not provided."
 

@@ -81,6 +81,7 @@ from .statuses import (
     PAYMENT_STATUS_UNDER_REVIEW,
     WORKFLOW_BUCKET_HISTORY,
     WORKFLOW_BUCKET_ISSUES,
+    WORKFLOW_BUCKET_REPORTED,
     WORKFLOW_BUCKET_VIEW_ONLY,
 )
 from .workflow import (
@@ -208,6 +209,9 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
     def _authenticated_request(self, request):
         force_authenticate(request, user=self.admin_user)
         return request
+
+    def _partner_auth_headers(self, partner):
+        return {"HTTP_AUTHORIZATION": f"Bearer {partner.partner_session_token}"}
 
     def _build_traveler_breakdown(self, travelers):
         return [
@@ -2600,6 +2604,9 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         force_authenticate(request, user=self.admin_user)
         return request
 
+    def _partner_auth_headers(self, partner):
+        return {"HTTP_AUTHORIZATION": f"Bearer {partner.partner_session_token}"}
+
     def _request_package_reviews(self, **query_params):
         request = self._authenticated_request(
             self.factory.get(
@@ -2702,6 +2709,23 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
                 "is_hotel_completed": True,
                 "is_transport_completed": True,
             },
+        )
+        sync_booking_state(booking, save=True)
+        booking.refresh_from_db()
+        return booking
+
+    def _report_open_traveler_issue(self, booking):
+        traveler = PassportValidity.objects.filter(
+            passport_for_booking_number=booking,
+        ).order_by("pk").first()
+        if traveler is None:
+            raise AssertionError("Booking must have at least one traveler before reporting an issue.")
+
+        TravelerIssue.objects.create(
+            booking=booking,
+            traveler=traveler,
+            status=TravelerIssue.STATUS_OPEN,
+            created_by=booking.order_to,
         )
         sync_booking_state(booking, save=True)
         booking.refresh_from_db()
@@ -2813,6 +2837,96 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertEqual(
             response.data.get("results")[0].get("booking_number"),
             matching_booking.booking_number,
+        )
+
+    def test_booking_list_issues_bucket_includes_reported_and_operator_objection_bookings(self):
+        reported_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-ISSUES-REPORTED-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(reported_booking)
+        self._report_open_traveler_issue(reported_booking)
+
+        objection_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-ISSUES-OBJECTION-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(objection_booking)
+        objection_booking.issue_status = ISSUE_STATUS_OPERATOR_OBJECTION
+        objection_booking.save(update_fields=["issue_status"])
+        sync_booking_state(objection_booking, save=True)
+        objection_booking.refresh_from_db()
+
+        request = self._authenticated_request(
+            self.factory.get(
+                "/bookings/get_all_booking_detail_for_partner/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "workflow_bucket": WORKFLOW_BUCKET_ISSUES,
+                    "page": 1,
+                    "page_size": 10,
+                },
+            )
+        )
+
+        response = GetBookingShortDetailForPartnersView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 2)
+        self.assertEqual(
+            {
+                result.get("booking_number")
+                for result in response.data.get("results", [])
+            },
+            {
+                reported_booking.booking_number,
+                objection_booking.booking_number,
+            },
+        )
+
+    def test_booking_list_reported_bucket_alias_returns_only_reported_issue_bookings(self):
+        reported_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-REPORTED-ALIAS-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(reported_booking)
+        self._report_open_traveler_issue(reported_booking)
+
+        objection_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-REPORTED-ALIAS-002",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(objection_booking)
+        objection_booking.issue_status = ISSUE_STATUS_OPERATOR_OBJECTION
+        objection_booking.save(update_fields=["issue_status"])
+        sync_booking_state(objection_booking, save=True)
+        objection_booking.refresh_from_db()
+
+        request = self._authenticated_request(
+            self.factory.get(
+                "/bookings/get_all_booking_detail_for_partner/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "workflow_bucket": WORKFLOW_BUCKET_REPORTED,
+                    "page": 1,
+                    "page_size": 10,
+                },
+            )
+        )
+
+        response = GetBookingShortDetailForPartnersView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 1)
+        self.assertEqual(
+            response.data.get("results")[0].get("booking_number"),
+            reported_booking.booking_number,
         )
 
     def test_booking_list_raw_status_filter_hides_non_visible_hold_bookings_for_partner(self):
@@ -3117,6 +3231,555 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         )
 
         self.assertTrue(booking_hotel_fulfillments_are_complete(booking))
+
+    @patch("booking.manage_partner_booking.send_objection_email")
+    def test_covered_booking_mutations_reject_unauthenticated_legacy_partner_tokens(
+        self,
+        mocked_send_objection,
+    ):
+        action_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-ACTION-LEGACY-401-001",
+            booking_status=BOOKING_STATUS_READY_FOR_OPERATOR,
+        )
+        self._mark_ready_for_operator(action_booking)
+
+        mutable_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-MUTATION-LEGACY-401-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(mutable_booking)
+
+        action_response = self.client.put(
+            "/bookings/partner_action_for_booking/",
+            {
+                "partner_session_token": self.partner_a.partner_session_token,
+                "booking_number": action_booking.booking_number,
+                "partner_remarks": "Legacy token only.",
+                "booking_status": "IN_FULFILLMENT",
+            },
+            format="json",
+        )
+        self.assertEqual(action_response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        upload_response = self.client.post(
+            "/bookings/manage_booking_documents/",
+            {
+                "partner_session_token": self.partner_a.partner_session_token,
+                "booking_number": mutable_booking.booking_number,
+                "document_for": "eVisa",
+                "document_link": SimpleUploadedFile(
+                    "legacy-visa.pdf",
+                    b"%PDF-1.4 legacy visa",
+                    content_type="application/pdf",
+                ),
+            },
+            format="multipart",
+        )
+        self.assertEqual(upload_response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        delete_response = self.client.delete(
+            "/bookings/delete_booking_documents/",
+            {
+                "partner_session_token": self.partner_a.partner_session_token,
+                "booking_number": mutable_booking.booking_number,
+                "document_id": str(uuid4()),
+            },
+            format="json",
+        )
+        self.assertEqual(delete_response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        airline_post_response = self.client.post(
+            "/bookings/manage_booking_airline_details/",
+            {
+                "partner_session_token": self.partner_a.partner_session_token,
+                "booking_number": mutable_booking.booking_number,
+                "flight_direction": "outbound",
+                "flight_date": timezone.now().isoformat(),
+                "flight_time": "10:00:00",
+                "flight_from": "Karachi",
+                "flight_to": "Jeddah",
+            },
+            format="json",
+        )
+        self.assertEqual(
+            airline_post_response.status_code,
+            status.HTTP_401_UNAUTHORIZED,
+        )
+
+        airline_put_response = self.client.put(
+            "/bookings/manage_booking_airline_details/",
+            {
+                "partner_session_token": self.partner_a.partner_session_token,
+                "booking_airline_id": str(uuid4()),
+                "booking_number": mutable_booking.booking_number,
+                "flight_direction": "outbound",
+                "flight_date": timezone.now().isoformat(),
+                "flight_time": "10:00:00",
+                "flight_from": "Karachi",
+                "flight_to": "Jeddah",
+            },
+            format="json",
+        )
+        self.assertEqual(
+            airline_put_response.status_code,
+            status.HTTP_401_UNAUTHORIZED,
+        )
+
+        arrangement_post_response = self.client.post(
+            "/bookings/manage_booking_hotel_or_transport_details/",
+            {
+                "partner_session_token": self.partner_a.partner_session_token,
+                "booking_number": mutable_booking.booking_number,
+                "detail_for": "Transport",
+                "transport_mode": "details_only",
+                "transport_name": "Legacy Coaster",
+                "transport_type": "Shared",
+                "route_summary": "Karachi -> Jeddah",
+            },
+            format="json",
+        )
+        self.assertEqual(
+            arrangement_post_response.status_code,
+            status.HTTP_401_UNAUTHORIZED,
+        )
+
+        arrangement_put_response = self.client.put(
+            "/bookings/manage_booking_hotel_or_transport_details/",
+            {
+                "partner_session_token": self.partner_a.partner_session_token,
+                "booking_number": mutable_booking.booking_number,
+                "detail_for": "Transport",
+                "transport_mode": "details_only",
+                "transport_name": "Legacy Coaster",
+                "transport_type": "Shared",
+                "route_summary": "Karachi -> Jeddah",
+            },
+            format="json",
+        )
+        self.assertEqual(
+            arrangement_put_response.status_code,
+            status.HTTP_401_UNAUTHORIZED,
+        )
+
+        mocked_send_objection.assert_not_called()
+
+    @patch("booking.manage_partner_booking.send_objection_email")
+    def test_covered_booking_mutations_scope_bearer_partner_to_authenticated_principal(
+        self,
+        mocked_send_objection,
+    ):
+        action_booking = self._create_booking(
+            partner=self.partner_b,
+            package=self.package_b,
+            booking_number="BK-ACTION-SCOPE-001",
+            booking_status=BOOKING_STATUS_READY_FOR_OPERATOR,
+        )
+        self._mark_ready_for_operator(action_booking)
+
+        document_booking = self._create_booking(
+            partner=self.partner_b,
+            package=self.package_b,
+            booking_number="BK-DOC-SCOPE-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(document_booking)
+        existing_document = BookingDocuments.objects.create(
+            document_link=SimpleUploadedFile(
+                "existing-visa.pdf",
+                b"%PDF-1.4 existing visa",
+                content_type="application/pdf",
+            ),
+            document_for_booking_token=document_booking,
+            document_for="eVisa",
+            document_category="eVisa",
+        )
+
+        airline_post_booking = self._create_booking(
+            partner=self.partner_b,
+            package=self.package_b,
+            booking_number="BK-AIRLINE-POST-SCOPE-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(airline_post_booking)
+
+        airline_put_booking = self._create_booking(
+            partner=self.partner_b,
+            package=self.package_b,
+            booking_number="BK-AIRLINE-PUT-SCOPE-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(airline_put_booking)
+        existing_airline = BookingAirlineDetail.objects.create(
+            flight_date=timezone.now(),
+            flight_time="10:00:00",
+            flight_from="Lahore",
+            flight_to="Jeddah",
+            airline_for_booking=airline_put_booking,
+        )
+
+        arrangement_post_booking = self._create_booking(
+            partner=self.partner_b,
+            package=self.package_b,
+            booking_number="BK-ARRANGEMENT-POST-SCOPE-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(arrangement_post_booking)
+
+        arrangement_put_booking = self._create_booking(
+            partner=self.partner_b,
+            package=self.package_b,
+            booking_number="BK-ARRANGEMENT-PUT-SCOPE-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(arrangement_put_booking)
+        existing_transport = BookingTransportFulfillment.objects.create(
+            transport_for_booking=arrangement_put_booking,
+            transport_mode="details_only",
+            transport_name="Scoped Bus",
+            transport_type="Shared",
+            route_summary="Lahore -> Jeddah",
+        )
+
+        action_response = self.client.put(
+            "/bookings/partner_action_for_booking/",
+            {
+                "partner_session_token": self.partner_b.partner_session_token,
+                "booking_number": action_booking.booking_number,
+                "partner_remarks": "Attempted cross-partner action.",
+                "booking_status": "IN_FULFILLMENT",
+            },
+            format="json",
+            **self._partner_auth_headers(self.partner_a),
+        )
+        self.assertEqual(action_response.status_code, status.HTTP_404_NOT_FOUND)
+        action_booking.refresh_from_db()
+        self.assertEqual(action_booking.booking_status, BOOKING_STATUS_READY_FOR_OPERATOR)
+
+        upload_response = self.client.post(
+            "/bookings/manage_booking_documents/",
+            {
+                "partner_session_token": self.partner_b.partner_session_token,
+                "booking_number": document_booking.booking_number,
+                "document_for": "eVisa",
+                "document_link": SimpleUploadedFile(
+                    "scope-visa.pdf",
+                    b"%PDF-1.4 scope visa",
+                    content_type="application/pdf",
+                ),
+            },
+            format="multipart",
+            **self._partner_auth_headers(self.partner_a),
+        )
+        self.assertEqual(upload_response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(
+            BookingDocuments.objects.filter(
+                document_for_booking_token=document_booking,
+            ).count(),
+            1,
+        )
+
+        delete_response = self.client.delete(
+            "/bookings/delete_booking_documents/",
+            {
+                "partner_session_token": self.partner_b.partner_session_token,
+                "booking_number": document_booking.booking_number,
+                "document_id": str(existing_document.document_id),
+            },
+            format="json",
+            **self._partner_auth_headers(self.partner_a),
+        )
+        self.assertEqual(delete_response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertTrue(
+            BookingDocuments.objects.filter(
+                document_id=existing_document.document_id,
+            ).exists()
+        )
+
+        airline_post_response = self.client.post(
+            "/bookings/manage_booking_airline_details/",
+            {
+                "partner_session_token": self.partner_b.partner_session_token,
+                "booking_number": airline_post_booking.booking_number,
+                "flight_direction": "outbound",
+                "flight_date": timezone.now().isoformat(),
+                "flight_time": "10:00:00",
+                "flight_from": "Karachi",
+                "flight_to": "Jeddah",
+            },
+            format="json",
+            **self._partner_auth_headers(self.partner_a),
+        )
+        self.assertEqual(airline_post_response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertFalse(
+            BookingAirlineDetail.objects.filter(
+                airline_for_booking=airline_post_booking,
+            ).exists()
+        )
+
+        airline_put_response = self.client.put(
+            "/bookings/manage_booking_airline_details/",
+            {
+                "partner_session_token": self.partner_b.partner_session_token,
+                "booking_airline_id": str(existing_airline.booking_airline_id),
+                "booking_number": airline_put_booking.booking_number,
+                "flight_direction": "outbound",
+                "flight_date": timezone.now().isoformat(),
+                "flight_time": "15:30:00",
+                "flight_from": "Karachi",
+                "flight_to": "Madinah",
+            },
+            format="json",
+            **self._partner_auth_headers(self.partner_a),
+        )
+        self.assertEqual(airline_put_response.status_code, status.HTTP_404_NOT_FOUND)
+        existing_airline.refresh_from_db()
+        self.assertEqual(existing_airline.flight_from, "Lahore")
+        self.assertEqual(existing_airline.flight_to, "Jeddah")
+
+        arrangement_post_response = self.client.post(
+            "/bookings/manage_booking_hotel_or_transport_details/",
+            {
+                "partner_session_token": self.partner_b.partner_session_token,
+                "booking_number": arrangement_post_booking.booking_number,
+                "detail_for": "Transport",
+                "transport_mode": "details_only",
+                "transport_name": "Scoped Coaster",
+                "transport_type": "Shared",
+                "route_summary": "Karachi -> Jeddah",
+            },
+            format="json",
+            **self._partner_auth_headers(self.partner_a),
+        )
+        self.assertEqual(
+            arrangement_post_response.status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+        self.assertFalse(
+            BookingTransportFulfillment.objects.filter(
+                transport_for_booking=arrangement_post_booking,
+            ).exists()
+        )
+
+        arrangement_put_response = self.client.put(
+            "/bookings/manage_booking_hotel_or_transport_details/",
+            {
+                "partner_session_token": self.partner_b.partner_session_token,
+                "booking_number": arrangement_put_booking.booking_number,
+                "detail_for": "Transport",
+                "transport_mode": "details_only",
+                "transport_name": "Scoped Coaster",
+                "transport_type": "Shared",
+                "route_summary": "Karachi -> Jeddah",
+            },
+            format="json",
+            **self._partner_auth_headers(self.partner_a),
+        )
+        self.assertEqual(
+            arrangement_put_response.status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+        existing_transport.refresh_from_db()
+        self.assertEqual(existing_transport.transport_name, "Scoped Bus")
+        self.assertEqual(existing_transport.route_summary, "Lahore -> Jeddah")
+
+        mocked_send_objection.assert_not_called()
+
+    @patch("booking.manage_partner_booking.send_objection_email")
+    def test_take_action_accepts_partner_bearer_auth_without_body_token(
+        self,
+        mocked_send_objection,
+    ):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-ACTION-HEADER-001",
+            booking_status=BOOKING_STATUS_READY_FOR_OPERATOR,
+        )
+        self._mark_ready_for_operator(booking)
+
+        response = self.client.put(
+            "/bookings/partner_action_for_booking/",
+            {
+                "booking_number": booking.booking_number,
+                "partner_remarks": "Proceed with fulfillment",
+                "booking_status": "IN_FULFILLMENT",
+            },
+            format="json",
+            **self._partner_auth_headers(self.partner_a),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        mocked_send_objection.assert_not_called()
+        booking.refresh_from_db()
+        self.assertEqual(booking.booking_status, BOOKING_STATUS_IN_FULFILLMENT)
+
+    def test_manage_booking_documents_and_delete_accept_partner_bearer_auth_without_body_token(
+        self,
+    ):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-DOC-HEADER-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(booking)
+
+        upload_response = self.client.post(
+            "/bookings/manage_booking_documents/",
+            {
+                "booking_number": booking.booking_number,
+                "document_for": "eVisa",
+                "document_link": SimpleUploadedFile(
+                    "visa.pdf",
+                    b"%PDF-1.4 visa",
+                    content_type="application/pdf",
+                ),
+            },
+            format="multipart",
+            **self._partner_auth_headers(self.partner_a),
+        )
+
+        self.assertEqual(upload_response.status_code, status.HTTP_201_CREATED)
+        document = BookingDocuments.objects.filter(
+            document_for_booking_token=booking,
+            document_for="eVisa",
+        ).first()
+        self.assertIsNotNone(document)
+
+        delete_response = self.client.delete(
+            "/bookings/delete_booking_documents/",
+            {
+                "booking_number": booking.booking_number,
+                "document_id": str(document.document_id),
+            },
+            format="json",
+            **self._partner_auth_headers(self.partner_a),
+        )
+
+        self.assertEqual(delete_response.status_code, status.HTTP_200_OK)
+        self.assertFalse(
+            BookingDocuments.objects.filter(document_id=document.document_id).exists()
+        )
+
+    def test_airline_post_accepts_partner_bearer_auth_without_body_token(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-AIRLINE-HEADER-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(booking)
+
+        response = self.client.post(
+            "/bookings/manage_booking_airline_details/",
+            {
+                "booking_number": booking.booking_number,
+                "flight_direction": "outbound",
+                "flight_date": timezone.now().isoformat(),
+                "flight_time": "10:00:00",
+                "flight_from": "Karachi",
+                "flight_to": "Jeddah",
+            },
+            format="json",
+            **self._partner_auth_headers(self.partner_a),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            BookingAirlineDetail.objects.filter(
+                airline_for_booking=booking,
+                flight_direction="outbound",
+            ).exists()
+        )
+
+    def test_transport_post_accepts_partner_bearer_auth_without_body_token(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-TRANSPORT-HEADER-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(booking)
+
+        response = self.client.post(
+            "/bookings/manage_booking_hotel_or_transport_details/",
+            {
+                "booking_number": booking.booking_number,
+                "detail_for": "Transport",
+                "transport_mode": "details_only",
+                "transport_name": "Coaster",
+                "transport_type": "Shared",
+                "route_summary": "Jeddah -> Makkah",
+                "contact_name": "Transport desk",
+            },
+            format="json",
+            **self._partner_auth_headers(self.partner_a),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            BookingTransportFulfillment.objects.filter(
+                transport_for_booking=booking
+            ).exists()
+        )
+
+    def test_close_booking_accepts_partner_bearer_auth_without_body_token(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-CLOSE-HEADER-001",
+            booking_status=BOOKING_STATUS_READY_FOR_TRAVEL,
+        )
+        self._mark_ready_for_travel(booking)
+
+        response = self.client.put(
+            "/bookings/update_booking_status_into_close/",
+            {
+                "booking_number": booking.booking_number,
+            },
+            format="json",
+            **self._partner_auth_headers(self.partner_a),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        booking.refresh_from_db()
+        self.assertEqual(booking.booking_status, BOOKING_STATUS_COMPLETED)
+
+    def test_report_booking_accepts_partner_bearer_auth_without_body_token(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-REPORT-HEADER-001",
+            booking_status=BOOKING_STATUS_READY_FOR_TRAVEL,
+        )
+        self._mark_ready_for_travel(booking)
+        passport = PassportValidity.objects.filter(
+            passport_for_booking_number=booking
+        ).first()
+        self.assertIsNotNone(passport)
+
+        response = self.client.put(
+            "/bookings/manage_traveler_issues/",
+            {
+                "booking_number": booking.booking_number,
+                "passport_id": str(passport.passport_id),
+            },
+            format="json",
+            **self._partner_auth_headers(self.partner_a),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(
+            TravelerIssue.objects.filter(
+                booking=booking,
+                traveler=passport,
+                status=TravelerIssue.STATUS_OPEN,
+            ).exists()
+        )
 
     def test_complaints_list_returns_paginated_empty_payload(self):
         request = self._authenticated_request(
@@ -3937,6 +4600,15 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         visible_issue_booking.save(update_fields=["issue_status"])
         sync_booking_state(visible_issue_booking, save=True)
 
+        visible_reported_issue_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-STATS-REPORTED-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(visible_reported_issue_booking)
+        self._report_open_traveler_issue(visible_reported_issue_booking)
+
         request = self._authenticated_request(
             self.factory.get(
                 "/bookings/get_overall_booking_statistics/",
@@ -3953,8 +4625,9 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertIn(WORKFLOW_BUCKET_VIEW_ONLY, response.data)
         self.assertIn(WORKFLOW_BUCKET_ISSUES, response.data)
         self.assertIn(WORKFLOW_BUCKET_HISTORY, response.data)
+        self.assertNotIn(WORKFLOW_BUCKET_REPORTED, response.data)
         self.assertEqual(response.data.get(WORKFLOW_BUCKET_VIEW_ONLY), 1)
-        self.assertEqual(response.data.get(WORKFLOW_BUCKET_ISSUES), 1)
+        self.assertEqual(response.data.get(WORKFLOW_BUCKET_ISSUES), 2)
         self.assertEqual(response.data.get(WORKFLOW_BUCKET_HISTORY), 1)
 
     def test_booking_statistics_uses_bounded_query_count(self):

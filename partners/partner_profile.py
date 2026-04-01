@@ -10,6 +10,9 @@ import threading
 from common.logs_file import logger
 from common.utility import generate_token, random_six_digits, send_verification_email, hash_password, check_password, validate_required_fields, check_photo_format_and_size, check_file_format_and_size, save_file_in_directory, delete_file_from_directory
 from common.user_profile import OTPDeliveryError, get_sms_gateway_api_key, send_sms_gateway_request
+from common.authentication import SessionTokenHeaderAuthentication
+from common.auth_utils import require_partner_profile
+from common.permissions import IsAuthenticatedPartnerProfile
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from datetime import datetime
 from drf_yasg.utils import swagger_auto_schema
@@ -129,6 +132,27 @@ def dispatch_partner_verification_email(email, name, otp, phone_number="", wait_
         daemon=True,
     ).start()
     return True
+
+
+class AuthenticatedPartnerMutationAPIView(APIView):
+    # Covered mutation routes intentionally disable legacy body/query token auth.
+    authentication_classes = [SessionTokenHeaderAuthentication]
+    permission_classes = [IsAuthenticatedPartnerProfile]
+
+    @staticmethod
+    def get_partner(request):
+        return require_partner_profile(request)
+
+    @staticmethod
+    def get_request_data_without_partner_token(request):
+        try:
+            data = request.data.copy()
+        except Exception:
+            data = {}
+
+        if hasattr(data, "pop"):
+            data.pop("partner_session_token", None)
+        return data
 
 
 class PartnerLoginView(APIView):
@@ -579,16 +603,14 @@ class MatchEmailOTPView(APIView):
             return Response({"message": "Failed to verify otp. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class PartnerServicesView(APIView):
-    permission_classes = [AllowAny]
+class PartnerServicesView(AuthenticatedPartnerMutationAPIView):
 
     @swagger_auto_schema(
-        operation_description="Create services for a partner based on the provided session token.",
+        operation_description="Create services for the authenticated partner.",
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
-            required=['partner_session_token', 'is_hajj_service_offer', 'is_umrah_service_offer'],
+            required=['is_hajj_service_offer', 'is_umrah_service_offer'],
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description="Session token of the partner"),
                 'is_hajj_service_offer': openapi.Schema(type=openapi.TYPE_BOOLEAN, description="Hajj service offer"),
                 'is_umrah_service_offer': openapi.Schema(type=openapi.TYPE_BOOLEAN, description="Umrah service offer"),
             }
@@ -603,18 +625,8 @@ class PartnerServicesView(APIView):
         }
     )
     def post(self, request, *args, **kwargs):
-        data = request.data
-        # Validate presence of the session token early
-        partner_session_token = request.data.get('partner_session_token')
-        if not partner_session_token:
-            return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Retrieve the partner profile using the session token
-        user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-
-        # Check if the user exists
-        if not user:
-            return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
+        data = self.get_request_data_without_partner_token(request)
+        user = self.get_partner(request)
 
         # Field Validation
         required_fields = [
@@ -691,8 +703,7 @@ class PartnerServicesView(APIView):
         user.save()
 
 
-class IndividualPartnerView(APIView):
-    permission_classes = [AllowAny]
+class IndividualPartnerView(AuthenticatedPartnerMutationAPIView):
     parser_classes = [MultiPartParser, FormParser]
 
     @swagger_auto_schema(
@@ -703,7 +714,6 @@ class IndividualPartnerView(APIView):
             openapi.Parameter('driving_license_number', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Driving license number of the partner"),
             openapi.Parameter('front_side_photo', openapi.IN_FORM, type=openapi.TYPE_FILE, required=True, description="Front side photo of the driving license"),
             openapi.Parameter('back_side_photo', openapi.IN_FORM, type=openapi.TYPE_FILE, required=True, description="Back side photo of the driving license"),
-            openapi.Parameter('partner_session_token', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Session token of the partner"),
             openapi.Parameter('street_address', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Street address of the partner"),
             openapi.Parameter('address_line2', openapi.IN_FORM, type=openapi.TYPE_STRING, required=False, description="Address line 2 of the partner"),
             openapi.Parameter('city', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="City of the partner"),
@@ -723,12 +733,12 @@ class IndividualPartnerView(APIView):
         }
     )
     def post(self, request, *args, **kwargs):
-        data = request.data
+        data = self.get_request_data_without_partner_token(request)
 
         # Validate required fields
         required_fields = [
             'contact_name', 'contact_number', 'driving_license_number', 'front_side_photo', 'back_side_photo',
-            'partner_session_token', 'street_address', 'city', 'state', 'country', 'postal_code'
+            'street_address', 'city', 'state', 'country', 'postal_code'
         ]
         error_response = validate_required_fields(required_fields, data)
         if error_response:
@@ -747,11 +757,7 @@ class IndividualPartnerView(APIView):
         except serializers.ValidationError as e:
             return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Retrieve partner profile
-        partner_session_token = data.get('partner_session_token')
-        user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-        if not user:
-            return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+        user = self.get_partner(request)
 
         # Check partner type
         if user.partner_type == "NA":
@@ -798,19 +804,17 @@ class IndividualPartnerView(APIView):
             return Response({"message": "An internal server error occurred."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class UpdatePartnerIndividualProfileView(APIView):
-    permission_classes = [AllowAny]
+class UpdatePartnerIndividualProfileView(AuthenticatedPartnerMutationAPIView):
 
     @swagger_auto_schema(
         operation_description="Update the individual partner profile with new details.",
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description="Session token of the partner"),
                 'contact_name': openapi.Schema(type=openapi.TYPE_STRING, description="Contact name of the partner"),
                 'contact_number': openapi.Schema(type=openapi.TYPE_STRING, description="Contact number of the partner"),
             },
-            required=['partner_session_token', 'contact_name', 'contact_number']
+            required=['contact_name', 'contact_number']
         ),
         responses={
             200: openapi.Response("Success: Individual partner profile updated", PartnerProfileSerializer),
@@ -825,14 +829,10 @@ class UpdatePartnerIndividualProfileView(APIView):
         Handle PUT requests to update an individual partner's profile.
         """
         try:
-            data = request.data
-            partner_session_token = request.data.get('partner_session_token')
-            contact_name = request.data.get('contact_name')
-            contact_number = request.data.get('contact_number')
-
-            # Check if partner session token is provided
-            if not partner_session_token:
-                return Response({"message": "Missing partner session token."}, status=status.HTTP_400_BAD_REQUEST)
+            data = self.get_request_data_without_partner_token(request)
+            contact_name = data.get('contact_name')
+            contact_number = data.get('contact_number')
+            user = self.get_partner(request)
 
             # Validate required fields
             required_fields = ['contact_name', 'contact_number']
@@ -846,12 +846,6 @@ class UpdatePartnerIndividualProfileView(APIView):
                 serializer1.validate_phone_number(contact_number)
             except serializers.ValidationError as e:
                 return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
-
-            try:
-                # Fetch user based on the partner session token
-                user = PartnerProfile.objects.get(partner_session_token=partner_session_token)
-            except PartnerProfile.DoesNotExist:
-                return Response({"message": "User not found with the provided partner session token."}, status=status.HTTP_404_NOT_FOUND)
 
             try:
                 # Fetch individual profile associated with the user
@@ -873,8 +867,7 @@ class UpdatePartnerIndividualProfileView(APIView):
             return Response({"message": "An internal server error occurred."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class BusinessPartnerView(APIView):
-    permission_classes = [AllowAny]
+class BusinessPartnerView(AuthenticatedPartnerMutationAPIView):
     parser_classes = [JSONParser, MultiPartParser, FormParser]
 
     @swagger_auto_schema(
@@ -890,7 +883,6 @@ class BusinessPartnerView(APIView):
             openapi.Parameter('company_bio', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Bio of the company"),
             openapi.Parameter('company_logo', openapi.IN_FORM, type=openapi.TYPE_FILE, required=True, description="Logo of the company"),
             openapi.Parameter('license_certificate', openapi.IN_FORM, type=openapi.TYPE_FILE, required=True, description="Certificate of the company"),
-            openapi.Parameter('partner_session_token', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Session token of the partner"),
             openapi.Parameter('street_address', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Street address of the partner"),
             openapi.Parameter('address_line2', openapi.IN_FORM, type=openapi.TYPE_STRING, required=False, description="Address line 2 of the partner"),
             openapi.Parameter('city', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="City of the partner"),
@@ -911,10 +903,10 @@ class BusinessPartnerView(APIView):
         }
     )
     def post(self, request, *args, **kwargs):
-        data = request.data
+        data = self.get_request_data_without_partner_token(request)
         required_fields = ['company_name', 'contact_name', 'contact_number', 'company_website', 'license_type',
                            'license_number', 'total_experience', 'company_bio', 'company_logo', 'license_certificate',
-                           'partner_session_token', 'street_address', 'city', 'state', 'country', 'postal_code', 'user_name']
+                           'street_address', 'city', 'state', 'country', 'postal_code', 'user_name']
 
         error_response = validate_required_fields(required_fields, data)
         if error_response:
@@ -922,12 +914,7 @@ class BusinessPartnerView(APIView):
 
         company_logo = data.get('company_logo')
         license_certificate = data.get('license_certificate')
-        partner_session_token = data.get('partner_session_token')
-
-        # Fetch the user based on the partner session token
-        user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-        if not user:
-            return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
+        user = self.get_partner(request)
 
         # Validate the username format
         if not re.match(r'^\w+$', data['user_name']):
@@ -1009,8 +996,7 @@ class BusinessPartnerView(APIView):
             return Response({"message": "An internal server error occurred."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class UpdateBusinessProfileView(APIView):
-    permission_classes = [AllowAny]
+class UpdateBusinessProfileView(AuthenticatedPartnerMutationAPIView):
     parser_classes = [JSONParser, MultiPartParser, FormParser]
 
     @swagger_auto_schema(
@@ -1018,7 +1004,6 @@ class UpdateBusinessProfileView(APIView):
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description="Session token of the partner"),
                 'user_name': openapi.Schema(type=openapi.TYPE_STRING, description="Username of the partner"),
                 'contact_name': openapi.Schema(type=openapi.TYPE_STRING, description="Contact name of the partner"),
                 'contact_number': openapi.Schema(type=openapi.TYPE_STRING, description="Contact number of the partner"),
@@ -1026,7 +1011,7 @@ class UpdateBusinessProfileView(APIView):
                 'total_experience': openapi.Schema(type=openapi.TYPE_INTEGER, description="Total experience of the company"),
                 'company_bio': openapi.Schema(type=openapi.TYPE_STRING, description="Bio of the company"),
             },
-            required=['partner_session_token', 'user_name', 'contact_name', 'contact_number', 'total_experience', 'company_bio']
+            required=['user_name', 'contact_name', 'contact_number', 'total_experience', 'company_bio']
         ),
         responses={
             200: openapi.Response("Success: Business partner profile updated", PartnerProfileSerializer),
@@ -1038,13 +1023,9 @@ class UpdateBusinessProfileView(APIView):
         }
     )
     def put(self, request, *args, **kwargs):
-        data = request.data
-        partner_session_token = data.get('partner_session_token')
+        data = self.get_request_data_without_partner_token(request)
         user_name = data.get('user_name') or data.get('company_profile_url')
         license_certificate = data.get('license_certificate')
-
-        if not partner_session_token:
-            return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
 
         # Validate optional phone number if provided
         contact_number = data.get('contact_number')
@@ -1060,7 +1041,7 @@ class UpdateBusinessProfileView(APIView):
             return Response({"message": "Invalid user name. Only alphanumeric characters and underscores are allowed."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            user = PartnerProfile.objects.get(partner_session_token=partner_session_token)
+            user = self.get_partner(request)
 
             if user.partner_type == "NA":
                 return Response({"message": "Sorry, update Service section first."}, status=status.HTTP_409_CONFLICT)
@@ -1108,8 +1089,6 @@ class UpdateBusinessProfileView(APIView):
             serialized_package = PartnerProfileSerializer(user)
             return Response(serialized_package.data, status=status.HTTP_200_OK)
 
-        except PartnerProfile.DoesNotExist:
-            return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
             logger.error(f"UpdatePartnerBusinessProfileView: {str(e)}")
             return Response({"message": "An internal server error occurred."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -1214,14 +1193,12 @@ class GetPartnerAddressView(APIView):
             return Response({"message": "An internal server error occurred."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class UpdatePartnerAddressView(APIView):
-    permission_classes = [AllowAny]
+class UpdatePartnerAddressView(AuthenticatedPartnerMutationAPIView):
 
     @swagger_auto_schema(
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the partner'),
                 'address_id': openapi.Schema(type=openapi.TYPE_STRING, description='ID of the address detail (optional for first-time create)'),
                 'street_address': openapi.Schema(type=openapi.TYPE_STRING, description='Street address'),
                 'address_line2': openapi.Schema(type=openapi.TYPE_STRING, description='Address line 2'),
@@ -1230,7 +1207,7 @@ class UpdatePartnerAddressView(APIView):
                 'country': openapi.Schema(type=openapi.TYPE_STRING, description='Country'),
                 'postal_code': openapi.Schema(type=openapi.TYPE_STRING, description='Postal code')
             },
-            required=['partner_session_token', 'street_address', 'city', 'country']
+            required=['street_address', 'city', 'country']
         ),
         responses={
             200: openapi.Response("Success: Address details updated successfully", PartnerMailingDetailSerializer),
@@ -1244,24 +1221,15 @@ class UpdatePartnerAddressView(APIView):
     )
     def put(self, request, *args, **kwargs):
         try:
-            data = request.data
-            partner_session_token = request.data.get('partner_session_token')
-            address_id = request.data.get('address_id')
-
-            # Validate session token presence
-            if not partner_session_token:
-                return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
+            data = self.get_request_data_without_partner_token(request)
+            address_id = data.get('address_id')
+            user = self.get_partner(request)
 
             # Validate required fields
             required_fields = ['street_address', 'city', 'country']
             error_response = validate_required_fields(required_fields, data)
             if error_response:
                 return error_response
-
-            # Retrieve user profile
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
 
             with transaction.atomic():
                 # If address_id is provided, update that specific address.
@@ -1312,20 +1280,60 @@ class UpdatePartnerAddressView(APIView):
             return Response({"message": "Failed to update address detail. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class UpdateCompanyLogoView(APIView):
-    permission_classes = [AllowAny]
+class UpdatePartnerAvatarView(AuthenticatedPartnerMutationAPIView):
+    parser_classes = [MultiPartParser, FormParser]
+
+    @swagger_auto_schema(
+        operation_description="Update the profile avatar for the authenticated partner.",
+        manual_parameters=[
+            openapi.Parameter(
+                'user_photo',
+                openapi.IN_FORM,
+                type=openapi.TYPE_FILE,
+                required=True,
+                description="New partner avatar file"
+            )
+        ],
+        responses={
+            200: openapi.Response("Success: Partner avatar updated", PartnerProfileSerializer),
+            400: "Bad Request: Missing file or invalid file format/size.",
+            401: "Unauthorized: Partner permissions required.",
+            404: "Not Found: User not recognized.",
+            500: "Server Error: Internal server error."
+        }
+    )
+    def put(self, request, *args, **kwargs):
+        try:
+            file = request.data.get('user_photo')
+            user = self.get_partner(request)
+
+            if not file:
+                return Response({"message": "Missing file or user information."}, status=status.HTTP_400_BAD_REQUEST)
+
+            if not check_photo_format_and_size(file):
+                return Response({"message": "Invalid file format or size."}, status=status.HTTP_400_BAD_REQUEST)
+
+            if user.user_photo:
+                delete_file_from_directory(user.user_photo.name)
+
+            file_path = save_file_in_directory(file)
+            user.user_photo = file_path
+            user.save(update_fields=['user_photo'])
+            user = normalize_legacy_review_status(user)
+
+            serialized_user = PartnerProfileSerializer(user)
+            return Response(serialized_user.data, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.error("UpdatePartnerAvatarView: %s", str(e))
+            return Response({"message": "Failed to upload profile photo. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class UpdateCompanyLogoView(AuthenticatedPartnerMutationAPIView):
     parser_classes = [MultiPartParser, FormParser]
 
     @swagger_auto_schema(
         operation_description="Update the company logo for a business partner.",
         manual_parameters=[
-            openapi.Parameter(
-                'partner_session_token',
-                openapi.IN_FORM,
-                type=openapi.TYPE_STRING,
-                required=True,
-                description="Session token of the partner"
-            ),
             openapi.Parameter(
                 'company_logo',
                 openapi.IN_FORM,
@@ -1346,14 +1354,10 @@ class UpdateCompanyLogoView(APIView):
     def put(self, request, *args, **kwargs):
         try:
             file = request.data.get('company_logo')
-            partner_session_token = request.data.get('partner_session_token')
+            user = self.get_partner(request)
 
-            if not file or not partner_session_token:
+            if not file:
                 return Response({"message": "Missing file or user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
 
             check_exist = BusinessProfile.objects.filter(company_of_partner=user).first()
             if not check_exist:
@@ -1383,15 +1387,13 @@ class UpdateCompanyLogoView(APIView):
             return Response({"message": "Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class ChangePasswordView(APIView):
-    permission_classes = [AllowAny]
+class ChangePasswordView(AuthenticatedPartnerMutationAPIView):
 
     @swagger_auto_schema(
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
-            required=['partner_session_token', 'current_password', 'new_password'],
+            required=['current_password', 'new_password'],
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING),
                 'current_password': openapi.Schema(type=openapi.TYPE_STRING),
                 'new_password': openapi.Schema(type=openapi.TYPE_STRING),
             }
@@ -1407,29 +1409,21 @@ class ChangePasswordView(APIView):
     def put(self, request, *args, **kwargs):
         try:
             # Retrieve data from request
-            partner_session_token = request.data.get('partner_session_token')
-            current_password = request.data.get('current_password')
-            new_password = request.data.get('new_password')
+            data = self.get_request_data_without_partner_token(request)
+            current_password = data.get('current_password')
+            new_password = data.get('new_password')
+            user = self.get_partner(request)
 
             # Check if all required fields are present in the request
             if not current_password or not new_password:
                 return Response({"message": "All fields are required."}, status=status.HTTP_400_BAD_REQUEST)
 
-            # Check if partner session token is provided
-            if not partner_session_token:
-                return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            serializer = PartnerProfileSerializer(data=request.data)
+            serializer = PartnerProfileSerializer(data=data)
             try:
                 # Validate the password using serializer validation
                 serializer.validate_password(new_password)
             except serializers.ValidationError as e:
                 return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Retrieve the user based on the partner session token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
 
             # Verify the current password before changing
             if not check_password(user.password, current_password):

@@ -16,11 +16,17 @@ from drf_yasg import openapi
 from drf_yasg.utils import swagger_auto_schema
 
 from booking.models import BookingRatingAndReview
+from common.authentication import (
+    SessionTokenHeaderAuthentication,
+    is_authenticated_staff_user,
+    resolve_authenticated_partner_profile,
+)
 from common.auth_utils import is_admin_request, require_partner_profile
 from common.logs_file import logger
 from common.pagination import CustomPagination
 from common.permissions import IsAdminOrAuthenticatedPartnerProfile
 from common.utility import generate_token, random_six_digits
+from management.authentication import ManagementSessionAuthentication
 from .models import (
     BusinessProfile,
     HuzAirlineDetail,
@@ -307,6 +313,70 @@ class OperatorPackageBaseView(APIView):
             .prefetch_related(*PACKAGE_PREFETCH_RELATED)
         )
 
+    @staticmethod
+    def _compute_total_nights(basic_payload):
+        source = basic_payload or {}
+        return max(sum(_to_int(source.get(field), 0) for field in BASIC_INT_FIELDS), 1)
+
+
+class AuthenticatedPartnerPackageMutationAPIView(OperatorPackageBaseView):
+    authentication_classes = [
+        SessionTokenHeaderAuthentication,
+        ManagementSessionAuthentication,
+    ]
+    permission_classes = [IsAdminOrAuthenticatedPartnerProfile]
+
+    @staticmethod
+    def _extract_partner_session_token(request):
+        token = str(request.query_params.get("partner_session_token") or "").strip()
+        if token:
+            return token
+
+        try:
+            payload = request.data
+        except Exception:
+            payload = None
+
+        if hasattr(payload, "get"):
+            token = str(payload.get("partner_session_token") or "").strip()
+            if token:
+                return token
+
+        return ""
+
+    def _get_partner(self, request, require_active=False):
+        partner = resolve_authenticated_partner_profile(request)
+        if partner is None:
+            if is_authenticated_staff_user(request):
+                partner_token = self._extract_partner_session_token(request)
+                if not partner_token:
+                    return None, Response(
+                        {"message": "Missing user information."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                return None, Response(
+                    {"message": "User not found with the provided detail."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            return None, Response(
+                {"detail": "Authentication credentials were not provided."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        if require_active and partner.account_status != "Active":
+            return None, Response(
+                {
+                    "message": (
+                        "Your account status does not allow you to perform this task. "
+                        "Please contact our support team for assistance."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        return partner, None
+
     def _get_partner_package(self, partner, huz_token, with_prefetch=False):
         queryset = (
             self._package_queryset()
@@ -433,11 +503,6 @@ class OperatorPackageBaseView(APIView):
             )
 
         return normalized, None
-
-    @staticmethod
-    def _compute_total_nights(basic_payload):
-        source = basic_payload or {}
-        return max(sum(_to_int(source.get(field), 0) for field in BASIC_INT_FIELDS), 1)
 
     @staticmethod
     def _normalize_package_date_range_payload(payload, basic_payload=None):
@@ -714,7 +779,7 @@ class OperatorPackageBaseView(APIView):
         return normalized, None
 
 
-class CreateHuzPackageView(OperatorPackageBaseView):
+class CreateHuzPackageView(AuthenticatedPartnerPackageMutationAPIView):
     @swagger_auto_schema(operation_description="Create a new package for the current partner.")
     def post(self, request, *args, **kwargs):
         try:
@@ -843,7 +908,7 @@ class CreateHuzPackageView(OperatorPackageBaseView):
             )
 
 
-class CreateHuzAirlineView(OperatorPackageBaseView):
+class CreateHuzAirlineView(AuthenticatedPartnerPackageMutationAPIView):
     @swagger_auto_schema(operation_description="Create package airline details.")
     def post(self, request, *args, **kwargs):
         try:
@@ -947,7 +1012,7 @@ class CreateHuzAirlineView(OperatorPackageBaseView):
             )
 
 
-class CreateHuzTransportView(OperatorPackageBaseView):
+class CreateHuzTransportView(AuthenticatedPartnerPackageMutationAPIView):
     @swagger_auto_schema(operation_description="Create package transport details.")
     def post(self, request, *args, **kwargs):
         try:
@@ -1051,7 +1116,7 @@ class CreateHuzTransportView(OperatorPackageBaseView):
             )
 
 
-class CreateHuzZiyarahView(OperatorPackageBaseView):
+class CreateHuzZiyarahView(AuthenticatedPartnerPackageMutationAPIView):
     @swagger_auto_schema(operation_description="Create package ziyarah details.")
     def post(self, request, *args, **kwargs):
         try:
@@ -1157,7 +1222,7 @@ class CreateHuzZiyarahView(OperatorPackageBaseView):
             )
 
 
-class CreateHuzHotelView(OperatorPackageBaseView):
+class CreateHuzHotelView(AuthenticatedPartnerPackageMutationAPIView):
     @swagger_auto_schema(operation_description="Create or update package hotel details.")
     def post(self, request, *args, **kwargs):
         try:
@@ -1444,7 +1509,7 @@ class GetAllHotelsWithImagesView(OperatorPackageBaseView):
             )
 
 
-class ManageHuzPackageStatusView(OperatorPackageBaseView):
+class ManageHuzPackageStatusView(AuthenticatedPartnerPackageMutationAPIView):
     @swagger_auto_schema(operation_description="Update package status.")
     def put(self, request, *args, **kwargs):
         try:

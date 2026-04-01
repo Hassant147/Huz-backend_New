@@ -1,9 +1,12 @@
 from rest_framework.views import APIView
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from rest_framework.exceptions import AuthenticationFailed
 from rest_framework import status
 from .models import PartnerProfile, PartnerWithdraw, PartnerBankAccount, Wallet, PartnerTransactionHistory
 from .serializers import PartnerWithdrawSerializer, PartnerBankAccountSerializer, PartnerTransactionSerializer
+from common.authentication import SessionTokenHeaderAuthentication
+from common.auth_utils import require_partner_profile
 from common.utility import validate_required_fields
 from common.logs_file import logger
 from django.db import transaction
@@ -12,7 +15,26 @@ from drf_yasg import openapi
 from django.db.models import Sum, Count
 
 
-class ManagePartnerBankAccountView(APIView):
+class PartnerHeaderAuthenticationAPIView(APIView):
+    authentication_classes = [SessionTokenHeaderAuthentication]
+
+    @staticmethod
+    def get_partner(request):
+        return require_partner_profile(request)
+
+    @staticmethod
+    def get_request_data_without_partner_token(request):
+        try:
+            data = request.data.copy()
+        except Exception:
+            data = {}
+
+        if hasattr(data, "pop"):
+            data.pop("partner_session_token", None)
+        return data
+
+
+class ManagePartnerBankAccountView(PartnerHeaderAuthenticationAPIView):
     permission_classes = [AllowAny]
 
     @swagger_auto_schema(
@@ -53,13 +75,12 @@ class ManagePartnerBankAccountView(APIView):
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the partner'),
                 'account_title': openapi.Schema(type=openapi.TYPE_STRING, description='Account title'),
                 'account_number': openapi.Schema(type=openapi.TYPE_STRING, description='Account number'),
                 'bank_name': openapi.Schema(type=openapi.TYPE_STRING, description='Bank name'),
                 'branch_code': openapi.Schema(type=openapi.TYPE_STRING, description='Branch code')
             },
-            required=['partner_session_token', 'account_title', 'account_number', 'bank_name', 'branch_code']
+            required=['account_title', 'account_number', 'bank_name', 'branch_code']
         ),
         responses={
             201: openapi.Response("Bank account details added successfully", PartnerBankAccountSerializer),
@@ -71,11 +92,8 @@ class ManagePartnerBankAccountView(APIView):
     )
     def post(self, request, *args, **kwargs):
         try:
-            # Validate session_token presence
-            data = request.data
-            partner_session_token = request.data.get('partner_session_token')
-            if not partner_session_token:
-                return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
+            user = self.get_partner(request)
+            data = self.get_request_data_without_partner_token(request)
 
             # Validate required fields
             required_fields = ['account_title', 'account_number', 'bank_name', 'branch_code']
@@ -83,22 +101,16 @@ class ManagePartnerBankAccountView(APIView):
             if error_response:
                 return error_response
 
-            # Retrieve user based on session_token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
-
             # Check if the bank account details already exist
             check_exist = PartnerBankAccount.objects.filter(
                 bank_account_for_partner=user,
-                account_title=request.data.get('account_title'),
-                account_number=request.data.get('account_number'),
-                bank_name=request.data.get('bank_name')
+                account_title=data.get('account_title'),
+                account_number=data.get('account_number'),
+                bank_name=data.get('bank_name')
             ).first()
             if check_exist:
                 return Response({"message": "This account detail already exists."}, status=status.HTTP_409_CONFLICT)
 
-            data.pop('partner_session_token')
             data['bank_account_for_partner'] = user.partner_id
             serializer = PartnerBankAccountSerializer(data=data)
             if not serializer.is_valid():
@@ -108,6 +120,8 @@ class ManagePartnerBankAccountView(APIView):
                 return Response({"message": f"{first_error_message}"}, status=status.HTTP_400_BAD_REQUEST)
             serializer.save()
             return Response(serializer.data, status=status.HTTP_201_CREATED)
+        except AuthenticationFailed:
+            raise
         except Exception as e:
             logger.error("Post - ManagePartnerBankAccountView error: %s", str(e))
             return Response({"message": "Failed to add user bank account. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -116,10 +130,9 @@ class ManagePartnerBankAccountView(APIView):
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the partner'),
                 'account_id': openapi.Schema(type=openapi.TYPE_STRING, description='ID of the account to be deleted')
             },
-            required=['partner_session_token', 'account_id']
+            required=['account_id']
         ),
         responses={
             200: "Bank account has been removed successfully.",
@@ -130,14 +143,11 @@ class ManagePartnerBankAccountView(APIView):
     )
     def delete(self, request, *args, **kwargs):
         try:
-            partner_session_token = request.data.get('partner_session_token')
-            account_id = request.data.get('account_id')
-            if not partner_session_token or not account_id:
+            user = self.get_partner(request)
+            data = self.get_request_data_without_partner_token(request)
+            account_id = data.get('account_id')
+            if not account_id:
                 return Response({"message": "Missing required information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
 
             check_exist = PartnerBankAccount.objects.filter(bank_account_for_partner=user, account_id=account_id).first()
             if not check_exist:
@@ -146,12 +156,14 @@ class ManagePartnerBankAccountView(APIView):
             check_exist.delete()
             return Response({"message": "Bank account has been removed successfully."}, status=status.HTTP_200_OK)
 
+        except AuthenticationFailed:
+            raise
         except Exception as e:
             logger.error("Delete - ManagePartnerBankAccountView error: %s", str(e))
             return Response({"message": "Failed to delete user bank account. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class ManagePartnerWithdrawView(APIView):
+class ManagePartnerWithdrawView(PartnerHeaderAuthenticationAPIView):
     permission_classes = [AllowAny]
 
     @swagger_auto_schema(
@@ -193,9 +205,8 @@ class ManagePartnerWithdrawView(APIView):
     @swagger_auto_schema(
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
-            required=['partner_session_token', 'account_id', 'withdraw_amount'],
+            required=['account_id', 'withdraw_amount'],
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the partner'),
                 'account_id': openapi.Schema(type=openapi.TYPE_INTEGER, description='ID of the bank account for withdrawal'),
                 'withdraw_amount': openapi.Schema(type=openapi.TYPE_NUMBER, description='Amount to withdraw')
             }
@@ -209,23 +220,14 @@ class ManagePartnerWithdrawView(APIView):
     )
     def post(self, request, *args, **kwargs):
         try:
-            data = request.data
-            partner_session_token = data.get('partner_session_token')
-
-            # Check if session_token is provided
-            if not partner_session_token:
-                return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
+            user = self.get_partner(request)
+            data = self.get_request_data_without_partner_token(request)
 
             # Validate required fields
             required_fields = ['account_id', 'withdraw_amount']
             error_response = validate_required_fields(required_fields, data)
             if error_response:
                 return error_response
-
-            # Retrieve user based on session_token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."},  status=status.HTTP_400_BAD_REQUEST)
 
             # Check if bank account details exist
             bank_detail = PartnerBankAccount.objects.filter(bank_account_for_partner=user, account_id=data.get('account_id')).first()
@@ -250,7 +252,6 @@ class ManagePartnerWithdrawView(APIView):
                           f"Bank Name: {bank_detail.bank_name}")
 
             # Prepare data for serializer
-            data.pop('partner_session_token')
             data['withdraw_for_partner'] = user.partner_id
             data['withdraw_bank'] = bank_detail.account_id
             data['withdraw_status'] = "Pending"
@@ -270,6 +271,8 @@ class ManagePartnerWithdrawView(APIView):
                 first_error_message = f"{first_error_field}: {serializer.errors[first_error_field][0]}"
                 return Response({"message": first_error_message}, status=status.HTTP_400_BAD_REQUEST)
 
+        except AuthenticationFailed:
+            raise
         except Exception as e:
             # adding logs
             logger.error("Post - ManagePartnerWithdrawView: %s", str(e))

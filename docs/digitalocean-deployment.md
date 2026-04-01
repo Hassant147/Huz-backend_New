@@ -180,6 +180,11 @@ sudo nano /etc/huz-backend.env
 
 Replace every placeholder value. The important ones are:
 
+- `APP_ENV`
+- `API_PUBLIC_ORIGIN`
+- `WEB_APP_ORIGIN`
+- `OPERATOR_APP_ORIGIN`
+- `ADMIN_APP_ORIGIN`
 - `SECRET_KEY`
 - `ALLOWED_HOSTS`
 - `CSRF_TRUSTED_ORIGINS`
@@ -193,23 +198,37 @@ Replace every placeholder value. The important ones are:
 - `OPERATOR_PANEL_BASE_URL`
 - `MEDIA_ROOT`
 
-For your current setup, use these exact values unless something is different in your environment:
+Use the reviewed environment checklist at `docs/BACKEND_ENVIRONMENT_CHECKLIST_2026-04-01.md` when you fill these values. That checklist is the canonical source for which origins should appear in the production env file.
+
+For your current setup, use these reviewed known values, then replace the blank admin origin with the real separately deployed admin domain before release:
 
 ```env
+APP_ENV=production
+API_PUBLIC_ORIGIN=https://hajjumrah.org
+WEB_APP_ORIGIN=https://hajjumrah.co
+OPERATOR_APP_ORIGIN=https://operator.hajjumrah.co
+# Required before release: replace the blank value below with the real admin frontend origin.
+ADMIN_APP_ORIGIN=
+ALLOW_LOCALHOST_ORIGINS=False
 ALLOWED_HOSTS=hajjumrah.org,www.hajjumrah.org
-CSRF_TRUSTED_ORIGINS=https://hajjumrah.org,https://www.hajjumrah.org
+# After setting ADMIN_APP_ORIGIN, append the same origin here for admin session requests.
+CSRF_TRUSTED_ORIGINS=https://hajjumrah.org,https://www.hajjumrah.org,https://hajjumrah.co,https://www.hajjumrah.co,https://operator.hajjumrah.co
 CORS_ALLOW_ALL_ORIGINS=False
-CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001,http://localhost:3002,http://127.0.0.1:3002,http://localhost:5173,http://127.0.0.1:5173,https://hajjumrah.org,https://www.hajjumrah.org
-OPERATOR_PANEL_BASE_URL=http://localhost:3000
+# After setting ADMIN_APP_ORIGIN, append the same origin here for admin browser API calls.
+CORS_ALLOWED_ORIGINS=https://hajjumrah.co,https://www.hajjumrah.co,https://operator.hajjumrah.co
+OPERATOR_PANEL_BASE_URL=https://operator.hajjumrah.co
 MEDIA_ROOT=/srv/huz-media
 ```
 
+The exact admin production domain is not discoverable from current repo config. Do not guess it. Get the real deployed admin origin and use that same value for `ADMIN_APP_ORIGIN`, `CORS_ALLOWED_ORIGINS`, and `CSRF_TRUSTED_ORIGINS` before release.
+
 Why these values are correct:
 
-- `ALLOWED_HOSTS` tells Django which hostnames are allowed
-- `CSRF_TRUSTED_ORIGINS` allows secure browser requests from the production domain
-- `CORS_ALLOWED_ORIGINS` temporarily allows local frontend development against production backend
-- later, once frontend is deployed, remove every `localhost` and `127.0.0.1` entry from `CORS_ALLOWED_ORIGINS`
+- `API_PUBLIC_ORIGIN`, `WEB_APP_ORIGIN`, `OPERATOR_APP_ORIGIN`, and `ADMIN_APP_ORIGIN` make the deployed topology reviewable in one place
+- `ALLOWED_HOSTS` tells Django which backend hostnames are allowed
+- `CSRF_TRUSTED_ORIGINS` allows secure browser requests from the reviewed frontend origins
+- `CORS_ALLOWED_ORIGINS` allows only the reviewed browser origins to call the production backend
+- `ADMIN_APP_ORIGIN` is required in this deployment model, and production checks fail until its real origin is also included in both browser-origin allowlists
 
 How to create a strong `SECRET_KEY`:
 
@@ -344,8 +363,8 @@ That is your manual deployment flow.
 
 `CSRF verification failed`
 
-- `CSRF_TRUSTED_ORIGINS` is missing your `https://...` domain
-- your frontend domain is missing from `CORS_ALLOWED_ORIGINS`
+- `CSRF_TRUSTED_ORIGINS` is missing your web, operator, or admin `https://...` domain
+- your web, operator, or admin frontend domain is missing from `CORS_ALLOWED_ORIGINS`
 
 `mysqlclient` build error during pip install
 

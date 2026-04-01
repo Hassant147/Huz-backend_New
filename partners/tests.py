@@ -5,6 +5,7 @@ from django.apps import apps
 from django.db import connection
 from django.utils import timezone
 from rest_framework import status
+from django.core.files.uploadedfile import SimpleUploadedFile
 from rest_framework.test import APIRequestFactory, APITransactionTestCase
 
 from booking.models import BookingRatingAndReview
@@ -14,9 +15,14 @@ from .models import (
     HuzBasicDetail,
     HuzHotelDetail,
     HuzPackageDateRange,
+    HuzTransportDetail,
+    HuzZiyarahDetail,
+    PartnerBankAccount,
+    PartnerMailingDetail,
     PartnerProfile,
     PartnerServices,
     PartnerTransactionHistory,
+    PartnerWithdraw,
     Wallet,
 )
 from .package_management import (
@@ -385,10 +391,9 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
     def test_operator_create_package_accepts_package_date_range_without_summary_dates(self):
         range_start = timezone.now() + timedelta(days=14)
         range_end = range_start + timedelta(days=10)
-        request = self.factory.post(
+        response = self.client.post(
             "/partner/enroll_package_basic_detail/",
             {
-                "partner_session_token": self.partner.partner_session_token,
                 "package_type": "Umrah",
                 "package_name": "Range Only Contract Package",
                 "description": "Created without top-level summary dates.",
@@ -404,9 +409,9 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
                 ],
             },
             format="json",
+            HTTP_AUTHORIZATION=f"Bearer {self.partner.partner_session_token}",
         )
 
-        response = CreateHuzPackageView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertIn("package_date_range", response.data)
         self.assertNotIn("start_date", response.data)
@@ -603,6 +608,703 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data.get("Active"), 1)
         self.assertEqual(response.data.get("Completed"), 1)
+
+
+class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        ensure_tables_for_apps(["common", "partners", "booking"])
+
+    def setUp(self):
+        self.partner_a = self._create_partner("package-auth-a")
+        self.partner_b = self._create_partner("package-auth-b")
+
+        self.package_a_with_details = self._create_package(
+            self.partner_a,
+            "package-auth-a-with-details",
+        )
+        self.package_a_for_creates = self._create_package(
+            self.partner_a,
+            "package-auth-a-for-creates",
+        )
+        self.package_b_with_details = self._create_package(
+            self.partner_b,
+            "package-auth-b-with-details",
+        )
+        self.package_b_for_creates = self._create_package(
+            self.partner_b,
+            "package-auth-b-for-creates",
+        )
+
+        self.airline_a = HuzAirlineDetail.objects.create(
+            airline_name="Airline A",
+            ticket_type="Economy",
+            flight_from="Karachi",
+            flight_to="Jeddah",
+            return_flight_from="Jeddah",
+            return_flight_to="Karachi",
+            is_return_flight_included=True,
+            airline_for_package=self.package_a_with_details,
+        )
+        self.transport_a = HuzTransportDetail.objects.create(
+            transport_name="Transport A",
+            transport_type="Shared",
+            routes="Karachi,Jeddah",
+            transport_for_package=self.package_a_with_details,
+        )
+        self.hotel_a = HuzHotelDetail.objects.create(
+            hotel_city="Makkah",
+            hotel_name="Hotel A",
+            hotel_rating="5 Star",
+            room_sharing_type="Quad",
+            hotel_distance="5",
+            distance_type="KM",
+            hotel_for_package=self.package_a_with_details,
+        )
+        self.ziyarah_a = HuzZiyarahDetail.objects.create(
+            ziyarah_list="Masjid Quba",
+            ziyarah_for_package=self.package_a_with_details,
+        )
+
+        self.airline_b = HuzAirlineDetail.objects.create(
+            airline_name="Airline B",
+            ticket_type="Economy",
+            flight_from="Lahore",
+            flight_to="Madinah",
+            return_flight_from="Madinah",
+            return_flight_to="Lahore",
+            is_return_flight_included=True,
+            airline_for_package=self.package_b_with_details,
+        )
+        self.transport_b = HuzTransportDetail.objects.create(
+            transport_name="Transport B",
+            transport_type="Private",
+            routes="Lahore,Madinah",
+            transport_for_package=self.package_b_with_details,
+        )
+        self.hotel_b = HuzHotelDetail.objects.create(
+            hotel_city="Makkah",
+            hotel_name="Hotel B",
+            hotel_rating="4 Star",
+            room_sharing_type="Double",
+            hotel_distance="7",
+            distance_type="KM",
+            hotel_for_package=self.package_b_with_details,
+        )
+        self.ziyarah_b = HuzZiyarahDetail.objects.create(
+            ziyarah_list="Jabal Uhud",
+            ziyarah_for_package=self.package_b_with_details,
+        )
+
+    def _create_partner(self, slug):
+        return PartnerProfile.objects.create(
+            partner_session_token=f"{slug}-session-token",
+            user_name=f"{slug}-username",
+            name=f"{slug}-name",
+            partner_type="Company",
+            account_status="Active",
+        )
+
+    def _create_package(self, partner, huz_token):
+        start_date = timezone.now() + timedelta(days=30)
+        end_date = start_date + timedelta(days=10)
+        return HuzBasicDetail.objects.create(
+            huz_token=huz_token,
+            package_type="Umrah",
+            package_name=f"Package {huz_token}",
+            start_date=start_date,
+            end_date=end_date,
+            description="Auth hardening test package",
+            mecca_nights=5,
+            madinah_nights=5,
+            package_status="Active",
+            package_provider=partner,
+        )
+
+    def _auth_headers(self, partner):
+        return {"HTTP_AUTHORIZATION": f"Bearer {partner.partner_session_token}"}
+
+    def test_package_mutations_reject_unauthenticated_requests_even_with_legacy_partner_tokens(self):
+        initial_package_count = HuzBasicDetail.objects.count()
+        original_package_name = self.package_a_with_details.package_name
+        original_package_status = self.package_a_with_details.package_status
+        original_airline_name = self.airline_a.airline_name
+        original_transport_name = self.transport_a.transport_name
+        original_hotel_name = self.hotel_a.hotel_name
+        original_ziyarah_list = self.ziyarah_a.ziyarah_list
+
+        cases = [
+            (
+                "basic_post_body_token",
+                lambda: self.client.post(
+                    "/partner/enroll_package_basic_detail/",
+                    {
+                        "partner_session_token": self.partner_a.partner_session_token,
+                        "package_type": "Umrah",
+                        "package_name": "Unauthorized Package Create",
+                        "description": "Should be rejected.",
+                        "mecca_nights": 5,
+                        "madinah_nights": 5,
+                    },
+                    format="json",
+                ),
+            ),
+            (
+                "basic_put_query_token",
+                lambda: self.client.put(
+                    f"/partner/enroll_package_basic_detail/?partner_session_token={self.partner_a.partner_session_token}",
+                    {
+                        "huz_token": self.package_a_with_details.huz_token,
+                        "package_name": "Unauthorized Package Update",
+                    },
+                    format="json",
+                ),
+            ),
+            (
+                "airline_post_body_token",
+                lambda: self.client.post(
+                    "/partner/enroll_package_airline_detail/",
+                    {
+                        "partner_session_token": self.partner_a.partner_session_token,
+                        "huz_token": self.package_a_for_creates.huz_token,
+                        "airline_name": "Unauthorized Airline",
+                        "ticket_type": "Economy",
+                        "flight_from": "Karachi",
+                        "flight_to": "Jeddah",
+                        "return_flight_from": "Jeddah",
+                        "return_flight_to": "Karachi",
+                    },
+                    format="json",
+                ),
+            ),
+            (
+                "airline_put_query_token",
+                lambda: self.client.put(
+                    f"/partner/enroll_package_airline_detail/?partner_session_token={self.partner_a.partner_session_token}",
+                    {
+                        "huz_token": self.package_a_with_details.huz_token,
+                        "airline_name": "Unauthorized Airline Update",
+                    },
+                    format="json",
+                ),
+            ),
+            (
+                "transport_post_body_token",
+                lambda: self.client.post(
+                    "/partner/enroll_package_transport_detail/",
+                    {
+                        "partner_session_token": self.partner_a.partner_session_token,
+                        "huz_token": self.package_a_for_creates.huz_token,
+                        "transport_name": "Unauthorized Transport",
+                        "transport_type": "Shared",
+                        "routes": "Karachi,Jeddah",
+                    },
+                    format="json",
+                ),
+            ),
+            (
+                "transport_put_query_token",
+                lambda: self.client.put(
+                    f"/partner/enroll_package_transport_detail/?partner_session_token={self.partner_a.partner_session_token}",
+                    {
+                        "huz_token": self.package_a_with_details.huz_token,
+                        "transport_name": "Unauthorized Transport Update",
+                    },
+                    format="json",
+                ),
+            ),
+            (
+                "hotel_post_body_token",
+                lambda: self.client.post(
+                    "/partner/enroll_package_hotel_detail/",
+                    {
+                        "partner_session_token": self.partner_a.partner_session_token,
+                        "huz_token": self.package_a_for_creates.huz_token,
+                        "hotel_city": "Makkah",
+                        "hotel_name": "Unauthorized Hotel",
+                        "hotel_rating": "5 Star",
+                        "room_sharing_type": "Quad",
+                    },
+                    format="json",
+                ),
+            ),
+            (
+                "hotel_put_query_token",
+                lambda: self.client.put(
+                    f"/partner/enroll_package_hotel_detail/?partner_session_token={self.partner_a.partner_session_token}",
+                    {
+                        "huz_token": self.package_a_with_details.huz_token,
+                        "hotel_id": str(self.hotel_a.hotel_id),
+                        "hotel_name": "Unauthorized Hotel Update",
+                    },
+                    format="json",
+                ),
+            ),
+            (
+                "ziyarah_post_body_token",
+                lambda: self.client.post(
+                    "/partner/enroll_package_ziyarah_detail/",
+                    {
+                        "partner_session_token": self.partner_a.partner_session_token,
+                        "huz_token": self.package_a_for_creates.huz_token,
+                        "ziyarah_list": "Unauthorized Ziyarah",
+                    },
+                    format="json",
+                ),
+            ),
+            (
+                "ziyarah_put_query_token",
+                lambda: self.client.put(
+                    f"/partner/enroll_package_ziyarah_detail/?partner_session_token={self.partner_a.partner_session_token}",
+                    {
+                        "huz_token": self.package_a_with_details.huz_token,
+                        "ziyarah_list": "Unauthorized Ziyarah Update",
+                    },
+                    format="json",
+                ),
+            ),
+            (
+                "status_put_query_token",
+                lambda: self.client.put(
+                    f"/partner/change_huz_package_status/?partner_session_token={self.partner_a.partner_session_token}",
+                    {
+                        "huz_token": self.package_a_with_details.huz_token,
+                        "package_status": "Deactivated",
+                    },
+                    format="json",
+                ),
+            ),
+        ]
+
+        for label, make_request in cases:
+            with self.subTest(label=label):
+                response = make_request()
+                self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        self.assertEqual(HuzBasicDetail.objects.count(), initial_package_count)
+        self.package_a_with_details.refresh_from_db()
+        self.airline_a.refresh_from_db()
+        self.transport_a.refresh_from_db()
+        self.hotel_a.refresh_from_db()
+        self.ziyarah_a.refresh_from_db()
+
+        self.assertEqual(self.package_a_with_details.package_name, original_package_name)
+        self.assertEqual(self.package_a_with_details.package_status, original_package_status)
+        self.assertEqual(self.airline_a.airline_name, original_airline_name)
+        self.assertEqual(self.transport_a.transport_name, original_transport_name)
+        self.assertEqual(self.hotel_a.hotel_name, original_hotel_name)
+        self.assertEqual(self.ziyarah_a.ziyarah_list, original_ziyarah_list)
+        self.assertFalse(
+            HuzAirlineDetail.objects.filter(
+                airline_for_package=self.package_a_for_creates,
+            ).exists()
+        )
+        self.assertFalse(
+            HuzTransportDetail.objects.filter(
+                transport_for_package=self.package_a_for_creates,
+            ).exists()
+        )
+        self.assertFalse(
+            HuzHotelDetail.objects.filter(
+                hotel_for_package=self.package_a_for_creates,
+            ).exists()
+        )
+        self.assertFalse(
+            HuzZiyarahDetail.objects.filter(
+                ziyarah_for_package=self.package_a_for_creates,
+            ).exists()
+        )
+
+    def test_authenticated_partner_package_mutations_accept_bearer_auth_without_body_token(self):
+        headers = self._auth_headers(self.partner_a)
+
+        create_basic_response = self.client.post(
+            "/partner/enroll_package_basic_detail/",
+            {
+                "package_type": "Umrah",
+                "package_name": "Bearer Created Package",
+                "description": "Created with bearer auth only.",
+                "mecca_nights": 4,
+                "madinah_nights": 4,
+            },
+            format="json",
+            **headers,
+        )
+        self.assertEqual(create_basic_response.status_code, status.HTTP_201_CREATED)
+        created_package = HuzBasicDetail.objects.get(
+            huz_token=create_basic_response.data["huz_token"]
+        )
+        self.assertEqual(created_package.package_provider, self.partner_a)
+
+        update_basic_response = self.client.put(
+            "/partner/enroll_package_basic_detail/",
+            {
+                "huz_token": self.package_a_with_details.huz_token,
+                "package_name": "Bearer Updated Package",
+            },
+            format="json",
+            **headers,
+        )
+        self.assertEqual(update_basic_response.status_code, status.HTTP_200_OK)
+        self.package_a_with_details.refresh_from_db()
+        self.assertEqual(self.package_a_with_details.package_name, "Bearer Updated Package")
+
+        create_airline_response = self.client.post(
+            "/partner/enroll_package_airline_detail/",
+            {
+                "huz_token": self.package_a_for_creates.huz_token,
+                "airline_name": "Bearer Airline",
+                "ticket_type": "Economy",
+                "flight_from": "Karachi",
+                "flight_to": "Jeddah",
+                "return_flight_from": "Jeddah",
+                "return_flight_to": "Karachi",
+            },
+            format="json",
+            **headers,
+        )
+        self.assertEqual(create_airline_response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            HuzAirlineDetail.objects.filter(
+                airline_for_package=self.package_a_for_creates,
+                airline_name="Bearer Airline",
+            ).exists()
+        )
+
+        update_airline_response = self.client.put(
+            "/partner/enroll_package_airline_detail/",
+            {
+                "huz_token": self.package_a_with_details.huz_token,
+                "airline_name": "Bearer Updated Airline",
+            },
+            format="json",
+            **headers,
+        )
+        self.assertEqual(update_airline_response.status_code, status.HTTP_200_OK)
+        self.airline_a.refresh_from_db()
+        self.assertEqual(self.airline_a.airline_name, "Bearer Updated Airline")
+
+        create_transport_response = self.client.post(
+            "/partner/enroll_package_transport_detail/",
+            {
+                "huz_token": self.package_a_for_creates.huz_token,
+                "transport_name": "Bearer Transport",
+                "transport_type": "Shared",
+                "routes": "Karachi,Jeddah",
+            },
+            format="json",
+            **headers,
+        )
+        self.assertEqual(create_transport_response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            HuzTransportDetail.objects.filter(
+                transport_for_package=self.package_a_for_creates,
+                transport_name="Bearer Transport",
+            ).exists()
+        )
+
+        update_transport_response = self.client.put(
+            "/partner/enroll_package_transport_detail/",
+            {
+                "huz_token": self.package_a_with_details.huz_token,
+                "transport_name": "Bearer Updated Transport",
+            },
+            format="json",
+            **headers,
+        )
+        self.assertEqual(update_transport_response.status_code, status.HTTP_200_OK)
+        self.transport_a.refresh_from_db()
+        self.assertEqual(self.transport_a.transport_name, "Bearer Updated Transport")
+
+        create_hotel_response = self.client.post(
+            "/partner/enroll_package_hotel_detail/",
+            {
+                "huz_token": self.package_a_for_creates.huz_token,
+                "hotel_city": "Makkah",
+                "hotel_name": "Bearer Hotel",
+                "hotel_rating": "5 Star",
+                "room_sharing_type": "Quad",
+            },
+            format="json",
+            **headers,
+        )
+        self.assertEqual(create_hotel_response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            HuzHotelDetail.objects.filter(
+                hotel_for_package=self.package_a_for_creates,
+                hotel_name="Bearer Hotel",
+            ).exists()
+        )
+
+        update_hotel_response = self.client.put(
+            "/partner/enroll_package_hotel_detail/",
+            {
+                "huz_token": self.package_a_with_details.huz_token,
+                "hotel_id": str(self.hotel_a.hotel_id),
+                "hotel_name": "Bearer Updated Hotel",
+            },
+            format="json",
+            **headers,
+        )
+        self.assertEqual(update_hotel_response.status_code, status.HTTP_200_OK)
+        self.hotel_a.refresh_from_db()
+        self.assertEqual(self.hotel_a.hotel_name, "Bearer Updated Hotel")
+
+        create_ziyarah_response = self.client.post(
+            "/partner/enroll_package_ziyarah_detail/",
+            {
+                "huz_token": self.package_a_for_creates.huz_token,
+                "ziyarah_list": "Masjid Qiblatain",
+            },
+            format="json",
+            **headers,
+        )
+        self.assertEqual(create_ziyarah_response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            HuzZiyarahDetail.objects.filter(
+                ziyarah_for_package=self.package_a_for_creates,
+                ziyarah_list="Masjid Qiblatain",
+            ).exists()
+        )
+
+        update_ziyarah_response = self.client.put(
+            "/partner/enroll_package_ziyarah_detail/",
+            {
+                "huz_token": self.package_a_with_details.huz_token,
+                "ziyarah_list": "Masjid al-Jinn",
+            },
+            format="json",
+            **headers,
+        )
+        self.assertEqual(update_ziyarah_response.status_code, status.HTTP_200_OK)
+        self.ziyarah_a.refresh_from_db()
+        self.assertEqual(self.ziyarah_a.ziyarah_list, "Masjid al-Jinn")
+
+        update_status_response = self.client.put(
+            "/partner/change_huz_package_status/",
+            {
+                "huz_token": self.package_a_with_details.huz_token,
+                "package_status": "Deactivated",
+            },
+            format="json",
+            **headers,
+        )
+        self.assertEqual(update_status_response.status_code, status.HTTP_200_OK)
+        self.package_a_with_details.refresh_from_db()
+        self.assertEqual(self.package_a_with_details.package_status, "Deactivated")
+
+    def test_authenticated_partner_package_mutations_are_scoped_to_authenticated_principal(self):
+        headers = self._auth_headers(self.partner_a)
+
+        create_basic_response = self.client.post(
+            "/partner/enroll_package_basic_detail/",
+            {
+                "partner_session_token": self.partner_b.partner_session_token,
+                "package_type": "Umrah",
+                "package_name": "Scoped Create Package",
+                "description": "Body token should not override bearer principal.",
+                "mecca_nights": 3,
+                "madinah_nights": 3,
+            },
+            format="json",
+            **headers,
+        )
+        self.assertEqual(create_basic_response.status_code, status.HTTP_201_CREATED)
+        created_package = HuzBasicDetail.objects.get(
+            huz_token=create_basic_response.data["huz_token"]
+        )
+        self.assertEqual(created_package.package_provider, self.partner_a)
+        self.assertNotEqual(created_package.package_provider, self.partner_b)
+
+        original_package_name = self.package_b_with_details.package_name
+        original_package_status = self.package_b_with_details.package_status
+        original_airline_name = self.airline_b.airline_name
+        original_transport_name = self.transport_b.transport_name
+        original_hotel_name = self.hotel_b.hotel_name
+        original_ziyarah_list = self.ziyarah_b.ziyarah_list
+
+        cases = [
+            (
+                "basic_put",
+                lambda: self.client.put(
+                    "/partner/enroll_package_basic_detail/",
+                    {
+                        "partner_session_token": self.partner_b.partner_session_token,
+                        "huz_token": self.package_b_with_details.huz_token,
+                        "package_name": "Hijacked Package Name",
+                    },
+                    format="json",
+                    **headers,
+                ),
+            ),
+            (
+                "airline_post",
+                lambda: self.client.post(
+                    "/partner/enroll_package_airline_detail/",
+                    {
+                        "partner_session_token": self.partner_b.partner_session_token,
+                        "huz_token": self.package_b_for_creates.huz_token,
+                        "airline_name": "Hijacked Airline",
+                        "ticket_type": "Economy",
+                        "flight_from": "Karachi",
+                        "flight_to": "Jeddah",
+                        "return_flight_from": "Jeddah",
+                        "return_flight_to": "Karachi",
+                    },
+                    format="json",
+                    **headers,
+                ),
+            ),
+            (
+                "airline_put",
+                lambda: self.client.put(
+                    "/partner/enroll_package_airline_detail/",
+                    {
+                        "partner_session_token": self.partner_b.partner_session_token,
+                        "huz_token": self.package_b_with_details.huz_token,
+                        "airline_name": "Hijacked Airline Update",
+                    },
+                    format="json",
+                    **headers,
+                ),
+            ),
+            (
+                "transport_post",
+                lambda: self.client.post(
+                    "/partner/enroll_package_transport_detail/",
+                    {
+                        "partner_session_token": self.partner_b.partner_session_token,
+                        "huz_token": self.package_b_for_creates.huz_token,
+                        "transport_name": "Hijacked Transport",
+                        "transport_type": "Shared",
+                        "routes": "Karachi,Jeddah",
+                    },
+                    format="json",
+                    **headers,
+                ),
+            ),
+            (
+                "transport_put",
+                lambda: self.client.put(
+                    "/partner/enroll_package_transport_detail/",
+                    {
+                        "partner_session_token": self.partner_b.partner_session_token,
+                        "huz_token": self.package_b_with_details.huz_token,
+                        "transport_name": "Hijacked Transport Update",
+                    },
+                    format="json",
+                    **headers,
+                ),
+            ),
+            (
+                "hotel_post",
+                lambda: self.client.post(
+                    "/partner/enroll_package_hotel_detail/",
+                    {
+                        "partner_session_token": self.partner_b.partner_session_token,
+                        "huz_token": self.package_b_for_creates.huz_token,
+                        "hotel_city": "Makkah",
+                        "hotel_name": "Hijacked Hotel",
+                        "hotel_rating": "5 Star",
+                        "room_sharing_type": "Quad",
+                    },
+                    format="json",
+                    **headers,
+                ),
+            ),
+            (
+                "hotel_put",
+                lambda: self.client.put(
+                    "/partner/enroll_package_hotel_detail/",
+                    {
+                        "partner_session_token": self.partner_b.partner_session_token,
+                        "huz_token": self.package_b_with_details.huz_token,
+                        "hotel_id": str(self.hotel_b.hotel_id),
+                        "hotel_name": "Hijacked Hotel Update",
+                    },
+                    format="json",
+                    **headers,
+                ),
+            ),
+            (
+                "ziyarah_post",
+                lambda: self.client.post(
+                    "/partner/enroll_package_ziyarah_detail/",
+                    {
+                        "partner_session_token": self.partner_b.partner_session_token,
+                        "huz_token": self.package_b_for_creates.huz_token,
+                        "ziyarah_list": "Hijacked Ziyarah",
+                    },
+                    format="json",
+                    **headers,
+                ),
+            ),
+            (
+                "ziyarah_put",
+                lambda: self.client.put(
+                    "/partner/enroll_package_ziyarah_detail/",
+                    {
+                        "partner_session_token": self.partner_b.partner_session_token,
+                        "huz_token": self.package_b_with_details.huz_token,
+                        "ziyarah_list": "Hijacked Ziyarah Update",
+                    },
+                    format="json",
+                    **headers,
+                ),
+            ),
+            (
+                "status_put",
+                lambda: self.client.put(
+                    "/partner/change_huz_package_status/",
+                    {
+                        "partner_session_token": self.partner_b.partner_session_token,
+                        "huz_token": self.package_b_with_details.huz_token,
+                        "package_status": "Deactivated",
+                    },
+                    format="json",
+                    **headers,
+                ),
+            ),
+        ]
+
+        for label, make_request in cases:
+            with self.subTest(label=label):
+                response = make_request()
+                self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+        self.package_b_with_details.refresh_from_db()
+        self.airline_b.refresh_from_db()
+        self.transport_b.refresh_from_db()
+        self.hotel_b.refresh_from_db()
+        self.ziyarah_b.refresh_from_db()
+
+        self.assertEqual(self.package_b_with_details.package_name, original_package_name)
+        self.assertEqual(self.package_b_with_details.package_status, original_package_status)
+        self.assertEqual(self.airline_b.airline_name, original_airline_name)
+        self.assertEqual(self.transport_b.transport_name, original_transport_name)
+        self.assertEqual(self.hotel_b.hotel_name, original_hotel_name)
+        self.assertEqual(self.ziyarah_b.ziyarah_list, original_ziyarah_list)
+        self.assertFalse(
+            HuzAirlineDetail.objects.filter(
+                airline_for_package=self.package_b_for_creates,
+            ).exists()
+        )
+        self.assertFalse(
+            HuzTransportDetail.objects.filter(
+                transport_for_package=self.package_b_for_creates,
+            ).exists()
+        )
+        self.assertFalse(
+            HuzHotelDetail.objects.filter(
+                hotel_for_package=self.package_b_for_creates,
+            ).exists()
+        )
+        self.assertFalse(
+            HuzZiyarahDetail.objects.filter(
+                ziyarah_for_package=self.package_b_for_creates,
+            ).exists()
+        )
 
 
 class PackageManagementWebsiteViewTests(APITransactionTestCase):
@@ -1080,10 +1782,9 @@ class PartnerServicesViewTests(APITransactionTestCase):
         )
 
     def test_partner_services_endpoint_accepts_hajj_and_umrah_only(self):
-        request = self.factory.post(
+        response = self.client.post(
             "/partner/partner_service/",
             {
-                "partner_session_token": self.partner.partner_session_token,
                 "is_hajj_service_offer": True,
                 "is_umrah_service_offer": False,
                 "is_ziyarah_service_offer": True,
@@ -1091,9 +1792,9 @@ class PartnerServicesViewTests(APITransactionTestCase):
                 "is_visa_service_offer": True,
             },
             format="json",
+            HTTP_AUTHORIZATION=f"Bearer {self.partner.partner_session_token}",
         )
 
-        response = PartnerServicesView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
         self.partner.refresh_from_db()
@@ -1107,17 +1808,16 @@ class PartnerServicesViewTests(APITransactionTestCase):
         self.assertFalse(services.is_visa_service_offer)
 
     def test_partner_services_endpoint_rejects_empty_supported_service_selection(self):
-        request = self.factory.post(
+        response = self.client.post(
             "/partner/partner_service/",
             {
-                "partner_session_token": self.partner.partner_session_token,
                 "is_hajj_service_offer": False,
                 "is_umrah_service_offer": False,
             },
             format="json",
+            HTTP_AUTHORIZATION=f"Bearer {self.partner.partner_session_token}",
         )
 
-        response = PartnerServicesView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(
             response.data.get("message"),
@@ -1126,3 +1826,253 @@ class PartnerServicesViewTests(APITransactionTestCase):
         self.assertFalse(
             PartnerServices.objects.filter(services_of_partner=self.partner).exists()
         )
+
+    def test_partner_services_endpoint_rejects_unauthenticated_requests(self):
+        response = self.client.post(
+            "/partner/partner_service/",
+            {
+                "partner_session_token": self.partner.partner_session_token,
+                "is_hajj_service_offer": True,
+                "is_umrah_service_offer": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class PartnerProfileAndFinancialMutationAuthTests(APITransactionTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        ensure_tables_for_apps(["common", "partners"])
+
+    def setUp(self):
+        self.partner_a = PartnerProfile.objects.create(
+            partner_session_token="partner-auth-a-session-token",
+            user_name="partner-auth-a",
+            name="Partner A",
+            partner_type="Company",
+            account_status="Active",
+            country_code="+92",
+            phone_number="3001111111",
+        )
+        self.partner_b = PartnerProfile.objects.create(
+            partner_session_token="partner-auth-b-session-token",
+            user_name="partner-auth-b",
+            name="Partner B",
+            partner_type="Company",
+            account_status="Active",
+            country_code="+92",
+            phone_number="3002222222",
+        )
+        self.address_a = PartnerMailingDetail.objects.create(
+            street_address="Street A",
+            city="Karachi",
+            state="Sindh",
+            country="Pakistan",
+            postal_code="74000",
+            mailing_of_partner=self.partner_a,
+        )
+        self.address_b = PartnerMailingDetail.objects.create(
+            street_address="Street B",
+            city="Lahore",
+            state="Punjab",
+            country="Pakistan",
+            postal_code="54000",
+            mailing_of_partner=self.partner_b,
+        )
+        self.bank_a = PartnerBankAccount.objects.create(
+            account_title="Partner A",
+            account_number="111111",
+            bank_name="A Bank",
+            branch_code="001",
+            bank_account_for_partner=self.partner_a,
+        )
+        self.bank_b = PartnerBankAccount.objects.create(
+            account_title="Partner B",
+            account_number="222222",
+            bank_name="B Bank",
+            branch_code="002",
+            bank_account_for_partner=self.partner_b,
+        )
+        self.wallet_a = Wallet.objects.create(
+            wallet_code="wallet-code-partner-auth-a",
+            wallet_amount=500.0,
+            wallet_session=self.partner_a,
+        )
+        Wallet.objects.create(
+            wallet_code="wallet-code-partner-auth-b",
+            wallet_amount=250.0,
+            wallet_session=self.partner_b,
+        )
+
+    def _auth_headers(self, partner):
+        return {"HTTP_AUTHORIZATION": f"Bearer {partner.partner_session_token}"}
+
+    def test_sensitive_profile_and_financial_mutations_reject_unauthenticated_requests(self):
+        response = self.client.put(
+            f"/partner/update_partner_address_detail/?partner_session_token={self.partner_a.partner_session_token}",
+            {
+                "street_address": "Unauthorized Street",
+                "city": "Karachi",
+                "country": "Pakistan",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        response = self.client.post(
+            "/partner/manage_partner_bank_account/",
+            {
+                "partner_session_token": self.partner_a.partner_session_token,
+                "account_title": "Unauthorized",
+                "account_number": "999999",
+                "bank_name": "Unauthorized Bank",
+                "branch_code": "009",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        response = self.client.post(
+            "/partner/manage_partner_withdraw_request/",
+            {
+                "partner_session_token": self.partner_a.partner_session_token,
+                "account_id": str(self.bank_a.account_id),
+                "withdraw_amount": 25.0,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_authenticated_partner_address_update_is_scoped_to_authenticated_principal(self):
+        response = self.client.put(
+            "/partner/update_partner_address_detail/",
+            {
+                "partner_session_token": self.partner_b.partner_session_token,
+                "address_id": str(self.address_b.address_id),
+                "street_address": "Attempted takeover",
+                "city": "Karachi",
+                "country": "Pakistan",
+            },
+            format="json",
+            **self._auth_headers(self.partner_a),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.address_b.refresh_from_db()
+        self.assertEqual(self.address_b.street_address, "Street B")
+
+    def test_authenticated_partner_can_update_own_address_without_body_token(self):
+        response = self.client.put(
+            "/partner/update_partner_address_detail/",
+            {
+                "address_id": str(self.address_a.address_id),
+                "street_address": "Updated Street A",
+                "city": "Karachi",
+                "country": "Pakistan",
+            },
+            format="json",
+            **self._auth_headers(self.partner_a),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.address_a.refresh_from_db()
+        self.assertEqual(self.address_a.street_address, "Updated Street A")
+
+    def test_authenticated_partner_bank_delete_is_scoped_to_authenticated_principal(self):
+        response = self.client.delete(
+            "/partner/manage_partner_bank_account/",
+            {
+                "partner_session_token": self.partner_b.partner_session_token,
+                "account_id": str(self.bank_b.account_id),
+            },
+            format="json",
+            **self._auth_headers(self.partner_a),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertTrue(
+            PartnerBankAccount.objects.filter(account_id=self.bank_b.account_id).exists()
+        )
+
+    def test_authenticated_partner_can_create_own_bank_account(self):
+        response = self.client.post(
+            "/partner/manage_partner_bank_account/",
+            {
+                "account_title": "Partner A Savings",
+                "account_number": "333333",
+                "bank_name": "Savings Bank",
+                "branch_code": "003",
+            },
+            format="json",
+            **self._auth_headers(self.partner_a),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            PartnerBankAccount.objects.filter(
+                bank_account_for_partner=self.partner_a,
+                account_number="333333",
+            ).exists()
+        )
+
+    def test_authenticated_partner_withdraw_request_is_scoped_to_authenticated_principal(self):
+        response = self.client.post(
+            "/partner/manage_partner_withdraw_request/",
+            {
+                "partner_session_token": self.partner_b.partner_session_token,
+                "account_id": str(self.bank_b.account_id),
+                "withdraw_amount": 25.0,
+            },
+            format="json",
+            **self._auth_headers(self.partner_a),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(response.data.get("message"), "Bank account details not found.")
+        self.assertFalse(
+            PartnerWithdraw.objects.filter(withdraw_for_partner=self.partner_b).exists()
+        )
+
+    def test_authenticated_partner_can_create_withdraw_request(self):
+        response = self.client.post(
+            "/partner/manage_partner_withdraw_request/",
+            {
+                "account_id": str(self.bank_a.account_id),
+                "withdraw_amount": 125.0,
+            },
+            format="json",
+            **self._auth_headers(self.partner_a),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.wallet_a.refresh_from_db()
+        self.assertEqual(self.wallet_a.wallet_amount, 375.0)
+        self.assertTrue(
+            PartnerWithdraw.objects.filter(
+                withdraw_for_partner=self.partner_a,
+                withdraw_bank=self.bank_a,
+                withdraw_amount=125.0,
+            ).exists()
+        )
+
+    def test_authenticated_partner_can_update_avatar_without_form_token(self):
+        response = self.client.put(
+            "/partner/update_partner_avatar/",
+            {
+                "user_photo": SimpleUploadedFile(
+                    "partner-avatar.jpg",
+                    b"avatar-image",
+                    content_type="image/jpeg",
+                )
+            },
+            format="multipart",
+            **self._auth_headers(self.partner_a),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.partner_a.refresh_from_db()
+        self.assertTrue(bool(self.partner_a.user_photo))
+        self.assertTrue(self.partner_a.user_photo.name.endswith(".jpg"))

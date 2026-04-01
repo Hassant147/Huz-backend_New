@@ -5,11 +5,13 @@ from django.db import transaction
 from django.db.models import Sum, Count, Q
 from django.utils import timezone
 from django.utils.dateparse import parse_date
+from rest_framework.authentication import SessionAuthentication
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
 from common.authentication import (
+    SessionTokenHeaderAuthentication,
     get_authenticated_partner_profile,
     is_authenticated_staff_user,
     resolve_authenticated_partner_profile,
@@ -18,6 +20,7 @@ from common.pagination import CustomPagination
 from common.permissions import IsAdminOrAuthenticatedPartnerProfile
 from common.utility import validate_required_fields, check_file_format_and_size, save_file_in_directory, delete_file_from_directory, send_objection_email, send_booking_documents_email
 from common.logs_file import logger
+from management.authentication import ManagementSessionAuthentication
 from partners.models import PartnerProfile, HuzBasicDetail, HuzHotelDetail
 from .models import (
     Booking,
@@ -61,6 +64,7 @@ from .statuses import (
     ISSUE_STATUS_OPERATOR_OBJECTION,
     ISSUE_STATUS_REPORTED,
     WORKFLOW_BUCKET_CHOICES,
+    WORKFLOW_BUCKET_REQUEST_CHOICES,
 )
 from .workflow import (
     booking_can_complete,
@@ -106,6 +110,47 @@ class IsAdminOrPartnerSessionToken(IsAdminOrAuthenticatedPartnerProfile):
     Backward-compatible alias while partner booking endpoints move from
     raw token presence checks to authenticated partner principals.
     """
+
+
+class AuthenticatedPartnerBookingMutationAPIView(APIView):
+    authentication_classes = [
+        SessionTokenHeaderAuthentication,
+        ManagementSessionAuthentication,
+    ]
+    permission_classes = [IsAdminOrAuthenticatedPartnerProfile]
+
+    @staticmethod
+    def resolve_request_partner(request):
+        partner = get_authenticated_partner_profile(request)
+        if partner is not None:
+            return partner, False, False
+
+        if not request_has_partner_visibility_override(request):
+            return None, False, False
+
+        partner_session_token = extract_partner_session_token(request)
+        if not partner_session_token:
+            return None, True, False
+
+        partner = PartnerProfile.objects.filter(
+            partner_session_token=partner_session_token
+        ).first()
+        return partner, True, True
+
+    @classmethod
+    def resolve_partner_booking_detail(cls, request, booking_number):
+        partner, is_admin_request_context, admin_lookup_supplied = cls.resolve_request_partner(
+            request
+        )
+        if partner is None:
+            return None, None, is_admin_request_context, admin_lookup_supplied
+
+        booking_detail = get_request_partner_booking_detail(
+            request,
+            partner,
+            booking_number,
+        )
+        return partner, booking_detail, is_admin_request_context, admin_lookup_supplied
 
 
 VALID_BOOKING_STATUSES = tuple(status_name for status_name, _ in BOOKING_STATUS_CHOICES)
@@ -781,9 +826,9 @@ class GetBookingShortDetailForPartnersView(APIView):
                         {"message": f"Invalid booking_status. Must be one of: {', '.join(VALID_BOOKING_STATUSES)}."},
                         status=status.HTTP_400_BAD_REQUEST
                     )
-            if workflow_bucket and workflow_bucket not in WORKFLOW_BUCKET_CHOICES:
+            if workflow_bucket and workflow_bucket not in WORKFLOW_BUCKET_REQUEST_CHOICES:
                 return Response(
-                    {"message": f"Invalid workflow_bucket. Must be one of: {', '.join(sorted(WORKFLOW_BUCKET_CHOICES))}."},
+                    {"message": f"Invalid workflow_bucket. Must be one of: {', '.join(sorted(WORKFLOW_BUCKET_REQUEST_CHOICES))}."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
@@ -863,15 +908,17 @@ class GetBookingDetailByBookingNumberForPartnerView(APIView):
             return Response({"message": "Failed to get booking detail. Internal server error.."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class TakeActionView(APIView):
-    permission_classes = [IsAdminOrPartnerSessionToken]
+class TakeActionView(AuthenticatedPartnerBookingMutationAPIView):
 
     @swagger_auto_schema(
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
-            required=['partner_session_token', 'booking_number', 'partner_remarks', 'booking_status'],
+            required=['booking_number', 'partner_remarks', 'booking_status'],
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the partner'),
+                'partner_session_token': openapi.Schema(
+                    type=openapi.TYPE_STRING,
+                    description='Optional admin-only partner token for staff-scoped compatibility requests.',
+                ),
                 'booking_number': openapi.Schema(type=openapi.TYPE_STRING, description='Booking number'),
                 'partner_remarks': openapi.Schema(type=openapi.TYPE_STRING, description='Remarks from the partner'),
                 'booking_status': openapi.Schema(type=openapi.TYPE_STRING, description='New booking status')
@@ -889,20 +936,22 @@ class TakeActionView(APIView):
         try:
             # Extract data from request
             data = request.data
-            required_fields = ['partner_session_token', 'booking_number', 'partner_remarks', 'booking_status']
+            required_fields = ['booking_number', 'partner_remarks', 'booking_status']
 
             # Check for missing required fields
             error_response = validate_required_fields(required_fields, data)
             if error_response:
                 return error_response
 
-            # Find the partner user with the provided session token
-            partner = PartnerProfile.objects.filter(partner_session_token=data.get('partner_session_token')).first()
+            partner, booking_detail, is_admin_request_context, admin_lookup_supplied = self.resolve_partner_booking_detail(
+                request,
+                data.get('booking_number'),
+            )
             if not partner:
+                if is_admin_request_context and not admin_lookup_supplied:
+                    return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
                 return Response({"message": "Partner profile not found."}, status=status.HTTP_404_NOT_FOUND)
 
-            # Find the booking detail associated with the user and booking number
-            booking_detail = get_request_partner_booking_detail(request, partner, data.get('booking_number'))
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -946,8 +995,7 @@ class TakeActionView(APIView):
             return Response({"message": "Failed to update booking status. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class ManageBookingDocumentsView(APIView):
-    permission_classes = [IsAdminOrPartnerSessionToken]
+class ManageBookingDocumentsView(AuthenticatedPartnerBookingMutationAPIView):
     parser_classes = [MultiPartParser, FormParser]
 
     @swagger_auto_schema(
@@ -955,7 +1003,13 @@ class ManageBookingDocumentsView(APIView):
             openapi.Parameter('document_link', in_=openapi.IN_FORM, type=openapi.TYPE_FILE, required=True, description="The document file(s) to upload"),
             openapi.Parameter('document_for', in_=openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Type of document (e.g., 'eVisa', 'airline')"),
             openapi.Parameter('booking_number', in_=openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Booking number related to the document"),
-            openapi.Parameter('partner_session_token', in_=openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Partner's session token for authentication"),
+            openapi.Parameter(
+                'partner_session_token',
+                in_=openapi.IN_FORM,
+                type=openapi.TYPE_STRING,
+                required=False,
+                description="Optional admin-only partner token for staff-scoped compatibility requests.",
+            ),
         ],
         responses={
 
@@ -971,11 +1025,8 @@ class ManageBookingDocumentsView(APIView):
         try:
             files = request.FILES.getlist('document_link')
             booking_number = request.data.get('booking_number')
-            partner_session_token = request.data.get('partner_session_token')
             normalized_document_for = infer_document_category(request.data)
-            if not files or not booking_number or (
-                not partner_session_token and not request_has_partner_visibility_override(request)
-            ):
+            if not files or not booking_number:
                 return Response({"message": "Missing file or required information."},
                                 status=status.HTTP_400_BAD_REQUEST)
 
@@ -989,18 +1040,17 @@ class ManageBookingDocumentsView(APIView):
                 if not check_file_format_and_size(file):
                     return Response({"message": "Invalid file format or size."}, status=status.HTTP_400_BAD_REQUEST)
 
-            partner = resolve_partner_for_request(request, partner_session_token=partner_session_token)
-            if partner is None and not request_has_partner_visibility_override(request):
-                return Response({"message": "Partner agency detail not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            booking_detail = get_booking_detail_for_request_context(
+            partner, booking_detail, is_admin_request_context, admin_lookup_supplied = self.resolve_partner_booking_detail(
                 request,
                 booking_number,
-                partner_session_token=partner_session_token,
             )
+            if partner is None:
+                if is_admin_request_context and not admin_lookup_supplied:
+                    return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"message": "Partner agency detail not found."}, status=status.HTTP_404_NOT_FOUND)
+
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
-            partner = partner or booking_detail.order_to
 
             if not can_update_booking_documents(booking_detail):
                 return Response({"message": "Only bookings that are in fulfillment or ready for travel can perform this task."}, status=status.HTTP_409_CONFLICT)
@@ -1068,14 +1118,19 @@ class ManageBookingDocumentsView(APIView):
             return Response({"message": "Failed to submit data. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class DeleteBookingDocumentsView(APIView):
-    permission_classes = [IsAdminOrPartnerSessionToken]
+class DeleteBookingDocumentsView(AuthenticatedPartnerBookingMutationAPIView):
 
     @swagger_auto_schema(
         manual_parameters=[
             openapi.Parameter('booking_number', in_=openapi.IN_QUERY, type=openapi.TYPE_STRING, required=True, description="Booking number related to the document"),
             openapi.Parameter('document_id', in_=openapi.IN_QUERY, type=openapi.TYPE_INTEGER, required=True, description="ID of the document to delete"),
-            openapi.Parameter('partner_session_token', in_=openapi.IN_QUERY, type=openapi.TYPE_STRING, required=True, description="Partner's session token for authentication"),
+            openapi.Parameter(
+                'partner_session_token',
+                in_=openapi.IN_QUERY,
+                type=openapi.TYPE_STRING,
+                required=False,
+                description="Optional admin-only partner token for staff-scoped compatibility requests.",
+            ),
         ],
         responses={
             200: "OK: Record deleted successfully.",
@@ -1089,25 +1144,20 @@ class DeleteBookingDocumentsView(APIView):
         # Extract parameters from the request
         booking_number = request.data.get('booking_number') or request.query_params.get('booking_number')
         document_id = request.data.get('document_id') or request.query_params.get('document_id')
-        partner_session_token = request.data.get('partner_session_token') or request.query_params.get('partner_session_token')
 
         # Validate the presence of required parameters
-        if not booking_number or not document_id or (
-            not partner_session_token and not request_has_partner_visibility_override(request)
-        ):
+        if not booking_number or not document_id:
             return Response({"message": "Missing required information."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Retrieve partner profile
-        partner = resolve_partner_for_request(request, partner_session_token=partner_session_token)
-        if not partner and not request_has_partner_visibility_override(request):
-            return Response({"message": "Partner agency not found."}, status=status.HTTP_404_NOT_FOUND)
-
-        # Retrieve booking detail
-        booking_detail = get_booking_detail_for_request_context(
+        partner, booking_detail, is_admin_request_context, admin_lookup_supplied = self.resolve_partner_booking_detail(
             request,
             booking_number,
-            partner_session_token=partner_session_token,
         )
+        if not partner:
+            if is_admin_request_context and not admin_lookup_supplied:
+                return Response({"message": "Missing required information."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"message": "Partner agency not found."}, status=status.HTTP_404_NOT_FOUND)
+
         if not booking_detail:
             return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -1139,16 +1189,18 @@ class DeleteBookingDocumentsView(APIView):
             return Response({"message": "Failed to delete record. Try again."}, status=status.HTTP_400_BAD_REQUEST)
 
 
-class BookingAirlineDetailsView(APIView):
-    permission_classes = [IsAdminOrPartnerSessionToken]
+class BookingAirlineDetailsView(AuthenticatedPartnerBookingMutationAPIView):
 
     @swagger_auto_schema(
         operation_description="Create airline details for a booking.",
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
-            required=['partner_session_token', 'booking_number', 'flight_date', 'flight_time', 'flight_from', 'flight_to'],
+            required=['booking_number', 'flight_date', 'flight_time', 'flight_from', 'flight_to'],
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Partner session token'),
+                'partner_session_token': openapi.Schema(
+                    type=openapi.TYPE_STRING,
+                    description='Optional admin-only partner token for staff-scoped compatibility requests.',
+                ),
                 'booking_number': openapi.Schema(type=openapi.TYPE_STRING, description='Booking number'),
                 'flight_direction': openapi.Schema(type=openapi.TYPE_STRING, description='Flight leg direction: outbound or return'),
                 'flight_date': openapi.Schema(type=openapi.TYPE_STRING, format=openapi.FORMAT_DATE, description='Flight date'),
@@ -1169,30 +1221,24 @@ class BookingAirlineDetailsView(APIView):
     def post(self, request, *args, **kwargs):
         try:
             data = request.data
-            required_fields = ['partner_session_token', 'booking_number', 'flight_date', 'flight_time', 'flight_from', 'flight_to']
+            required_fields = ['booking_number', 'flight_date', 'flight_time', 'flight_from', 'flight_to']
 
             # Check for missing required fields
             error_response = validate_required_fields(required_fields, data)
             if error_response:
                 return error_response
 
-            # Retrieve partner profile using session token
-            partner = resolve_partner_for_request(
-                request,
-                partner_session_token=request.data.get('partner_session_token'),
-            )
-            if not partner and not request_has_partner_visibility_override(request):
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Retrieve booking details using partner and booking number
-            booking_detail = get_booking_detail_for_request_context(
+            partner, booking_detail, is_admin_request_context, admin_lookup_supplied = self.resolve_partner_booking_detail(
                 request,
                 request.data.get('booking_number'),
-                partner_session_token=request.data.get('partner_session_token'),
             )
+            if not partner:
+                if is_admin_request_context and not admin_lookup_supplied:
+                    return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
-            partner = partner or booking_detail.order_to
 
             # # Retrieve client details from booking details
             # client_detail = booking_detail.order_by
@@ -1256,9 +1302,12 @@ class BookingAirlineDetailsView(APIView):
         operation_description="Update airline details for a booking.",
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
-            required=['partner_session_token', 'booking_airline_id', 'booking_number', 'flight_date', 'flight_time', 'flight_from', 'flight_to'],
+            required=['booking_airline_id', 'booking_number', 'flight_date', 'flight_time', 'flight_from', 'flight_to'],
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Partner session token'),
+                'partner_session_token': openapi.Schema(
+                    type=openapi.TYPE_STRING,
+                    description='Optional admin-only partner token for staff-scoped compatibility requests.',
+                ),
                 'booking_airline_id': openapi.Schema(type=openapi.TYPE_STRING, description='Booking airline ID'),
                 'booking_number': openapi.Schema(type=openapi.TYPE_STRING, description='Booking number'),
                 'flight_direction': openapi.Schema(type=openapi.TYPE_STRING, description='Flight leg direction: outbound or return'),
@@ -1280,27 +1329,23 @@ class BookingAirlineDetailsView(APIView):
     def put(self, request, *args, **kwargs):
         try:
             data = request.data
-            required_fields = ['partner_session_token', 'booking_airline_id', 'booking_number', 'flight_date', 'flight_time', 'flight_from', 'flight_to']
+            required_fields = ['booking_airline_id', 'booking_number', 'flight_date', 'flight_time', 'flight_from', 'flight_to']
             # Check for missing required fields
             error_response = validate_required_fields(required_fields, data)
             if error_response:
                 return error_response
 
-            partner = resolve_partner_for_request(
-                request,
-                partner_session_token=data.get('partner_session_token'),
-            )
-            if not partner and not request_has_partner_visibility_override(request):
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            booking_detail = get_booking_detail_for_request_context(
+            partner, booking_detail, is_admin_request_context, admin_lookup_supplied = self.resolve_partner_booking_detail(
                 request,
                 data.get('booking_number'),
-                partner_session_token=data.get('partner_session_token'),
             )
+            if not partner:
+                if is_admin_request_context and not admin_lookup_supplied:
+                    return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
-            partner = partner or booking_detail.order_to
 
             # Retrieve the existing airline details for the booking
             airline_detail = BookingAirlineDetail.objects.filter(
@@ -1352,16 +1397,18 @@ class BookingAirlineDetailsView(APIView):
             return Response({"message": "Failed to update record. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class BookingHotelAndTransportDetailsView(APIView):
-    permission_classes = [IsAdminOrPartnerSessionToken]
+class BookingHotelAndTransportDetailsView(AuthenticatedPartnerBookingMutationAPIView):
 
     @swagger_auto_schema(
         operation_description="Add hotel and transport details for a booking.",
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
-            required=['partner_session_token', 'booking_number', 'detail_for'],
+            required=['booking_number', 'detail_for'],
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Partner session token'),
+                'partner_session_token': openapi.Schema(
+                    type=openapi.TYPE_STRING,
+                    description='Optional admin-only partner token for staff-scoped compatibility requests.',
+                ),
                 'detail_for': openapi.Schema(type=openapi.TYPE_STRING, description='Detail type (Hotel or Transport)'),
                 'hotel_items': openapi.Schema(type=openapi.TYPE_STRING, description='JSON array of hotel fulfillment items when detail_for=Hotel'),
                 'transport_mode': openapi.Schema(type=openapi.TYPE_STRING, description='Transport mode when detail_for=Transport'),
@@ -1386,9 +1433,7 @@ class BookingHotelAndTransportDetailsView(APIView):
     def post(self, request, *args, **kwargs):
         try:
             data = request.data
-            if not data.get("booking_number") or not data.get("detail_for") or (
-                not data.get("partner_session_token") and not request_has_partner_visibility_override(request)
-            ):
+            if not data.get("booking_number") or not data.get("detail_for"):
                 return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
 
             normalized_detail_for = normalize_arrangement_detail_type(data.get('detail_for'))
@@ -1398,22 +1443,17 @@ class BookingHotelAndTransportDetailsView(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            # Retrieve the user based on the provided session token
-            partner = resolve_partner_for_request(
-                request,
-                partner_session_token=data.get('partner_session_token'),
-            )
-            if not partner and not request_has_partner_visibility_override(request):
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            booking_detail = get_booking_detail_for_request_context(
+            partner, booking_detail, is_admin_request_context, admin_lookup_supplied = self.resolve_partner_booking_detail(
                 request,
                 data.get('booking_number'),
-                partner_session_token=data.get('partner_session_token'),
             )
+            if not partner:
+                if is_admin_request_context and not admin_lookup_supplied:
+                    return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
-            partner = partner or booking_detail.order_to
 
             # Retrieve client details using the session token from booking details
             client_detail = booking_detail.order_by
@@ -1476,7 +1516,10 @@ class BookingHotelAndTransportDetailsView(APIView):
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Partner session token'),
+                'partner_session_token': openapi.Schema(
+                    type=openapi.TYPE_STRING,
+                    description='Optional admin-only partner token for staff-scoped compatibility requests.',
+                ),
                 'booking_number': openapi.Schema(type=openapi.TYPE_STRING, description='Booking number'),
                 'detail_for': openapi.Schema(type=openapi.TYPE_STRING, description='Detail type (Hotel/Transport)'),
                 'hotel_items': openapi.Schema(type=openapi.TYPE_STRING, description='JSON array of hotel fulfillment items when detail_for=Hotel'),
@@ -1489,7 +1532,7 @@ class BookingHotelAndTransportDetailsView(APIView):
                 'ticket_reference': openapi.Schema(type=openapi.TYPE_STRING, description='Optional transport ticket reference'),
                 'note': openapi.Schema(type=openapi.TYPE_STRING, description='Traveler-facing hotel or transport note'),
             },
-            required=['partner_session_token', 'booking_number', 'detail_for']
+            required=['booking_number', 'detail_for']
         ),
         responses={
             200: openapi.Response('Hotel or transport details updated successfully', DetailBookingSerializer),
@@ -1503,9 +1546,7 @@ class BookingHotelAndTransportDetailsView(APIView):
     def put(self, request, *args, **kwargs):
         try:
             data = request.data
-            if not data.get("booking_number") or not data.get("detail_for") or (
-                not data.get("partner_session_token") and not request_has_partner_visibility_override(request)
-            ):
+            if not data.get("booking_number") or not data.get("detail_for"):
                 return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
 
             normalized_detail_for = normalize_arrangement_detail_type(data.get('detail_for'))
@@ -1515,23 +1556,17 @@ class BookingHotelAndTransportDetailsView(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            # Retrieve partner profile using session token
-            partner = resolve_partner_for_request(
-                request,
-                partner_session_token=data.get('partner_session_token'),
-            )
-            if not partner and not request_has_partner_visibility_override(request):
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Retrieve booking details using partner and booking number
-            booking_detail = get_booking_detail_for_request_context(
+            partner, booking_detail, is_admin_request_context, admin_lookup_supplied = self.resolve_partner_booking_detail(
                 request,
                 data.get('booking_number'),
-                partner_session_token=data.get('partner_session_token'),
             )
+            if not partner:
+                if is_admin_request_context and not admin_lookup_supplied:
+                    return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+
             if not booking_detail:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
-            partner = partner or booking_detail.order_to
 
             # Check if hotel or transport details exist for the booking
             detail_exists = (
@@ -2271,7 +2306,8 @@ class CloseBookingView(APIView):
     def put(self, request, *args, **kwargs):
         try:
             data = request.data
-            required_fields = ['booking_number', 'partner_session_token']
+            partner_session_token = extract_partner_session_token(request)
+            required_fields = ['booking_number']
 
             # Validate that all required fields are present in the request data
             error_response = validate_required_fields(required_fields, data)
@@ -2279,7 +2315,10 @@ class CloseBookingView(APIView):
                 return error_response
 
             # Retrieve partner associated with the provided partner session token
-            partner_detail = PartnerProfile.objects.filter(partner_session_token=data.get('partner_session_token')).first()
+            partner_detail = resolve_partner_for_request(
+                request,
+                partner_session_token=partner_session_token,
+            )
             if not partner_detail:
                 return Response({"message": "Package provider detail not found."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -2346,7 +2385,7 @@ class ReportBookingView(APIView):
         try:
             passport_id = request.data.get('passport_id')
             traveler_issue_id = request.data.get("traveler_issue_id")
-            partner_session_token = request.data.get('partner_session_token')
+            partner_session_token = extract_partner_session_token(request)
             booking_number = request.data.get('booking_number')
             if not booking_number or (
                 not partner_session_token and not request_has_partner_visibility_override(request)

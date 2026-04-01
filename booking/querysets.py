@@ -188,7 +188,7 @@ def build_partner_workflow_bucket_q(workflow_bucket):
     if normalized_bucket == WORKFLOW_BUCKET_REPORTED:
         return Q(issue_status=ISSUE_STATUS_REPORTED)
     if normalized_bucket == WORKFLOW_BUCKET_ISSUES:
-        return Q(issue_status=ISSUE_STATUS_OPERATOR_OBJECTION)
+        return Q(issue_status__in=ISSUE_STATUSES)
     if normalized_bucket == WORKFLOW_BUCKET_VIEW_ONLY:
         return non_issue_q & Q(
             effective_booking_status__in=(

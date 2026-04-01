@@ -26,6 +26,7 @@ urlpatterns = [
     path('check_username_exist/', partner_profile.CheckPartnerUsernameAvailabilityView.as_view()),
     path('get_partner_address_detail/', partner_profile.GetPartnerAddressView.as_view()),
     path('update_partner_address_detail/', partner_profile.UpdatePartnerAddressView.as_view()),
+    path('update_partner_avatar/', partner_profile.UpdatePartnerAvatarView.as_view()),
     path('update_company_logo/', partner_profile.UpdateCompanyLogoView.as_view()),
     path('change_partner_password/', partner_profile.ChangePasswordView.as_view()),
 
