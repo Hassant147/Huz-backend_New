@@ -5,6 +5,7 @@ import bcrypt
 import smtplib
 import socket
 import ssl
+import time
 from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -223,6 +224,18 @@ def _should_retry_with_starttls(error):
     return isinstance(error, retriable_error_types)
 
 
+def _is_transient_smtp_error(error):
+    if not isinstance(error, smtplib.SMTPResponseException):
+        return False
+    return 400 <= int(getattr(error, "smtp_code", 0) or 0) < 500
+
+
+def _should_retry_after_email_error(error, attempt_number, max_attempts):
+    if attempt_number >= max_attempts:
+        return False
+    return _should_retry_with_starttls(error) or _is_transient_smtp_error(error)
+
+
 def _send_email(email, subject, html_content):
     delivery_backend = getattr(settings, "EMAIL_DELIVERY_BACKEND", "smtp").strip().lower()
     if delivery_backend == "console":
@@ -249,45 +262,76 @@ def _send_email(email, subject, html_content):
         "use_tls": settings.EMAIL_USE_TLS,
     }
 
-    try:
-        return _send_email_via_smtp(email, subject, html_content, **primary_transport)
-    except Exception as primary_error:
-        should_retry = (
-            settings.EMAIL_ALLOW_STARTTLS_FALLBACK
-            and primary_transport["use_ssl"]
-            and settings.EMAIL_STARTTLS_PORT != settings.EMAIL_PORT
-            and _should_retry_with_starttls(primary_error)
-        )
-        if should_retry:
-            logger.warning(
-                "Primary SMTP transport failed for %s: %s. Retrying with STARTTLS on port %s.",
-                email,
-                str(primary_error),
-                settings.EMAIL_STARTTLS_PORT,
-            )
-            try:
-                return _send_email_via_smtp(
-                    email,
-                    subject,
-                    html_content,
-                    host=settings.EMAIL_HOST,
-                    port=settings.EMAIL_STARTTLS_PORT,
-                    use_ssl=False,
-                    use_tls=True,
-                )
-            except Exception as fallback_error:
-                logger.error(
-                    "Email sending error for %s after STARTTLS fallback: %s",
-                    email,
-                    str(fallback_error),
-                )
-                return False
+    max_attempts = max(1, int(getattr(settings, "EMAIL_TRANSIENT_SMTP_RETRIES", 2)) + 1)
+    retry_delay_seconds = max(0, int(getattr(settings, "EMAIL_TRANSIENT_SMTP_RETRY_DELAY_SECONDS", 2)))
 
-        if isinstance(primary_error, smtplib.SMTPException):
-            logger.error("SMTP Error while sending email to %s: %s", email, str(primary_error))
-        else:
-            logger.error("Email sending error for %s: %s", email, str(primary_error))
-        return False
+    for attempt_number in range(1, max_attempts + 1):
+        try:
+            return _send_email_via_smtp(email, subject, html_content, **primary_transport)
+        except Exception as primary_error:
+            should_try_starttls = (
+                settings.EMAIL_ALLOW_STARTTLS_FALLBACK
+                and primary_transport["use_ssl"]
+                and settings.EMAIL_STARTTLS_PORT != settings.EMAIL_PORT
+                and _should_retry_with_starttls(primary_error)
+            )
+            if should_try_starttls:
+                logger.warning(
+                    "Primary SMTP transport failed for %s: %s. Retrying with STARTTLS on port %s.",
+                    email,
+                    str(primary_error),
+                    settings.EMAIL_STARTTLS_PORT,
+                )
+                try:
+                    return _send_email_via_smtp(
+                        email,
+                        subject,
+                        html_content,
+                        host=settings.EMAIL_HOST,
+                        port=settings.EMAIL_STARTTLS_PORT,
+                        use_ssl=False,
+                        use_tls=True,
+                    )
+                except Exception as fallback_error:
+                    if _should_retry_after_email_error(fallback_error, attempt_number, max_attempts):
+                        logger.warning(
+                            "Email sending transient failure for %s after STARTTLS fallback (attempt %s/%s): %s. Retrying in %ss.",
+                            email,
+                            attempt_number,
+                            max_attempts,
+                            str(fallback_error),
+                            retry_delay_seconds,
+                        )
+                        if retry_delay_seconds:
+                            time.sleep(retry_delay_seconds)
+                        continue
+                    logger.error(
+                        "Email sending error for %s after STARTTLS fallback: %s",
+                        email,
+                        str(fallback_error),
+                    )
+                    return False
+
+            if _should_retry_after_email_error(primary_error, attempt_number, max_attempts):
+                logger.warning(
+                    "Email sending transient failure for %s (attempt %s/%s): %s. Retrying in %ss.",
+                    email,
+                    attempt_number,
+                    max_attempts,
+                    str(primary_error),
+                    retry_delay_seconds,
+                )
+                if retry_delay_seconds:
+                    time.sleep(retry_delay_seconds)
+                continue
+
+            if isinstance(primary_error, smtplib.SMTPException):
+                logger.error("SMTP Error while sending email to %s: %s", email, str(primary_error))
+            else:
+                logger.error("Email sending error for %s: %s", email, str(primary_error))
+            return False
+
+    return False
 
 
 def _dispatch_email(email, subject, html_content, wait_for_result=False):

@@ -21,4 +21,4 @@ DATABASES = {
     }
 }
 
-EMAIL_DELIVERY_BACKEND = config("EMAIL_DELIVERY_BACKEND", default="console").strip().lower()
+EMAIL_DELIVERY_BACKEND = config("EMAIL_DELIVERY_BACKEND", default="smtp").strip().lower()
