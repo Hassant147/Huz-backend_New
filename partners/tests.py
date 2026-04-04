@@ -9,6 +9,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from rest_framework.test import APIRequestFactory, APITransactionTestCase
 
 from booking.models import BookingRatingAndReview
+from common.utility import hash_password
 
 from .models import (
     HuzAirlineDetail,
@@ -94,7 +95,7 @@ class PartnerProfileSignupTests(APITransactionTestCase):
     @patch("partners.partner_profile.dispatch_partner_verification_email", return_value=True)
     def test_create_partner_profile_persists_user_and_dispatches_otp_after_commit(self, mocked_dispatch):
         request = self.factory.post(
-            "/partner/create_partner_profile/",
+            "/api/v1/operator/auth/accounts/",
             {
                 "email": "operator-signup@example.com",
                 "name": "Operator Signup",
@@ -119,6 +120,95 @@ class PartnerProfileSignupTests(APITransactionTestCase):
             "+923001234567",
             wait_for_result=False,
         )
+
+    @patch("partners.partner_profile.dispatch_partner_verification_email", return_value=True)
+    def test_canonical_operator_auth_accounts_alias_creates_partner_profile(self, mocked_dispatch):
+        response = self.client.post(
+            "/api/v1/operator/auth/accounts/",
+            {
+                "email": "operator-signup@example.com",
+                "name": "Operator Signup",
+                "phone_number": "+923001234567",
+                "password": "SecurePass1!",
+                "sign_type": "Email",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        created_partner = PartnerProfile.objects.get(email="operator-signup@example.com")
+        self.assertTrue(Wallet.objects.filter(wallet_session=created_partner).exists())
+        mocked_dispatch.assert_called_once()
+
+    def test_canonical_operator_auth_login_alias_authenticates_partner(self):
+        PartnerProfile.objects.create(
+            partner_session_token="canonical-login-session-token",
+            email="operator-login@example.com",
+            name="Operator Login",
+            country_code="+92",
+            phone_number="3001234599",
+            partner_type="NA",
+            sign_type="Email",
+            password=hash_password("SecurePass1!"),
+        )
+
+        response = self.client.post(
+            "/api/v1/operator/auth/login/",
+            {
+                "email": "operator-login@example.com",
+                "password": "SecurePass1!",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["email"], "operator-login@example.com")
+        self.assertEqual(
+            response.data["partner_session_token"],
+            "canonical-login-session-token",
+        )
+
+    def test_canonical_operator_auth_users_exists_alias_supports_email_lookup(self):
+        PartnerProfile.objects.create(
+            partner_session_token="canonical-exists-session-token",
+            email="operator-exists@example.com",
+            name="Operator Exists",
+            country_code="+92",
+            phone_number="3001234588",
+            partner_type="NA",
+            sign_type="Email",
+        )
+
+        response = self.client.post(
+            "/api/v1/operator/auth/users/exists/",
+            {"email": "operator-exists@example.com"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["email"], "operator-exists@example.com")
+
+    def test_canonical_operator_username_exists_alias_accepts_bearer_auth(self):
+        partner = PartnerProfile.objects.create(
+            partner_session_token="canonical-username-session-token",
+            email="operator-username@example.com",
+            name="Operator Username",
+            country_code="+92",
+            phone_number="3001234591",
+            partner_type="Company",
+            sign_type="Email",
+            user_name="current-name",
+        )
+
+        response = self.client.post(
+            "/api/v1/operator/me/usernames/exists/",
+            {"user_name": "available_name"},
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {partner.partner_session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["message"], "This username is available.")
 
     @patch("partners.partner_profile.send_partner_verification_sms", return_value=True)
     @patch("partners.partner_profile.send_verification_email", return_value=False)
@@ -156,19 +246,40 @@ class PartnerProfileSignupTests(APITransactionTestCase):
             sign_type="Email",
         )
 
-        request = self.factory.put(
-            "/partner/resend_otp/",
-            {"partner_session_token": partner.partner_session_token},
+        response = self.client.put(
+            "/api/v1/operator/auth/otp/resend/",
+            {},
             format="json",
+            HTTP_AUTHORIZATION=f"Bearer {partner.partner_session_token}",
         )
-
-        from .partner_profile import SendEmailOTPView
-
-        response = SendEmailOTPView.as_view()(request)
 
         partner.refresh_from_db()
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["message"], "OTP sent successfully.")
+        self.assertRegex(partner.otp or "", r"^\d{6}$")
+        mocked_email.assert_called_once_with(partner.email, partner.name, partner.otp, wait_for_result=True)
+
+    @patch("partners.partner_profile.send_verification_email", return_value=True)
+    def test_canonical_operator_auth_resend_otp_accepts_bearer_token(self, mocked_email):
+        partner = PartnerProfile.objects.create(
+            partner_session_token="canonical-resend-session-token",
+            email="operator-canonical-resend@example.com",
+            name="Operator Canonical Resend",
+            country_code="+92",
+            phone_number="3001234572",
+            partner_type="NA",
+            sign_type="Email",
+        )
+
+        response = self.client.put(
+            "/api/v1/operator/auth/otp/resend/",
+            {},
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {partner.partner_session_token}",
+        )
+
+        partner.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertRegex(partner.otp or "", r"^\d{6}$")
         mocked_email.assert_called_once_with(partner.email, partner.name, partner.otp, wait_for_result=True)
 
@@ -189,15 +300,12 @@ class PartnerProfileSignupTests(APITransactionTestCase):
             sign_type="Email",
         )
 
-        request = self.factory.put(
-            "/partner/resend_otp/",
-            {"partner_session_token": partner.partner_session_token},
+        response = self.client.put(
+            "/api/v1/operator/auth/otp/resend/",
+            {},
             format="json",
+            HTTP_AUTHORIZATION=f"Bearer {partner.partner_session_token}",
         )
-
-        from .partner_profile import SendEmailOTPView
-
-        response = SendEmailOTPView.as_view()(request)
 
         partner.refresh_from_db()
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -222,15 +330,12 @@ class PartnerProfileSignupTests(APITransactionTestCase):
             sign_type="Email",
         )
 
-        request = self.factory.put(
-            "/partner/resend_otp/",
-            {"partner_session_token": partner.partner_session_token},
+        response = self.client.put(
+            "/api/v1/operator/auth/otp/resend/",
+            {},
             format="json",
+            HTTP_AUTHORIZATION=f"Bearer {partner.partner_session_token}",
         )
-
-        from .partner_profile import SendEmailOTPView
-
-        response = SendEmailOTPView.as_view()(request)
 
         partner.refresh_from_db()
         attempted_otp = mocked_email.call_args.args[2]
@@ -254,15 +359,37 @@ class PartnerProfileSignupTests(APITransactionTestCase):
             is_email_verified=False,
         )
 
-        request = self.factory.put(
-            "/partner/verify_otp/",
-            {"partner_session_token": partner.partner_session_token, "otp": "123456"},
+        response = self.client.put(
+            "/api/v1/operator/auth/otp/verify/",
+            {"otp": "123456"},
             format="json",
+            HTTP_AUTHORIZATION=f"Bearer {partner.partner_session_token}",
         )
 
-        from .partner_profile import MatchEmailOTPView
+        partner.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(partner.is_email_verified)
+        self.assertEqual(partner.otp, "")
 
-        response = MatchEmailOTPView.as_view()(request)
+    def test_canonical_operator_auth_verify_otp_accepts_bearer_token(self):
+        partner = PartnerProfile.objects.create(
+            partner_session_token="canonical-verify-session-token",
+            email="operator-canonical-verify@example.com",
+            name="Operator Canonical Verify",
+            country_code="+92",
+            phone_number="3001234573",
+            partner_type="NA",
+            sign_type="Email",
+            otp="123456",
+            is_email_verified=False,
+        )
+
+        response = self.client.put(
+            "/api/v1/operator/auth/otp/verify/",
+            {"otp": "123456"},
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {partner.partner_session_token}",
+        )
 
         partner.refresh_from_db()
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -332,23 +459,22 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
             package_provider=self.other_partner,
         )
 
-    def _request_short_packages(self, **query_params):
-        request = self.factory.get(
-            "/partner/get_package_short_detail_by_partner_token/",
-            query_params,
-        )
-        return GetHuzShortPackageByTokenView.as_view()(request)
+    def _auth_headers(self, partner=None):
+        active_partner = partner or self.partner
+        return {"HTTP_AUTHORIZATION": f"Bearer {active_partner.partner_session_token}"}
+
+    def _request_short_packages(self, *, authenticated=True, partner=None, **query_params):
+        headers = self._auth_headers(partner) if authenticated else {}
+        return self.client.get("/api/v1/operator/me/packages/", query_params, **headers)
 
     def test_get_package_detail_returns_single_item_list(self):
-        request = self.factory.get(
-            "/partner/get_package_detail_by_partner_token/",
+        response = self.client.get(
+            "/api/v1/operator/me/packages/detail/",
             {
-                "partner_session_token": self.partner.partner_session_token,
                 "huz_token": self.package.huz_token,
             },
+            **self._auth_headers(),
         )
-
-        response = GetHuzPackageDetailByTokenView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIsInstance(response.data, list)
         self.assertEqual(len(response.data), 1)
@@ -371,15 +497,13 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
             distance_type="KM",
             hotel_for_package=self.package,
         )
-        request = self.factory.get(
-            "/partner/get_package_detail_by_partner_token/",
+        response = self.client.get(
+            "/api/v1/operator/me/packages/detail/",
             {
-                "partner_session_token": self.partner.partner_session_token,
                 "huz_token": self.package.huz_token,
             },
+            **self._auth_headers(),
         )
-
-        response = GetHuzPackageDetailByTokenView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         hotel_payload = response.data[0]["hotel_detail"][0]
 
@@ -392,7 +516,7 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
         range_start = timezone.now() + timedelta(days=14)
         range_end = range_start + timedelta(days=10)
         response = self.client.post(
-            "/partner/enroll_package_basic_detail/",
+            "/api/v1/operator/me/packages/basic/",
             {
                 "package_type": "Umrah",
                 "package_name": "Range Only Contract Package",
@@ -430,15 +554,13 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
         self.assertEqual(created_package.package_validity, created_range.package_validity)
 
     def test_get_package_detail_returns_404_for_unknown_token(self):
-        request = self.factory.get(
-            "/partner/get_package_detail_by_partner_token/",
+        response = self.client.get(
+            "/api/v1/operator/me/packages/detail/",
             {
-                "partner_session_token": self.partner.partner_session_token,
                 "huz_token": "unknown-token",
             },
+            **self._auth_headers(),
         )
-
-        response = GetHuzPackageDetailByTokenView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
         self.assertEqual(response.data.get("message"), "Package do not exist.")
 
@@ -507,7 +629,20 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
 
     def test_get_short_packages_accept_bearer_authorization(self):
         response = self.client.get(
-            "/partner/get_package_short_detail_by_partner_token/",
+            "/api/v1/operator/me/packages/",
+            {"package_type": "Hajj"},
+            **self._auth_headers(),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("results", response.data)
+        returned_tokens = {item.get("huz_token") for item in response.data.get("results") or []}
+        self.assertIn(self.package.huz_token, returned_tokens)
+        self.assertNotIn("X-Auth-Deprecated", response)
+
+    def test_canonical_operator_packages_list_accepts_bearer_authorization(self):
+        response = self.client.get(
+            "/api/v1/operator/me/packages/",
             {"package_type": "Hajj"},
             HTTP_AUTHORIZATION=f"Bearer {self.partner.partner_session_token}",
         )
@@ -516,7 +651,6 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
         self.assertIn("results", response.data)
         returned_tokens = {item.get("huz_token") for item in response.data.get("results") or []}
         self.assertIn(self.package.huz_token, returned_tokens)
-        self.assertNotIn("X-Auth-Deprecated", response)
 
     def test_get_short_packages_rejects_unsupported_package_type(self):
         response = self._request_short_packages(
@@ -531,10 +665,7 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
         )
 
     def test_get_short_packages_rejects_unauthenticated_requests(self):
-        response = self.client.get(
-            "/partner/get_package_short_detail_by_partner_token/",
-            {"package_type": "Hajj"},
-        )
+        response = self._request_short_packages(authenticated=False, package_type="Hajj")
 
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
@@ -572,11 +703,11 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
             package_provider=self.partner,
         )
 
-        request = self.factory.get(
-            "/partner/get_partner_overall_package_statistics/",
-            {"partner_session_token": self.partner.partner_session_token},
+        response = self.client.get(
+            "/api/v1/operator/me/packages/statistics/",
+            {},
+            **self._auth_headers(),
         )
-        response = GetPartnersOverallPackagesStatisticsView.as_view()(request)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data.get("Active"), 1)
@@ -599,11 +730,11 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
             package_provider=self.partner,
         )
 
-        request = self.factory.get(
-            "/partner/get_partner_overall_package_statistics/",
-            {"partner_session_token": self.partner.partner_session_token},
+        response = self.client.get(
+            "/api/v1/operator/me/packages/statistics/",
+            {},
+            **self._auth_headers(),
         )
-        response = GetPartnersOverallPackagesStatisticsView.as_view()(request)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data.get("Active"), 1)
@@ -738,7 +869,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "basic_post_body_token",
                 lambda: self.client.post(
-                    "/partner/enroll_package_basic_detail/",
+                    "/api/v1/operator/me/packages/basic/",
                     {
                         "partner_session_token": self.partner_a.partner_session_token,
                         "package_type": "Umrah",
@@ -753,7 +884,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "basic_put_query_token",
                 lambda: self.client.put(
-                    f"/partner/enroll_package_basic_detail/?partner_session_token={self.partner_a.partner_session_token}",
+                    f"/api/v1/operator/me/packages/basic/?partner_session_token={self.partner_a.partner_session_token}",
                     {
                         "huz_token": self.package_a_with_details.huz_token,
                         "package_name": "Unauthorized Package Update",
@@ -764,7 +895,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "airline_post_body_token",
                 lambda: self.client.post(
-                    "/partner/enroll_package_airline_detail/",
+                    "/api/v1/operator/me/packages/airline/",
                     {
                         "partner_session_token": self.partner_a.partner_session_token,
                         "huz_token": self.package_a_for_creates.huz_token,
@@ -781,7 +912,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "airline_put_query_token",
                 lambda: self.client.put(
-                    f"/partner/enroll_package_airline_detail/?partner_session_token={self.partner_a.partner_session_token}",
+                    f"/api/v1/operator/me/packages/airline/?partner_session_token={self.partner_a.partner_session_token}",
                     {
                         "huz_token": self.package_a_with_details.huz_token,
                         "airline_name": "Unauthorized Airline Update",
@@ -792,7 +923,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "transport_post_body_token",
                 lambda: self.client.post(
-                    "/partner/enroll_package_transport_detail/",
+                    "/api/v1/operator/me/packages/transport/",
                     {
                         "partner_session_token": self.partner_a.partner_session_token,
                         "huz_token": self.package_a_for_creates.huz_token,
@@ -806,7 +937,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "transport_put_query_token",
                 lambda: self.client.put(
-                    f"/partner/enroll_package_transport_detail/?partner_session_token={self.partner_a.partner_session_token}",
+                    f"/api/v1/operator/me/packages/transport/?partner_session_token={self.partner_a.partner_session_token}",
                     {
                         "huz_token": self.package_a_with_details.huz_token,
                         "transport_name": "Unauthorized Transport Update",
@@ -817,7 +948,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "hotel_post_body_token",
                 lambda: self.client.post(
-                    "/partner/enroll_package_hotel_detail/",
+                    "/api/v1/operator/me/packages/hotel/",
                     {
                         "partner_session_token": self.partner_a.partner_session_token,
                         "huz_token": self.package_a_for_creates.huz_token,
@@ -832,7 +963,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "hotel_put_query_token",
                 lambda: self.client.put(
-                    f"/partner/enroll_package_hotel_detail/?partner_session_token={self.partner_a.partner_session_token}",
+                    f"/api/v1/operator/me/packages/hotel/?partner_session_token={self.partner_a.partner_session_token}",
                     {
                         "huz_token": self.package_a_with_details.huz_token,
                         "hotel_id": str(self.hotel_a.hotel_id),
@@ -844,7 +975,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "ziyarah_post_body_token",
                 lambda: self.client.post(
-                    "/partner/enroll_package_ziyarah_detail/",
+                    "/api/v1/operator/me/packages/ziyarah/",
                     {
                         "partner_session_token": self.partner_a.partner_session_token,
                         "huz_token": self.package_a_for_creates.huz_token,
@@ -856,7 +987,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "ziyarah_put_query_token",
                 lambda: self.client.put(
-                    f"/partner/enroll_package_ziyarah_detail/?partner_session_token={self.partner_a.partner_session_token}",
+                    f"/api/v1/operator/me/packages/ziyarah/?partner_session_token={self.partner_a.partner_session_token}",
                     {
                         "huz_token": self.package_a_with_details.huz_token,
                         "ziyarah_list": "Unauthorized Ziyarah Update",
@@ -867,7 +998,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "status_put_query_token",
                 lambda: self.client.put(
-                    f"/partner/change_huz_package_status/?partner_session_token={self.partner_a.partner_session_token}",
+                    f"/api/v1/operator/me/packages/status/?partner_session_token={self.partner_a.partner_session_token}",
                     {
                         "huz_token": self.package_a_with_details.huz_token,
                         "package_status": "Deactivated",
@@ -920,7 +1051,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
         headers = self._auth_headers(self.partner_a)
 
         create_basic_response = self.client.post(
-            "/partner/enroll_package_basic_detail/",
+            "/api/v1/operator/me/packages/basic/",
             {
                 "package_type": "Umrah",
                 "package_name": "Bearer Created Package",
@@ -938,7 +1069,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
         self.assertEqual(created_package.package_provider, self.partner_a)
 
         update_basic_response = self.client.put(
-            "/partner/enroll_package_basic_detail/",
+            "/api/v1/operator/me/packages/basic/",
             {
                 "huz_token": self.package_a_with_details.huz_token,
                 "package_name": "Bearer Updated Package",
@@ -951,7 +1082,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
         self.assertEqual(self.package_a_with_details.package_name, "Bearer Updated Package")
 
         create_airline_response = self.client.post(
-            "/partner/enroll_package_airline_detail/",
+            "/api/v1/operator/me/packages/airline/",
             {
                 "huz_token": self.package_a_for_creates.huz_token,
                 "airline_name": "Bearer Airline",
@@ -973,7 +1104,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
         )
 
         update_airline_response = self.client.put(
-            "/partner/enroll_package_airline_detail/",
+            "/api/v1/operator/me/packages/airline/",
             {
                 "huz_token": self.package_a_with_details.huz_token,
                 "airline_name": "Bearer Updated Airline",
@@ -986,7 +1117,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
         self.assertEqual(self.airline_a.airline_name, "Bearer Updated Airline")
 
         create_transport_response = self.client.post(
-            "/partner/enroll_package_transport_detail/",
+            "/api/v1/operator/me/packages/transport/",
             {
                 "huz_token": self.package_a_for_creates.huz_token,
                 "transport_name": "Bearer Transport",
@@ -1005,7 +1136,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
         )
 
         update_transport_response = self.client.put(
-            "/partner/enroll_package_transport_detail/",
+            "/api/v1/operator/me/packages/transport/",
             {
                 "huz_token": self.package_a_with_details.huz_token,
                 "transport_name": "Bearer Updated Transport",
@@ -1018,7 +1149,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
         self.assertEqual(self.transport_a.transport_name, "Bearer Updated Transport")
 
         create_hotel_response = self.client.post(
-            "/partner/enroll_package_hotel_detail/",
+            "/api/v1/operator/me/packages/hotel/",
             {
                 "huz_token": self.package_a_for_creates.huz_token,
                 "hotel_city": "Makkah",
@@ -1038,7 +1169,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
         )
 
         update_hotel_response = self.client.put(
-            "/partner/enroll_package_hotel_detail/",
+            "/api/v1/operator/me/packages/hotel/",
             {
                 "huz_token": self.package_a_with_details.huz_token,
                 "hotel_id": str(self.hotel_a.hotel_id),
@@ -1052,7 +1183,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
         self.assertEqual(self.hotel_a.hotel_name, "Bearer Updated Hotel")
 
         create_ziyarah_response = self.client.post(
-            "/partner/enroll_package_ziyarah_detail/",
+            "/api/v1/operator/me/packages/ziyarah/",
             {
                 "huz_token": self.package_a_for_creates.huz_token,
                 "ziyarah_list": "Masjid Qiblatain",
@@ -1069,7 +1200,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
         )
 
         update_ziyarah_response = self.client.put(
-            "/partner/enroll_package_ziyarah_detail/",
+            "/api/v1/operator/me/packages/ziyarah/",
             {
                 "huz_token": self.package_a_with_details.huz_token,
                 "ziyarah_list": "Masjid al-Jinn",
@@ -1082,7 +1213,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
         self.assertEqual(self.ziyarah_a.ziyarah_list, "Masjid al-Jinn")
 
         update_status_response = self.client.put(
-            "/partner/change_huz_package_status/",
+            "/api/v1/operator/me/packages/status/",
             {
                 "huz_token": self.package_a_with_details.huz_token,
                 "package_status": "Deactivated",
@@ -1094,11 +1225,29 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
         self.package_a_with_details.refresh_from_db()
         self.assertEqual(self.package_a_with_details.package_status, "Deactivated")
 
+    def test_canonical_operator_package_basic_mutation_accepts_bearer_auth(self):
+        response = self.client.post(
+            "/api/v1/operator/me/packages/basic/",
+            {
+                "package_type": "Umrah",
+                "package_name": "Canonical Bearer Package",
+                "description": "Created through the canonical operator package route.",
+                "mecca_nights": 4,
+                "madinah_nights": 4,
+            },
+            format="json",
+            **self._auth_headers(self.partner_a),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        created_package = HuzBasicDetail.objects.get(huz_token=response.data["huz_token"])
+        self.assertEqual(created_package.package_provider, self.partner_a)
+
     def test_authenticated_partner_package_mutations_are_scoped_to_authenticated_principal(self):
         headers = self._auth_headers(self.partner_a)
 
         create_basic_response = self.client.post(
-            "/partner/enroll_package_basic_detail/",
+            "/api/v1/operator/me/packages/basic/",
             {
                 "partner_session_token": self.partner_b.partner_session_token,
                 "package_type": "Umrah",
@@ -1128,7 +1277,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "basic_put",
                 lambda: self.client.put(
-                    "/partner/enroll_package_basic_detail/",
+                    "/api/v1/operator/me/packages/basic/",
                     {
                         "partner_session_token": self.partner_b.partner_session_token,
                         "huz_token": self.package_b_with_details.huz_token,
@@ -1141,7 +1290,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "airline_post",
                 lambda: self.client.post(
-                    "/partner/enroll_package_airline_detail/",
+                    "/api/v1/operator/me/packages/airline/",
                     {
                         "partner_session_token": self.partner_b.partner_session_token,
                         "huz_token": self.package_b_for_creates.huz_token,
@@ -1159,7 +1308,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "airline_put",
                 lambda: self.client.put(
-                    "/partner/enroll_package_airline_detail/",
+                    "/api/v1/operator/me/packages/airline/",
                     {
                         "partner_session_token": self.partner_b.partner_session_token,
                         "huz_token": self.package_b_with_details.huz_token,
@@ -1172,7 +1321,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "transport_post",
                 lambda: self.client.post(
-                    "/partner/enroll_package_transport_detail/",
+                    "/api/v1/operator/me/packages/transport/",
                     {
                         "partner_session_token": self.partner_b.partner_session_token,
                         "huz_token": self.package_b_for_creates.huz_token,
@@ -1187,7 +1336,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "transport_put",
                 lambda: self.client.put(
-                    "/partner/enroll_package_transport_detail/",
+                    "/api/v1/operator/me/packages/transport/",
                     {
                         "partner_session_token": self.partner_b.partner_session_token,
                         "huz_token": self.package_b_with_details.huz_token,
@@ -1200,7 +1349,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "hotel_post",
                 lambda: self.client.post(
-                    "/partner/enroll_package_hotel_detail/",
+                    "/api/v1/operator/me/packages/hotel/",
                     {
                         "partner_session_token": self.partner_b.partner_session_token,
                         "huz_token": self.package_b_for_creates.huz_token,
@@ -1216,7 +1365,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "hotel_put",
                 lambda: self.client.put(
-                    "/partner/enroll_package_hotel_detail/",
+                    "/api/v1/operator/me/packages/hotel/",
                     {
                         "partner_session_token": self.partner_b.partner_session_token,
                         "huz_token": self.package_b_with_details.huz_token,
@@ -1230,7 +1379,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "ziyarah_post",
                 lambda: self.client.post(
-                    "/partner/enroll_package_ziyarah_detail/",
+                    "/api/v1/operator/me/packages/ziyarah/",
                     {
                         "partner_session_token": self.partner_b.partner_session_token,
                         "huz_token": self.package_b_for_creates.huz_token,
@@ -1243,7 +1392,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "ziyarah_put",
                 lambda: self.client.put(
-                    "/partner/enroll_package_ziyarah_detail/",
+                    "/api/v1/operator/me/packages/ziyarah/",
                     {
                         "partner_session_token": self.partner_b.partner_session_token,
                         "huz_token": self.package_b_with_details.huz_token,
@@ -1256,7 +1405,7 @@ class PackageManagementOperatorMutationAuthTests(APITransactionTestCase):
             (
                 "status_put",
                 lambda: self.client.put(
-                    "/partner/change_huz_package_status/",
+                    "/api/v1/operator/me/packages/status/",
                     {
                         "partner_session_token": self.partner_b.partner_session_token,
                         "huz_token": self.package_b_with_details.huz_token,
@@ -1424,14 +1573,14 @@ class PackageManagementWebsiteViewTests(APITransactionTestCase):
 
     def _request_website_packages(self, **query_params):
         request = self.factory.get(
-            "/partner/get_package_short_detail_for_web/",
+            "/api/v1/packages/public/",
             query_params,
         )
         return GetHuzShortPackageForWebsiteView.as_view()(request)
 
     def _request_website_search(self, **query_params):
         request = self.factory.get(
-            "/partner/get_package_detail_by_city_and_date/",
+            "/api/v1/packages/public/search/",
             query_params,
         )
         return GetSearchPackageByCityNDateView.as_view()(request)
@@ -1458,7 +1607,7 @@ class PackageManagementWebsiteViewTests(APITransactionTestCase):
 
     def test_website_detail_returns_expired_future_ranges_with_explicit_status(self):
         request = self.factory.get(
-            "/partner/get_package_detail_by_package_id_for_web/",
+            "/api/v1/packages/public/detail/",
             {"huz_token": self.ranged_package.huz_token},
         )
 
@@ -1623,7 +1772,7 @@ class PackageManagementWebsiteViewTests(APITransactionTestCase):
 
     def test_website_detail_exposes_landed_packages_without_flight_data(self):
         request = self.factory.get(
-            "/partner/get_package_detail_by_package_id_for_web/",
+            "/api/v1/packages/public/detail/",
             {"huz_token": self.landed_package.huz_token},
         )
 
@@ -1645,7 +1794,7 @@ class PackageManagementWebsiteViewTests(APITransactionTestCase):
 
     def test_website_detail_exposes_flat_hotel_contract_without_nested_duplicates(self):
         request = self.factory.get(
-            "/partner/get_package_detail_by_package_id_for_web/",
+            "/api/v1/packages/public/detail/",
             {"huz_token": self.ranged_package.huz_token},
         )
 
@@ -1693,6 +1842,16 @@ class PackageManagementWebsiteViewTests(APITransactionTestCase):
             "Invalid package_type. Use Hajj or Umrah.",
         )
 
+    def test_canonical_public_packages_alias_returns_results(self):
+        response = self.client.get(
+            "/api/v1/packages/public/",
+            {"package_type": "Umrah"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        returned_tokens = {item.get("huz_token") for item in response.data.get("results", [])}
+        self.assertIn(self.ranged_package.huz_token, returned_tokens)
+
 
 class PartnerWalletEndpointAccessTests(APITransactionTestCase):
     @classmethod
@@ -1732,12 +1891,10 @@ class PartnerWalletEndpointAccessTests(APITransactionTestCase):
         )
 
     def test_transaction_summary_endpoint_works_without_admin_auth(self):
-        request = self.factory.get(
-            "/partner/get_partner_over_transaction_amount/",
-            {"partner_session_token": self.partner.partner_session_token},
+        response = self.client.get(
+            "/api/v1/operator/me/wallet/summary/",
+            HTTP_AUTHORIZATION=f"Bearer {self.partner.partner_session_token}",
         )
-
-        response = GetPartnerTransactionOverallSummaryView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data.get("credit_transaction_amount"), 250.0)
         self.assertEqual(response.data.get("debit_transaction_amount"), 80.0)
@@ -1745,21 +1902,37 @@ class PartnerWalletEndpointAccessTests(APITransactionTestCase):
         self.assertEqual(response.data.get("debit_number_transactions"), 1)
 
     def test_transaction_history_endpoint_works_without_admin_auth(self):
-        request = self.factory.get(
-            "/partner/get_partner_all_transaction_history/",
-            {"partner_session_token": self.partner.partner_session_token},
+        response = self.client.get(
+            "/api/v1/operator/me/wallet/transactions/",
+            HTTP_AUTHORIZATION=f"Bearer {self.partner.partner_session_token}",
         )
-
-        response = GetPartnerAllTransactionHistoryView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data), 2)
 
     def test_transaction_summary_requires_partner_session_token(self):
-        request = self.factory.get("/partner/get_partner_over_transaction_amount/")
+        response = self.client.get("/api/v1/operator/me/wallet/summary/")
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
-        response = GetPartnerTransactionOverallSummaryView.as_view()(request)
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertEqual(response.data.get("message"), "Missing user information.")
+    def test_canonical_wallet_endpoints_accept_bearer_auth_without_partner_session_token(self):
+        summary_response = self.client.get(
+            "/api/v1/operator/me/wallet/summary/",
+            HTTP_AUTHORIZATION=f"Bearer {self.partner.partner_session_token}",
+        )
+        transactions_response = self.client.get(
+            "/api/v1/operator/me/wallet/transactions/",
+            HTTP_AUTHORIZATION=f"Bearer {self.partner.partner_session_token}",
+        )
+        profile_response = self.client.get(
+            "/api/v1/operator/me/profile/",
+            HTTP_AUTHORIZATION=f"Bearer {self.partner.partner_session_token}",
+        )
+
+        self.assertEqual(summary_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(summary_response.data.get("credit_transaction_amount"), 250.0)
+        self.assertEqual(transactions_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(transactions_response.data), 2)
+        self.assertEqual(profile_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(profile_response.data.get("partner_session_token"), self.partner.partner_session_token)
 
 
 class PartnerServicesViewTests(APITransactionTestCase):
@@ -1783,7 +1956,7 @@ class PartnerServicesViewTests(APITransactionTestCase):
 
     def test_partner_services_endpoint_accepts_hajj_and_umrah_only(self):
         response = self.client.post(
-            "/partner/partner_service/",
+            "/api/v1/operator/me/services/",
             {
                 "is_hajj_service_offer": True,
                 "is_umrah_service_offer": False,
@@ -1809,7 +1982,7 @@ class PartnerServicesViewTests(APITransactionTestCase):
 
     def test_partner_services_endpoint_rejects_empty_supported_service_selection(self):
         response = self.client.post(
-            "/partner/partner_service/",
+            "/api/v1/operator/me/services/",
             {
                 "is_hajj_service_offer": False,
                 "is_umrah_service_offer": False,
@@ -1829,7 +2002,7 @@ class PartnerServicesViewTests(APITransactionTestCase):
 
     def test_partner_services_endpoint_rejects_unauthenticated_requests(self):
         response = self.client.post(
-            "/partner/partner_service/",
+            "/api/v1/operator/me/services/",
             {
                 "partner_session_token": self.partner.partner_session_token,
                 "is_hajj_service_offer": True,
@@ -1912,7 +2085,7 @@ class PartnerProfileAndFinancialMutationAuthTests(APITransactionTestCase):
 
     def test_sensitive_profile_and_financial_mutations_reject_unauthenticated_requests(self):
         response = self.client.put(
-            f"/partner/update_partner_address_detail/?partner_session_token={self.partner_a.partner_session_token}",
+            f"/api/v1/operator/me/address/upsert/?partner_session_token={self.partner_a.partner_session_token}",
             {
                 "street_address": "Unauthorized Street",
                 "city": "Karachi",
@@ -1923,7 +2096,7 @@ class PartnerProfileAndFinancialMutationAuthTests(APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
         response = self.client.post(
-            "/partner/manage_partner_bank_account/",
+            "/api/v1/operator/me/wallet/banks/",
             {
                 "partner_session_token": self.partner_a.partner_session_token,
                 "account_title": "Unauthorized",
@@ -1936,7 +2109,7 @@ class PartnerProfileAndFinancialMutationAuthTests(APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
         response = self.client.post(
-            "/partner/manage_partner_withdraw_request/",
+            "/api/v1/operator/me/wallet/withdrawals/",
             {
                 "partner_session_token": self.partner_a.partner_session_token,
                 "account_id": str(self.bank_a.account_id),
@@ -1948,7 +2121,7 @@ class PartnerProfileAndFinancialMutationAuthTests(APITransactionTestCase):
 
     def test_authenticated_partner_address_update_is_scoped_to_authenticated_principal(self):
         response = self.client.put(
-            "/partner/update_partner_address_detail/",
+            "/api/v1/operator/me/address/upsert/",
             {
                 "partner_session_token": self.partner_b.partner_session_token,
                 "address_id": str(self.address_b.address_id),
@@ -1966,7 +2139,7 @@ class PartnerProfileAndFinancialMutationAuthTests(APITransactionTestCase):
 
     def test_authenticated_partner_can_update_own_address_without_body_token(self):
         response = self.client.put(
-            "/partner/update_partner_address_detail/",
+            "/api/v1/operator/me/address/upsert/",
             {
                 "address_id": str(self.address_a.address_id),
                 "street_address": "Updated Street A",
@@ -1983,7 +2156,7 @@ class PartnerProfileAndFinancialMutationAuthTests(APITransactionTestCase):
 
     def test_authenticated_partner_bank_delete_is_scoped_to_authenticated_principal(self):
         response = self.client.delete(
-            "/partner/manage_partner_bank_account/",
+            "/api/v1/operator/me/wallet/banks/",
             {
                 "partner_session_token": self.partner_b.partner_session_token,
                 "account_id": str(self.bank_b.account_id),
@@ -1999,7 +2172,7 @@ class PartnerProfileAndFinancialMutationAuthTests(APITransactionTestCase):
 
     def test_authenticated_partner_can_create_own_bank_account(self):
         response = self.client.post(
-            "/partner/manage_partner_bank_account/",
+            "/api/v1/operator/me/wallet/banks/",
             {
                 "account_title": "Partner A Savings",
                 "account_number": "333333",
@@ -2020,7 +2193,7 @@ class PartnerProfileAndFinancialMutationAuthTests(APITransactionTestCase):
 
     def test_authenticated_partner_withdraw_request_is_scoped_to_authenticated_principal(self):
         response = self.client.post(
-            "/partner/manage_partner_withdraw_request/",
+            "/api/v1/operator/me/wallet/withdrawals/",
             {
                 "partner_session_token": self.partner_b.partner_session_token,
                 "account_id": str(self.bank_b.account_id),
@@ -2038,7 +2211,7 @@ class PartnerProfileAndFinancialMutationAuthTests(APITransactionTestCase):
 
     def test_authenticated_partner_can_create_withdraw_request(self):
         response = self.client.post(
-            "/partner/manage_partner_withdraw_request/",
+            "/api/v1/operator/me/wallet/withdrawals/",
             {
                 "account_id": str(self.bank_a.account_id),
                 "withdraw_amount": 125.0,
@@ -2060,7 +2233,7 @@ class PartnerProfileAndFinancialMutationAuthTests(APITransactionTestCase):
 
     def test_authenticated_partner_can_update_avatar_without_form_token(self):
         response = self.client.put(
-            "/partner/update_partner_avatar/",
+            "/api/v1/operator/me/profile/avatar/",
             {
                 "user_photo": SimpleUploadedFile(
                     "partner-avatar.jpg",

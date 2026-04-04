@@ -16,10 +16,6 @@ class SessionTokenAuthContext:
     token: str
     source: str
 
-    @property
-    def legacy(self):
-        return self.source != "authorization"
-
 
 class SessionTokenBridgePrincipal:
     def __init__(self, context):
@@ -60,26 +56,6 @@ def _normalize_token(raw_token):
     return token
 
 
-def _extract_legacy_token(request, field_name):
-    query_params = getattr(request, "query_params", None)
-    if query_params is not None:
-        token = _normalize_token(query_params.get(field_name))
-        if token:
-            return token, f"{field_name}_in_query"
-
-    try:
-        payload = request.data
-    except Exception:
-        payload = None
-
-    if hasattr(payload, "get"):
-        token = _normalize_token(payload.get(field_name))
-        if token:
-            return token, f"{field_name}_in_payload"
-
-    return "", ""
-
-
 def _build_auth_context(token, source):
     user = UserProfile.objects.filter(session_token=token).first()
     partner = PartnerProfile.objects.filter(partner_session_token=token).first()
@@ -108,14 +84,10 @@ def _apply_request_context(request, context):
         return
 
     setattr(request, "auth_context", context)
-    if context.legacy:
-        setattr(request, "_legacy_token_used", context.source)
 
     raw_request = getattr(request, "_request", None)
     if raw_request is not None:
         setattr(raw_request, "auth_context", context)
-        if context.legacy:
-            setattr(raw_request, "_legacy_token_used", context.source)
 
 
 class SessionTokenHeaderAuthentication(BaseAuthentication):
@@ -144,23 +116,6 @@ class SessionTokenHeaderAuthentication(BaseAuthentication):
 
     def authenticate_header(self, request):
         return "Bearer"
-
-
-class LegacySessionTokenAuthentication(BaseAuthentication):
-    def authenticate(self, request):
-        for field_name in ("session_token", "partner_session_token"):
-            token, source = _extract_legacy_token(request, field_name)
-            if not token:
-                continue
-
-            context = _build_auth_context(token, source)
-            if context is None:
-                continue
-
-            _apply_request_context(request, context)
-            return SessionTokenBridgePrincipal(context), context
-
-        return None
 
 
 def get_session_token_auth_context(request):
@@ -197,31 +152,3 @@ def get_authenticated_partner_profile(request):
     if auth_context and auth_context.principal_type == "partner":
         return auth_context.principal
     return None
-
-
-def resolve_authenticated_user_profile(request, token_field="session_token"):
-    user = get_authenticated_user_profile(request)
-    if user is not None:
-        return user
-
-    if not is_authenticated_staff_user(request):
-        return None
-
-    token, _ = _extract_legacy_token(request, token_field)
-    if not token:
-        return None
-    return UserProfile.objects.filter(session_token=token).first()
-
-
-def resolve_authenticated_partner_profile(request, token_field="partner_session_token"):
-    partner = get_authenticated_partner_profile(request)
-    if partner is not None:
-        return partner
-
-    if not is_authenticated_staff_user(request):
-        return None
-
-    token, _ = _extract_legacy_token(request, token_field)
-    if not token:
-        return None
-    return PartnerProfile.objects.filter(partner_session_token=token).first()

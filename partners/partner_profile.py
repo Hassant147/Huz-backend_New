@@ -10,7 +10,10 @@ import threading
 from common.logs_file import logger
 from common.utility import generate_token, random_six_digits, send_verification_email, hash_password, check_password, validate_required_fields, check_photo_format_and_size, check_file_format_and_size, save_file_in_directory, delete_file_from_directory
 from common.user_profile import OTPDeliveryError, get_sms_gateway_api_key, send_sms_gateway_request
-from common.authentication import SessionTokenHeaderAuthentication
+from common.authentication import (
+    SessionTokenHeaderAuthentication,
+    get_authenticated_partner_profile,
+)
 from common.auth_utils import require_partner_profile
 from common.permissions import IsAuthenticatedPartnerProfile
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
@@ -132,6 +135,28 @@ def dispatch_partner_verification_email(email, name, otp, phone_number="", wait_
         daemon=True,
     ).start()
     return True
+
+
+def resolve_partner_read_request(request):
+    partner = get_authenticated_partner_profile(request)
+    if partner is not None:
+        return normalize_legacy_review_status(partner), None
+
+    return None, Response(
+        {"message": "Authenticated partner profile is required."},
+        status=status.HTTP_401_UNAUTHORIZED,
+    )
+
+
+def resolve_partner_auth_request(request):
+    partner = get_authenticated_partner_profile(request)
+    if partner is not None:
+        return normalize_legacy_review_status(partner), None
+
+    return None, Response(
+        {"message": "Authenticated partner profile is required."},
+        status=status.HTTP_401_UNAUTHORIZED,
+    )
 
 
 class AuthenticatedPartnerMutationAPIView(APIView):
@@ -463,33 +488,33 @@ class GetPartnerProfileView(APIView):
     permission_classes = [AllowAny]
 
     @swagger_auto_schema(
-        operation_description="Get partner profile by partner session token.",
+        operation_description=(
+            "Get the authenticated partner profile. "
+            "Admin-session aliases may still supply `partner_session_token` through "
+            "explicit compatibility helpers, but canonical operator requests use "
+            "the Authorization header."
+        ),
         manual_parameters=[
             openapi.Parameter(
                 'partner_session_token',
                 openapi.IN_QUERY,
                 type=openapi.TYPE_STRING,
-                required=True,
-                description='Session token of the partner'
+                required=False,
+                description='Optional for documented legacy/admin compatibility only.'
             ),
         ],
         responses={
             200: openapi.Response("Success", PartnerProfileSerializer),
-            400: "Bad Request: Missing partner session token.",
+            400: "Bad Request: Missing partner detail for compatibility requests.",
             404: "Not Found: User not found with the provided detail.",
             500: "Server Error: Internal server error",
         }
     )
     def get(self, request, *args, **kwargs):
         try:
-            partner_session_token = request.GET.get('partner_session_token')
-            if not partner_session_token:
-                return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
-            user = normalize_legacy_review_status(user)
+            user, error_response = resolve_partner_read_request(request)
+            if error_response:
+                return error_response
 
             return Response(PartnerProfileSerializer(user).data, status=status.HTTP_200_OK)
         except Exception as e:
@@ -501,29 +526,26 @@ class SendEmailOTPView(APIView):
     permission_classes = [AllowAny]
 
     @swagger_auto_schema(
-        operation_description="Send or Resend OTP to the partner's email based on session token",
-        request_body=openapi.Schema(type=openapi.TYPE_OBJECT, required=['partner_session_token'], properties={'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description="Session token of the partner")}),
+        operation_description=(
+            "Send or resend OTP for the authenticated partner. "
+            "Canonical operator requests use the Authorization header."
+        ),
+        request_body=openapi.Schema(
+            type=openapi.TYPE_OBJECT,
+            properties={},
+        ),
         responses={
             200: "OTP sent successfully.",
             400: "Bad Request: Missing or invalid input data",
-            401: "Unauthorized: Admin permissions required",
-            404: "Not Found: User not found with the provided session token",
+            401: "Unauthorized: Authenticated partner profile required",
             500: "Server Error: Internal server error"
         }
     )
     def put(self, request, *args, **kwargs):
         try:
-            # Check if session_token is provided
-            partner_session_token = request.data.get('partner_session_token')
-            if not partner_session_token:
-                return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Retrieve user profile based on session_token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-
-            # Check if user exists
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
+            user, error_response = resolve_partner_auth_request(request)
+            if error_response:
+                return error_response
 
             otp = random_six_digits()
             full_phone_number = build_partner_full_phone_number(user)
@@ -552,33 +574,31 @@ class MatchEmailOTPView(APIView):
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the partner'),
                 'otp': openapi.Schema(type=openapi.TYPE_STRING, description='OTP Password of user'),
             },
-            required=['partner_session_token', 'otp']
+            required=['otp']
         ),
         responses={
             200: openapi.Response("Success: OTP Matched successfully", PartnerProfileSerializer),
             400: "Bad Request: Missing required information or invalid data format",
-            401: "Unauthorized: Admin permissions required",
+            401: "Unauthorized: Authenticated partner profile required",
             404: "Not Found: User not recognized",
             500: "Server Error: Internal server error"
         },
-        operation_description="Update address details for a user"
+        operation_description=(
+            "Verify OTP for the authenticated partner. "
+            "Canonical operator requests use the Authorization header."
+        )
     )
     def put(self, request, *args, **kwargs):
         try:
-            # Check if session_token is provided
-            partner_session_token = request.data.get('partner_session_token')
             otp = request.data.get('otp')
-            if not otp or not partner_session_token:
+            if not otp:
                 return Response({"message": "Missing OTP or user information."}, status=status.HTTP_400_BAD_REQUEST)
 
-            #  Retrieve user profile based on session_token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
-            user = normalize_legacy_review_status(user)
+            user, error_response = resolve_partner_auth_request(request)
+            if error_response:
+                return error_response
 
             # Check OTP expiry window
             time_difference = timezone.now() - user.otp_time
@@ -1095,6 +1115,7 @@ class UpdateBusinessProfileView(AuthenticatedPartnerMutationAPIView):
 
 
 class CheckPartnerUsernameAvailabilityView(APIView):
+    authentication_classes = [SessionTokenHeaderAuthentication]
     permission_classes = [AllowAny]
 
     @swagger_auto_schema(
@@ -1102,10 +1123,9 @@ class CheckPartnerUsernameAvailabilityView(APIView):
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description="Session token of the partner"),
                 'user_name': openapi.Schema(type=openapi.TYPE_STRING, description="Desired username of the partner"),
             },
-            required=['partner_session_token', 'user_name']
+            required=['user_name']
         ),
         responses={
             200: "This username is available.",
@@ -1119,23 +1139,21 @@ class CheckPartnerUsernameAvailabilityView(APIView):
     def post(self, request, *args, **kwargs):
         try:
             data = request.data
-            partner_session_token = request.data.get('partner_session_token')
-            user_name = request.data.get('user_name')
+            user_name = (request.data.get('user_name') or '').strip()
 
             # Validate required fields
-            required_fields = ['user_name', 'partner_session_token']
+            required_fields = ['user_name']
             error_response = validate_required_fields(required_fields, data)
             if error_response:
                 return error_response
 
+            user, auth_error_response = resolve_partner_auth_request(request)
+            if auth_error_response:
+                return auth_error_response
+
             # Validate username format
             if not re.match(r'^\w+$', user_name):
                 return Response({"message": "Invalid username. Only alphanumeric characters and underscores are allowed."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Fetch user based on the partner session token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided partner session token."}, status=status.HTTP_404_NOT_FOUND)
 
             # Check if the username is already taken by another user
             if user.user_name != user_name.lower():
@@ -1153,29 +1171,34 @@ class GetPartnerAddressView(APIView):
     permission_classes = [AllowAny]
 
     @swagger_auto_schema(
+        operation_description=(
+            "Retrieve the mailing address details of the authenticated partner. "
+            "Admin-session aliases may still supply `partner_session_token` through "
+            "explicit compatibility helpers, but canonical operator requests use "
+            "the Authorization header."
+        ),
         manual_parameters=[
-            openapi.Parameter('partner_session_token', openapi.IN_QUERY, type=openapi.TYPE_STRING, required=True, description='Session token of the partner'),
+            openapi.Parameter(
+                'partner_session_token',
+                openapi.IN_QUERY,
+                type=openapi.TYPE_STRING,
+                required=False,
+                description='Optional for documented legacy/admin compatibility only.',
+            ),
         ],
         responses={
             200: openapi.Response("Success: Address details retrieved successfully", PartnerMailingDetailSerializer),
             400: "Bad Request: Missing required information or user not recognized",
-            401: "Unauthorized: Admin permissions required",
+            401: "Unauthorized: Authenticated partner profile required",
             404: "Not Found: Address details not found for the user",
             500: "Server Error: Internal server error"
-        },
-        operation_description="Retrieve the mailing address details of a partner."
+        }
     )
     def get(self, request):
         try:
-            # Check if the partner_session_token is provided
-            partner_session_token = self.request.GET.get('partner_session_token')
-            if not partner_session_token:
-                return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Fetch the user based on the partner_session_token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
+            user, error_response = resolve_partner_read_request(request)
+            if error_response:
+                return error_response
 
             # Fetch the mailing address details of the user
             address_detail = PartnerMailingDetail.objects.filter(mailing_of_partner=user)

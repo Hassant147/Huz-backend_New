@@ -2610,7 +2610,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
     def _request_package_reviews(self, **query_params):
         request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_rating_and_review_package_wise/",
+                "/api/v1/operator/bookings/ratings/package/",
                 query_params,
             )
         )
@@ -2764,7 +2764,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_all_booking_detail_for_partner/",
+                "/api/v1/operator/bookings/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "workflow_bucket": "READY",
@@ -2789,7 +2789,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self._mark_in_fulfillment(booking)
 
         request = self.factory.get(
-            "/bookings/get_all_booking_detail_for_partner/",
+            "/api/v1/operator/bookings/",
             {
                 "partner_session_token": self.partner_a.partner_session_token,
                 "workflow_bucket": "FULFILLMENT",
@@ -2799,8 +2799,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         )
 
         response = GetBookingShortDetailForPartnersView.as_view()(request)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data.get("count"), 1)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
     def test_booking_list_filters_by_booking_number_prefix(self):
         matching_booking = self._create_booking(
@@ -2820,7 +2819,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_all_booking_detail_for_partner/",
+                "/api/v1/operator/bookings/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "workflow_bucket": "FULFILLMENT",
@@ -2863,7 +2862,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_all_booking_detail_for_partner/",
+                "/api/v1/operator/bookings/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "workflow_bucket": WORKFLOW_BUCKET_ISSUES,
@@ -2911,7 +2910,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_all_booking_detail_for_partner/",
+                "/api/v1/operator/bookings/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "workflow_bucket": WORKFLOW_BUCKET_REPORTED,
@@ -2938,7 +2937,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         )
 
         request = self.factory.get(
-            "/bookings/get_all_booking_detail_for_partner/",
+            "/api/v1/operator/bookings/",
             {
                 "partner_session_token": self.partner_a.partner_session_token,
                 "booking_status": BOOKING_STATUS_HOLD,
@@ -2948,9 +2947,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         )
 
         response = GetBookingShortDetailForPartnersView.as_view()(request)
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data.get("count"), 0)
-        self.assertEqual(response.data.get("results"), [])
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
     def test_booking_list_raw_status_filter_allows_staff_override_for_hidden_bookings(self):
         hidden_booking = self._create_booking(
@@ -2962,7 +2959,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_all_booking_detail_for_partner/",
+                "/api/v1/operator/bookings/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_status": BOOKING_STATUS_HOLD,
@@ -2989,7 +2986,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         )
 
         request = self.factory.get(
-            "/bookings/get_booking_detail_by_booking_number/",
+            "/api/v1/operator/bookings/detail/",
             {
                 "partner_session_token": self.partner_a.partner_session_token,
                 "booking_number": hidden_booking.booking_number,
@@ -2997,7 +2994,33 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         )
 
         response = GetBookingDetailByBookingNumberForPartnerView.as_view()(request)
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_canonical_operator_booking_list_accepts_bearer_auth_without_partner_session_token(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-CANONICAL-LIST-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(booking)
+
+        response = self.client.get(
+            "/api/v1/operator/bookings/",
+            {
+                "workflow_bucket": "FULFILLMENT",
+                "page": 1,
+                "page_size": 10,
+            },
+            HTTP_AUTHORIZATION=f"Bearer {self.partner_a.partner_session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 1)
+        self.assertEqual(
+            response.data.get("results")[0].get("booking_number"),
+            booking.booking_number,
+        )
 
     def test_staff_can_fetch_non_visible_partner_booking_detail(self):
         hidden_booking = self._create_booking(
@@ -3009,9 +3032,31 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_booking_detail_by_booking_number/",
+                "/api/v1/operator/bookings/detail/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
+                    "booking_number": hidden_booking.booking_number,
+                },
+            )
+        )
+
+        response = GetBookingDetailByBookingNumberForPartnerView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("booking_number"), hidden_booking.booking_number)
+        self.assertFalse(response.data.get("operator_visible"))
+
+    def test_staff_can_fetch_non_visible_partner_booking_detail_without_partner_token(self):
+        hidden_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-DETAIL-HIDDEN-STAFF-002",
+            booking_status=BOOKING_STATUS_HOLD,
+        )
+
+        request = self._authenticated_request(
+            self.factory.get(
+                "/api/v1/admin/operators/bookings/detail/",
+                {
                     "booking_number": hidden_booking.booking_number,
                 },
             )
@@ -3062,7 +3107,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_booking_detail_by_booking_number/",
+                "/api/v1/operator/bookings/detail/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": booking.booking_number,
@@ -3103,7 +3148,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.post(
-                "/bookings/manage_booking_hotel_or_transport_details/",
+                "/api/v1/operator/bookings/arrangements/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": booking.booking_number,
@@ -3254,7 +3299,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self._mark_in_fulfillment(mutable_booking)
 
         action_response = self.client.put(
-            "/bookings/partner_action_for_booking/",
+            "/api/v1/operator/bookings/action/",
             {
                 "partner_session_token": self.partner_a.partner_session_token,
                 "booking_number": action_booking.booking_number,
@@ -3266,7 +3311,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertEqual(action_response.status_code, status.HTTP_401_UNAUTHORIZED)
 
         upload_response = self.client.post(
-            "/bookings/manage_booking_documents/",
+            "/api/v1/operator/bookings/documents/",
             {
                 "partner_session_token": self.partner_a.partner_session_token,
                 "booking_number": mutable_booking.booking_number,
@@ -3282,7 +3327,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertEqual(upload_response.status_code, status.HTTP_401_UNAUTHORIZED)
 
         delete_response = self.client.delete(
-            "/bookings/delete_booking_documents/",
+            "/api/v1/operator/bookings/document-delete/",
             {
                 "partner_session_token": self.partner_a.partner_session_token,
                 "booking_number": mutable_booking.booking_number,
@@ -3293,7 +3338,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertEqual(delete_response.status_code, status.HTTP_401_UNAUTHORIZED)
 
         airline_post_response = self.client.post(
-            "/bookings/manage_booking_airline_details/",
+            "/api/v1/operator/bookings/airline-details/",
             {
                 "partner_session_token": self.partner_a.partner_session_token,
                 "booking_number": mutable_booking.booking_number,
@@ -3311,7 +3356,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         )
 
         airline_put_response = self.client.put(
-            "/bookings/manage_booking_airline_details/",
+            "/api/v1/operator/bookings/airline-details/",
             {
                 "partner_session_token": self.partner_a.partner_session_token,
                 "booking_airline_id": str(uuid4()),
@@ -3330,7 +3375,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         )
 
         arrangement_post_response = self.client.post(
-            "/bookings/manage_booking_hotel_or_transport_details/",
+            "/api/v1/operator/bookings/arrangements/",
             {
                 "partner_session_token": self.partner_a.partner_session_token,
                 "booking_number": mutable_booking.booking_number,
@@ -3348,7 +3393,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         )
 
         arrangement_put_response = self.client.put(
-            "/bookings/manage_booking_hotel_or_transport_details/",
+            "/api/v1/operator/bookings/arrangements/",
             {
                 "partner_session_token": self.partner_a.partner_session_token,
                 "booking_number": mutable_booking.booking_number,
@@ -3445,7 +3490,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         )
 
         action_response = self.client.put(
-            "/bookings/partner_action_for_booking/",
+            "/api/v1/operator/bookings/action/",
             {
                 "partner_session_token": self.partner_b.partner_session_token,
                 "booking_number": action_booking.booking_number,
@@ -3460,7 +3505,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertEqual(action_booking.booking_status, BOOKING_STATUS_READY_FOR_OPERATOR)
 
         upload_response = self.client.post(
-            "/bookings/manage_booking_documents/",
+            "/api/v1/operator/bookings/documents/",
             {
                 "partner_session_token": self.partner_b.partner_session_token,
                 "booking_number": document_booking.booking_number,
@@ -3483,7 +3528,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         )
 
         delete_response = self.client.delete(
-            "/bookings/delete_booking_documents/",
+            "/api/v1/operator/bookings/document-delete/",
             {
                 "partner_session_token": self.partner_b.partner_session_token,
                 "booking_number": document_booking.booking_number,
@@ -3500,7 +3545,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         )
 
         airline_post_response = self.client.post(
-            "/bookings/manage_booking_airline_details/",
+            "/api/v1/operator/bookings/airline-details/",
             {
                 "partner_session_token": self.partner_b.partner_session_token,
                 "booking_number": airline_post_booking.booking_number,
@@ -3521,7 +3566,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         )
 
         airline_put_response = self.client.put(
-            "/bookings/manage_booking_airline_details/",
+            "/api/v1/operator/bookings/airline-details/",
             {
                 "partner_session_token": self.partner_b.partner_session_token,
                 "booking_airline_id": str(existing_airline.booking_airline_id),
@@ -3541,7 +3586,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertEqual(existing_airline.flight_to, "Jeddah")
 
         arrangement_post_response = self.client.post(
-            "/bookings/manage_booking_hotel_or_transport_details/",
+            "/api/v1/operator/bookings/arrangements/",
             {
                 "partner_session_token": self.partner_b.partner_session_token,
                 "booking_number": arrangement_post_booking.booking_number,
@@ -3565,7 +3610,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         )
 
         arrangement_put_response = self.client.put(
-            "/bookings/manage_booking_hotel_or_transport_details/",
+            "/api/v1/operator/bookings/arrangements/",
             {
                 "partner_session_token": self.partner_b.partner_session_token,
                 "booking_number": arrangement_put_booking.booking_number,
@@ -3602,7 +3647,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self._mark_ready_for_operator(booking)
 
         response = self.client.put(
-            "/bookings/partner_action_for_booking/",
+            "/api/v1/operator/bookings/action/",
             {
                 "booking_number": booking.booking_number,
                 "partner_remarks": "Proceed with fulfillment",
@@ -3629,7 +3674,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self._mark_in_fulfillment(booking)
 
         upload_response = self.client.post(
-            "/bookings/manage_booking_documents/",
+            "/api/v1/operator/bookings/documents/",
             {
                 "booking_number": booking.booking_number,
                 "document_for": "eVisa",
@@ -3651,7 +3696,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertIsNotNone(document)
 
         delete_response = self.client.delete(
-            "/bookings/delete_booking_documents/",
+            "/api/v1/operator/bookings/document-delete/",
             {
                 "booking_number": booking.booking_number,
                 "document_id": str(document.document_id),
@@ -3675,7 +3720,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self._mark_in_fulfillment(booking)
 
         response = self.client.post(
-            "/bookings/manage_booking_airline_details/",
+            "/api/v1/operator/bookings/airline-details/",
             {
                 "booking_number": booking.booking_number,
                 "flight_direction": "outbound",
@@ -3706,7 +3751,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self._mark_in_fulfillment(booking)
 
         response = self.client.post(
-            "/bookings/manage_booking_hotel_or_transport_details/",
+            "/api/v1/operator/bookings/arrangements/",
             {
                 "booking_number": booking.booking_number,
                 "detail_for": "Transport",
@@ -3737,7 +3782,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self._mark_ready_for_travel(booking)
 
         response = self.client.put(
-            "/bookings/update_booking_status_into_close/",
+            "/api/v1/operator/bookings/close/",
             {
                 "booking_number": booking.booking_number,
             },
@@ -3763,7 +3808,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertIsNotNone(passport)
 
         response = self.client.put(
-            "/bookings/manage_traveler_issues/",
+            "/api/v1/operator/bookings/issues/",
             {
                 "booking_number": booking.booking_number,
                 "passport_id": str(passport.passport_id),
@@ -3784,7 +3829,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
     def test_complaints_list_returns_paginated_empty_payload(self):
         request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_all_complaints_for_partner/",
+                "/api/v1/operator/bookings/complaints/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "page": 1,
@@ -3831,7 +3876,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_all_complaints_for_partner/",
+                "/api/v1/operator/bookings/complaints/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                 },
@@ -3874,7 +3919,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_all_complaints_for_partner/",
+                "/api/v1/operator/bookings/complaints/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "complaint_status": "Open",
@@ -3907,7 +3952,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.post(
-                "/bookings/give_feedback_on_complaints/",
+                "/api/v1/operator/bookings/complaints/respond/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "complaint_id": str(complaint.complaint_id),
@@ -3940,7 +3985,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.post(
-                "/bookings/give_feedback_on_complaints/",
+                "/api/v1/operator/bookings/complaints/respond/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "complaint_id": str(complaint.complaint_id),
@@ -3973,7 +4018,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.post(
-                "/bookings/give_feedback_on_complaints/",
+                "/api/v1/operator/bookings/complaints/respond/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "complaint_id": str(complaint.complaint_id),
@@ -4008,7 +4053,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.post(
-                "/bookings/manage_booking_documents/",
+                "/api/v1/operator/bookings/documents/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": booking.booking_number,
@@ -4048,7 +4093,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.delete(
-                "/bookings/delete_booking_documents/",
+                "/api/v1/operator/bookings/document-delete/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": booking.booking_number,
@@ -4071,7 +4116,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
     def test_hotel_transport_post_requires_booking_number(self):
         request = self._authenticated_request(
             self.factory.post(
-                "/bookings/manage_booking_hotel_or_transport_details/",
+                "/api/v1/operator/bookings/arrangements/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "jeddah_name": "J Name",
@@ -4102,7 +4147,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.post(
-                "/bookings/manage_booking_hotel_or_transport_details/",
+                "/api/v1/operator/bookings/arrangements/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": booking.booking_number,
@@ -4154,7 +4199,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         outbound_request = self._authenticated_request(
             self.factory.post(
-                "/bookings/manage_booking_airline_details/",
+                "/api/v1/operator/bookings/airline-details/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": booking.booking_number,
@@ -4178,7 +4223,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         return_request = self._authenticated_request(
             self.factory.post(
-                "/bookings/manage_booking_airline_details/",
+                "/api/v1/operator/bookings/airline-details/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": booking.booking_number,
@@ -4219,7 +4264,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.post(
-                "/bookings/manage_booking_airline_details/",
+                "/api/v1/operator/bookings/airline-details/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": booking.booking_number,
@@ -4272,7 +4317,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.put(
-                "/bookings/manage_booking_airline_details/",
+                "/api/v1/operator/bookings/airline-details/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_airline_id": str(other_airline.booking_airline_id),
@@ -4305,7 +4350,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.put(
-                "/bookings/update_booking_status_into_close/",
+                "/api/v1/operator/bookings/close/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": other_partner_booking.booking_number,
@@ -4343,7 +4388,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.put(
-                "/bookings/update_booking_status_into_close/",
+                "/api/v1/operator/bookings/close/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": booking.booking_number,
@@ -4384,7 +4429,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.put(
-                "/bookings/manage_traveler_issues/",
+                "/api/v1/operator/bookings/issues/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": partner_booking.booking_number,
@@ -4426,7 +4471,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.put(
-                "/bookings/manage_traveler_issues/",
+                "/api/v1/operator/bookings/issues/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": booking.booking_number,
@@ -4476,7 +4521,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         active_request = self._authenticated_request(
             self.factory.put(
-                "/bookings/partner_action_for_booking/",
+                "/api/v1/operator/bookings/action/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": pending_booking_active.booking_number,
@@ -4492,7 +4537,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         objection_request = self._authenticated_request(
             self.factory.put(
-                "/bookings/partner_action_for_booking/",
+                "/api/v1/operator/bookings/action/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "booking_number": pending_booking_objection.booking_number,
@@ -4535,7 +4580,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_overall_complaints_counts/",
+                "/api/v1/operator/bookings/complaints/summary/",
                 {"partner_session_token": self.partner_a.partner_session_token},
             )
         )
@@ -4550,7 +4595,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
     def test_yearly_earning_statistics_rejects_invalid_year(self):
         request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_yearly_earning_statistics/",
+                "/api/v1/operator/bookings/earnings/yearly/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "year": "not-a-year",
@@ -4611,7 +4656,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_overall_booking_statistics/",
+                "/api/v1/operator/bookings/statistics/",
                 {"partner_session_token": self.partner_a.partner_session_token},
             )
         )
@@ -4640,7 +4685,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_overall_booking_statistics/",
+                "/api/v1/operator/bookings/statistics/",
                 {"partner_session_token": self.partner_a.partner_session_token},
             )
         )
@@ -4654,7 +4699,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
     def test_receivable_payment_statistics_returns_paginated_empty_payload(self):
         request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_receivable_payment_statistics/",
+                "/api/v1/operator/bookings/payments/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "page": 1,
@@ -4703,7 +4748,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_receivable_payment_statistics/",
+                "/api/v1/operator/bookings/payments/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "page": 1,
@@ -4925,7 +4970,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         overall_request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_overall_partner_rating/",
+                "/api/v1/operator/bookings/ratings/summary/",
                 {"partner_session_token": self.partner_a.partner_session_token},
             )
         )
@@ -4937,7 +4982,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         package_request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_overall_rating_package_wise/",
+                "/api/v1/operator/bookings/ratings/package-summary/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "huz_token": self.package_a.huz_token,
@@ -4968,7 +5013,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         overall_request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_overall_partner_rating/",
+                "/api/v1/operator/bookings/ratings/summary/",
                 {"partner_session_token": self.partner_a.partner_session_token},
             )
         )
@@ -4977,7 +5022,7 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         package_request = self._authenticated_request(
             self.factory.get(
-                "/bookings/get_overall_rating_package_wise/",
+                "/api/v1/operator/bookings/ratings/package-summary/",
                 {
                     "partner_session_token": self.partner_a.partner_session_token,
                     "huz_token": self.package_a.huz_token,

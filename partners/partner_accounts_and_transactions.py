@@ -5,7 +5,10 @@ from rest_framework.exceptions import AuthenticationFailed
 from rest_framework import status
 from .models import PartnerProfile, PartnerWithdraw, PartnerBankAccount, Wallet, PartnerTransactionHistory
 from .serializers import PartnerWithdrawSerializer, PartnerBankAccountSerializer, PartnerTransactionSerializer
-from common.authentication import SessionTokenHeaderAuthentication
+from common.authentication import (
+    SessionTokenHeaderAuthentication,
+    get_authenticated_partner_profile,
+)
 from common.auth_utils import require_partner_profile
 from common.utility import validate_required_fields
 from common.logs_file import logger
@@ -33,13 +36,36 @@ class PartnerHeaderAuthenticationAPIView(APIView):
             data.pop("partner_session_token", None)
         return data
 
+    @staticmethod
+    def resolve_read_partner(request):
+        partner = get_authenticated_partner_profile(request)
+        if partner is not None:
+            return partner, None
+
+        return None, Response(
+            {"message": "Authenticated partner profile is required."},
+            status=status.HTTP_401_UNAUTHORIZED,
+        )
+
 
 class ManagePartnerBankAccountView(PartnerHeaderAuthenticationAPIView):
     permission_classes = [AllowAny]
 
     @swagger_auto_schema(
+        operation_description=(
+            "Retrieve bank accounts for the authenticated partner. "
+            "Admin-session aliases may still supply `partner_session_token` through "
+            "explicit compatibility helpers, but canonical operator requests use "
+            "the Authorization header."
+        ),
         manual_parameters=[
-            openapi.Parameter('partner_session_token', openapi.IN_QUERY, description="Session token of the partner", type=openapi.TYPE_STRING, required=True)
+            openapi.Parameter(
+                'partner_session_token',
+                openapi.IN_QUERY,
+                description='Optional for documented legacy/admin compatibility only.',
+                type=openapi.TYPE_STRING,
+                required=False,
+            )
         ],
         responses={
             200: openapi.Response('Successfully retrieved bank accounts', PartnerBankAccountSerializer(many=True)),
@@ -50,14 +76,9 @@ class ManagePartnerBankAccountView(PartnerHeaderAuthenticationAPIView):
     )
     def get(self, request):
         try:
-            partner_session_token = request.GET.get('partner_session_token')
-            if not partner_session_token:
-                return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Retrieve user based on session_token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_400_BAD_REQUEST)
+            user, error_response = self.resolve_read_partner(request)
+            if error_response:
+                return error_response
 
             # Retrieve bank accounts associated with the user
             bank_accounts = PartnerBankAccount.objects.filter(bank_account_for_partner=user)
@@ -167,8 +188,20 @@ class ManagePartnerWithdrawView(PartnerHeaderAuthenticationAPIView):
     permission_classes = [AllowAny]
 
     @swagger_auto_schema(
+        operation_description=(
+            "Retrieve withdrawal requests for the authenticated partner. "
+            "Admin-session aliases may still supply `partner_session_token` through "
+            "explicit compatibility helpers, but canonical operator requests use "
+            "the Authorization header."
+        ),
         manual_parameters=[
-            openapi.Parameter('partner_session_token', openapi.IN_QUERY, type=openapi.TYPE_STRING, required=True, description='Session token of the partner')
+            openapi.Parameter(
+                'partner_session_token',
+                openapi.IN_QUERY,
+                type=openapi.TYPE_STRING,
+                required=False,
+                description='Optional for documented legacy/admin compatibility only.',
+            )
         ],
         responses={
             200: openapi.Response("Successful retrieval of withdrawal requests", PartnerWithdrawSerializer),
@@ -179,15 +212,9 @@ class ManagePartnerWithdrawView(PartnerHeaderAuthenticationAPIView):
     )
     def get(self, request):
         try:
-            # Check if session_token exist
-            partner_session_token = self.request.GET.get('partner_session_token', None)
-            if not partner_session_token:
-                return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Retrieve user based on session_token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
+            user, error_response = self.resolve_read_partner(request)
+            if error_response:
+                return error_response
 
             # Check if there are withdrawal requests for the user
             check_exist = PartnerWithdraw.objects.filter(withdraw_for_partner=user)
@@ -279,13 +306,26 @@ class ManagePartnerWithdrawView(PartnerHeaderAuthenticationAPIView):
             return Response({"message": "Failed to add user withdraw request. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class GetPartnerAllTransactionHistoryView(APIView):
+class GetPartnerAllTransactionHistoryView(PartnerHeaderAuthenticationAPIView):
     permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         operation_summary="Get Partner Transaction History",
-        operation_description="Retrieve all transaction history for a user based on session token",
-        manual_parameters=[openapi.Parameter('partner_session_token', openapi.IN_QUERY, type=openapi.TYPE_STRING, required=True, description='Session token of the user')],
+        operation_description=(
+            "Retrieve all transaction history for the authenticated partner. "
+            "Admin-session aliases may still supply `partner_session_token` through "
+            "explicit compatibility helpers, but canonical operator requests use "
+            "the Authorization header."
+        ),
+        manual_parameters=[
+            openapi.Parameter(
+                'partner_session_token',
+                openapi.IN_QUERY,
+                type=openapi.TYPE_STRING,
+                required=False,
+                description='Optional for documented legacy/admin compatibility only.',
+            )
+        ],
         responses={
             200: openapi.Response("Successful retrieval of transaction history", PartnerTransactionSerializer(many=True)),
             404: "Not Found: User or transaction history not found",
@@ -295,15 +335,9 @@ class GetPartnerAllTransactionHistoryView(APIView):
     )
     def get(self, request):
         try:
-            # Check if session_token exist
-            partner_session_token = request.GET.get('partner_session_token')
-            if not partner_session_token:
-                return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Retrieve user based on session_token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
+            user, error_response = self.resolve_read_partner(request)
+            if error_response:
+                return error_response
 
             # Retrieve user transactions based on user session_token
             exist_trans = PartnerTransactionHistory.objects.filter(
@@ -322,13 +356,26 @@ class GetPartnerAllTransactionHistoryView(APIView):
             return Response({"message": "Failed to get user transaction history. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class GetPartnerTransactionOverallSummaryView(APIView):
+class GetPartnerTransactionOverallSummaryView(PartnerHeaderAuthenticationAPIView):
     permission_classes = [AllowAny]
 
     @swagger_auto_schema(
         operation_summary="Get Partner Transaction Counts and Amounts Summary",
-        operation_description="Retrieve the total credit and debit transaction amounts and counts for a partner based on session token",
-        manual_parameters=[openapi.Parameter('partner_session_token', openapi.IN_QUERY, description="Session token of the partner", type=openapi.TYPE_STRING, required=True)],
+        operation_description=(
+            "Retrieve total credit and debit transaction amounts and counts for "
+            "the authenticated partner. Admin-session aliases may still supply "
+            "`partner_session_token` through explicit compatibility helpers, but "
+            "canonical operator requests use the Authorization header."
+        ),
+        manual_parameters=[
+            openapi.Parameter(
+                'partner_session_token',
+                openapi.IN_QUERY,
+                description='Optional for documented legacy/admin compatibility only.',
+                type=openapi.TYPE_STRING,
+                required=False,
+            )
+        ],
         responses={
             200: openapi.Response("Successful retrieval of transaction amount summary"),
             404: "Not Found: User or transaction records not found",
@@ -338,15 +385,9 @@ class GetPartnerTransactionOverallSummaryView(APIView):
     )
     def get(self, request):
         try:
-            # Check if session_token is provided
-            partner_session_token = request.GET.get('partner_session_token')
-            if not partner_session_token:
-                return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Retrieve user based on session_token and checking if user exists
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
+            user, error_response = self.resolve_read_partner(request)
+            if error_response:
+                return error_response
 
             # Aggregate total credit transaction amounts and counts for the user
             credit_transaction = PartnerTransactionHistory.objects.filter(

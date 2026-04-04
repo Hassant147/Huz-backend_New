@@ -18,8 +18,8 @@ from drf_yasg.utils import swagger_auto_schema
 from booking.models import BookingRatingAndReview
 from common.authentication import (
     SessionTokenHeaderAuthentication,
+    get_authenticated_partner_profile,
     is_authenticated_staff_user,
-    resolve_authenticated_partner_profile,
 )
 from common.auth_utils import is_admin_request, require_partner_profile
 from common.logs_file import logger
@@ -345,24 +345,32 @@ class AuthenticatedPartnerPackageMutationAPIView(OperatorPackageBaseView):
         return ""
 
     def _get_partner(self, request, require_active=False):
-        partner = resolve_authenticated_partner_profile(request)
+        partner = get_authenticated_partner_profile(request)
         if partner is None:
-            if is_authenticated_staff_user(request):
-                partner_token = self._extract_partner_session_token(request)
-                if not partner_token:
-                    return None, Response(
-                        {"message": "Missing user information."},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
+            if not is_authenticated_staff_user(request):
+                return None, Response(
+                    {"detail": "Authentication credentials were not provided."},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
+
+            # Staff/admin compatibility can still scope these mutation views to
+            # a selected partner token; authenticated operators resolve from
+            # the Authorization header instead.
+            partner_token = self._extract_partner_session_token(request)
+            if not partner_token:
+                return None, Response(
+                    {"message": "Missing user information."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            partner = PartnerProfile.objects.filter(
+                partner_session_token=partner_token
+            ).first()
+            if partner is None:
                 return None, Response(
                     {"message": "User not found with the provided detail."},
                     status=status.HTTP_404_NOT_FOUND,
                 )
-
-            return None, Response(
-                {"detail": "Authentication credentials were not provided."},
-                status=status.HTTP_401_UNAUTHORIZED,
-            )
 
         if require_active and partner.account_status != "Active":
             return None, Response(
@@ -1421,15 +1429,17 @@ class GetAllHotelsWithImagesView(OperatorPackageBaseView):
     @swagger_auto_schema(
         operation_description=(
             "Get all master hotels for package creation dropdowns. "
-            "Returns hotel list with lightweight image placeholders."
+            "Returns hotel list with lightweight image placeholders. "
+            "Authenticated operators use the Authorization header; "
+            "`partner_session_token` is only for documented staff/admin compatibility."
         ),
         manual_parameters=[
             openapi.Parameter(
                 "partner_session_token",
                 openapi.IN_QUERY,
-                description="Partner session token",
+                description="Optional for documented staff/admin compatibility only.",
                 type=openapi.TYPE_STRING,
-                required=True,
+                required=False,
             ),
             openapi.Parameter(
                 "city",
@@ -1566,14 +1576,18 @@ class ManageHuzPackageStatusView(AuthenticatedPartnerPackageMutationAPIView):
 
 class GetHuzShortPackageByTokenView(OperatorPackageBaseView):
     @swagger_auto_schema(
-        operation_description="Get partner packages with filtering and pagination.",
+        operation_description=(
+            "Get partner packages with filtering and pagination. "
+            "Authenticated operators use the Authorization header; "
+            "`partner_session_token` is only for documented staff/admin compatibility."
+        ),
         manual_parameters=[
             openapi.Parameter(
                 "partner_session_token",
                 openapi.IN_QUERY,
-                description="Partner session token",
+                description="Optional for documented staff/admin compatibility only.",
                 type=openapi.TYPE_STRING,
-                required=True,
+                required=False,
             ),
             openapi.Parameter(
                 "package_type",
@@ -1661,14 +1675,18 @@ class GetHuzShortPackageByTokenView(OperatorPackageBaseView):
 
 class GetHuzPackageDetailByTokenView(OperatorPackageBaseView):
     @swagger_auto_schema(
-        operation_description="Get package detail by partner token and package token.",
+        operation_description=(
+            "Get package detail by token. Authenticated operators use the "
+            "Authorization header; `partner_session_token` is only for documented "
+            "staff/admin compatibility."
+        ),
         manual_parameters=[
             openapi.Parameter(
                 "partner_session_token",
                 openapi.IN_QUERY,
-                description="Partner session token",
+                description="Optional for documented staff/admin compatibility only.",
                 type=openapi.TYPE_STRING,
-                required=True,
+                required=False,
             ),
             openapi.Parameter(
                 "huz_token",
@@ -1721,14 +1739,18 @@ class GetHuzPackageDetailByTokenView(OperatorPackageBaseView):
 
 class GetPartnersOverallPackagesStatisticsView(OperatorPackageBaseView):
     @swagger_auto_schema(
-        operation_description="Get overall package statistics for a partner.",
+        operation_description=(
+            "Get overall package statistics for a partner. Authenticated operators "
+            "use the Authorization header; `partner_session_token` is only for "
+            "documented staff/admin compatibility."
+        ),
         manual_parameters=[
             openapi.Parameter(
                 "partner_session_token",
                 openapi.IN_QUERY,
-                description="Partner session token",
+                description="Optional for documented staff/admin compatibility only.",
                 type=openapi.TYPE_STRING,
-                required=True,
+                required=False,
             )
         ],
     )

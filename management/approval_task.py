@@ -847,11 +847,11 @@ class ApprovedORRejectCompanyView(APIView):
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the partner'),
+                'company_id': openapi.Schema(type=openapi.TYPE_STRING, description='Company ID of the partner company'),
                 'session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the sales director (optional, used for approval)'),
                 'account_status': openapi.Schema(type=openapi.TYPE_STRING, description='Review decision for company profile', enum=['Active', 'Rejected']),
             },
-            required=['partner_session_token', 'account_status'],
+            required=['account_status'],
         ),
         responses={
             200: "Success: Company profile updated",
@@ -864,13 +864,13 @@ class ApprovedORRejectCompanyView(APIView):
     def put(self, request, *args, **kwargs):
         try:
             # Extract data from request
-            partner_session_token = (request.data.get('partner_session_token') or '').strip()
+            company_id = str(request.data.get('company_id') or '').strip()
             session_token = (request.data.get('session_token') or '').strip()
             account_status = (request.data.get('account_status') or '').strip()
 
             # Check for required parameters
-            if not partner_session_token or not account_status:
-                return Response({"message": "Missing user or account status information."}, status=status.HTTP_400_BAD_REQUEST)
+            if not company_id or not account_status:
+                return Response({"message": "Missing company or account status information."}, status=status.HTTP_400_BAD_REQUEST)
 
             if account_status not in self.ACCOUNT_STATUS_CHOICES:
                 return Response(
@@ -878,8 +878,7 @@ class ApprovedORRejectCompanyView(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
-            # Retrieve partner profile based on session token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
+            user = PartnerProfile.objects.filter(company_of_partner__company_id=company_id).first()
             if not user:
                 return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -1658,9 +1657,8 @@ class ManagePartnerReceiveAblePaymentView(APIView):
         operation_description="Updates the payment status for a partner based on the booking number and session token provided.",
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
-            required=['partner_session_token', 'booking_number'],
+            required=['booking_number'],
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='The session token of the partner'),
                 'booking_number': openapi.Schema(type=openapi.TYPE_STRING, description='The booking number associated with the payment'),
             },
         ),
@@ -1675,28 +1673,29 @@ class ManagePartnerReceiveAblePaymentView(APIView):
     )
     @transaction.atomic
     def put(self, request, *args, **kwargs):
-        partner_session_token = request.data.get('partner_session_token')
-        booking_number = request.data.get('booking_number')
+        booking_number = str(request.data.get('booking_number') or '').strip()
 
-        # Validate if both partner_session_token and booking_number are provided
-        if not partner_session_token or not booking_number:
-            return Response({"message": "Missing user or booking information."}, status=status.HTTP_400_BAD_REQUEST)
+        if not booking_number:
+            return Response({"message": "Missing booking information."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Retrieve the partner profile based on the session token
-        user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-        if not user:
-            return Response({"message": "User not found with the provided details."}, status=status.HTTP_404_NOT_FOUND)
+        # Retrieve the booking details based on the booking number
+        booking_detail = Booking.objects.select_related("order_to", "package_token").filter(
+            booking_number=booking_number
+        ).first()
+        if not booking_detail:
+            return Response({"message": "Booking not found with the provided details."},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        user = booking_detail.order_to
+
+        if not user or booking_detail.order_to_id != user.partner_id:
+            return Response({"message": "Payment detail not found with the provided details."},
+                            status=status.HTTP_404_NOT_FOUND)
 
         # Ensure the partner's account is active
         if user.account_status != "Active":
             return Response({"message": "Account status does not allow you to perform this task."},
                             status=status.HTTP_409_CONFLICT)
-
-        # Retrieve the booking details based on the booking number
-        booking_detail = Booking.objects.filter(booking_number=booking_number).first()
-        if not booking_detail:
-            return Response({"message": "Booking not found with the provided details."},
-                            status=status.HTTP_404_NOT_FOUND)
 
         # Ensure partner payouts only process after fulfillment has reached the travel-ready or completed stage
         if booking_detail.booking_status not in [BOOKING_STATUS_READY_FOR_TRAVEL, BOOKING_STATUS_COMPLETED]:

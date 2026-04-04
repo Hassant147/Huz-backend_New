@@ -1,11 +1,12 @@
 import importlib
+import smtplib
 from unittest.mock import Mock, patch
 
 from django.core.cache import cache
 from django.db import connection
 from django.test import SimpleTestCase, override_settings
 from django.test.utils import CaptureQueriesContext
-from django.urls import clear_url_caches
+from django.urls import Resolver404, clear_url_caches, resolve
 from uuid import uuid4
 from rest_framework import serializers, status
 from rest_framework.test import APIRequestFactory, APITestCase
@@ -244,6 +245,41 @@ class EmailUtilityTests(SimpleTestCase):
         self.assertFalse(result)
         mocked_smtp_ssl.assert_not_called()
         mocked_smtp.assert_not_called()
+
+    @override_settings(
+        EMAIL_DELIVERY_BACKEND="smtp",
+        EMAIL_ADDRESS="HajjUmrah.co <no-reply@example.com>",
+        EMAIL_ENVELOPE_SENDER="",
+        EMAIL_HOST="smtp.hostinger.com",
+        EMAIL_PORT=465,
+        SERVER_EMAIL="no-reply@example.com",
+        SERVER_EMAIL_PASSWORD="secret",
+        EMAIL_SEND_TIMEOUT_SECONDS=20,
+        EMAIL_USE_SSL=True,
+        EMAIL_USE_TLS=False,
+        EMAIL_STARTTLS_PORT=587,
+        EMAIL_ALLOW_STARTTLS_FALLBACK=True,
+        EMAIL_LOCAL_HOSTNAME="",
+        EMAIL_TRANSIENT_SMTP_RETRIES=2,
+        EMAIL_TRANSIENT_SMTP_RETRY_DELAY_SECONDS=1,
+    )
+    @patch("common.utility.time.sleep")
+    @patch("common.utility._send_email_via_smtp")
+    def test_send_email_retries_transient_smtp_4xx_errors(
+        self,
+        mocked_send_email_via_smtp,
+        mocked_sleep,
+    ):
+        mocked_send_email_via_smtp.side_effect = [
+            smtplib.SMTPDataError(454, b"4.3.0 Try again later"),
+            True,
+        ]
+
+        result = _send_email("recipient@example.com", "OTP test", "<p>otp</p>")
+
+        self.assertTrue(result)
+        self.assertEqual(mocked_send_email_via_smtp.call_count, 2)
+        mocked_sleep.assert_called_once_with(1)
 
 
 class CreateMemberProfileViewTransactionTests(APITestCase):
@@ -599,6 +635,24 @@ class PublicUrlExposureTests(SimpleTestCase):
         self.assertIn("huz_redoc/", routes)
         self.assertTrue(any(route.startswith("^media/") for route in routes))
         self.assertTrue(any(route.startswith("^static/") for route in routes))
+
+
+class ApiV1AuthRoutingTests(SimpleTestCase):
+    def test_auth_alias_routes_are_resolvable(self):
+        self.assertEqual(resolve("/api/v1/auth/users/exists/").url_name, "v1-auth-user-exists")
+        self.assertEqual(resolve("/api/v1/auth/otp/send/").url_name, "v1-auth-otp-send")
+        self.assertEqual(resolve("/api/v1/auth/otp/verify/").url_name, "v1-auth-otp-verify")
+        self.assertEqual(resolve("/api/v1/auth/accounts/").url_name, "v1-auth-accounts")
+
+    def test_legacy_route_families_are_not_resolvable(self):
+        for route in (
+            "/common/is_user_exist/",
+            "/partner/partner_login/",
+            "/bookings/get_booking_detail_by_booking_number/",
+        ):
+            with self.subTest(route=route):
+                with self.assertRaises(Resolver404):
+                    resolve(route)
 
 
 class UserProfileSerializerQueryTests(APITestCase):

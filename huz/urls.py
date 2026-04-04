@@ -7,9 +7,8 @@ from django.views.static import serve
 urlpatterns = [
     path('api/v1/', include('booking.api_urls')),
     path('api/v1/', include('common.api_urls')),
-    path('common/', include('common.urls')),
-    path('partner/', include('partners.urls')),
-    path('bookings/', include('booking.urls')),
+    path('api/v1/', include('partners.api_urls')),
+    path('api/v1/', include('management.api_urls')),
     # path('huz_team/', include('team.urls')),
     path('management/', include('management.urls')),
     path('admin/', admin.site.urls),

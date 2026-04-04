@@ -14,7 +14,6 @@ from common.authentication import (
     SessionTokenHeaderAuthentication,
     get_authenticated_partner_profile,
     is_authenticated_staff_user,
-    resolve_authenticated_partner_profile,
 )
 from common.pagination import CustomPagination
 from common.permissions import IsAdminOrAuthenticatedPartnerProfile
@@ -87,6 +86,11 @@ def extract_partner_session_token(request):
     authenticated_partner = get_authenticated_partner_profile(request)
     if authenticated_partner is not None:
         return str(authenticated_partner.partner_session_token or "").strip()
+
+    # Hidden-booking staff/admin views may still select a partner explicitly;
+    # authenticated operators resolve the partner from bearer auth above.
+    if not request_has_partner_visibility_override(request):
+        return ""
 
     token = request.query_params.get("partner_session_token")
     if token:
@@ -438,9 +442,12 @@ def _build_partner_booking_response(request, booking_detail):
 
 
 def resolve_partner_for_request(request, partner_session_token=""):
-    partner = resolve_authenticated_partner_profile(request)
+    partner = get_authenticated_partner_profile(request)
     if partner:
         return partner
+
+    if not request_has_partner_visibility_override(request):
+        return None
 
     normalized_token = str(partner_session_token or extract_partner_session_token(request) or "").strip()
     if not normalized_token:
@@ -463,6 +470,22 @@ def get_booking_detail_for_request_context(request, booking_number, *, partner_s
     if not partner_booking_is_accessible(booking, allow_hidden=allow_hidden):
         return None
     return booking
+
+
+def resolve_partner_or_error_response(
+    request,
+    *,
+    missing_message="Missing required data fields.",
+    not_found_message="User not found.",
+):
+    partner = resolve_partner_for_request(request)
+    if partner is not None:
+        return partner, None
+
+    if not extract_partner_session_token(request):
+        return None, Response({"message": missing_message}, status=status.HTTP_400_BAD_REQUEST)
+
+    return None, Response({"message": not_found_message}, status=status.HTTP_404_NOT_FOUND)
 
 
 def get_airline_direction_label(direction):
@@ -812,11 +835,10 @@ class GetBookingShortDetailForPartnersView(APIView):
     )
     def get(self, request):
         try:
-            partner_session_token = extract_partner_session_token(request)
             booking_status = request.GET.get('booking_status')
             workflow_bucket = str(request.GET.get("workflow_bucket") or "").strip().upper()
             booking_number = str(request.GET.get('booking_number') or "").strip()
-            if not partner_session_token or (not booking_status and not workflow_bucket):
+            if not booking_status and not workflow_bucket:
                 return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
             normalized_booking_status = ""
             if booking_status:
@@ -832,9 +854,13 @@ class GetBookingShortDetailForPartnersView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            user = resolve_authenticated_partner_profile(request)
-            if not user:
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+            user, error_response = resolve_partner_or_error_response(
+                request,
+                missing_message="Missing required data fields.",
+                not_found_message="User not found.",
+            )
+            if error_response:
+                return error_response
             allow_hidden = request_has_partner_visibility_override(request)
 
             bookings_queryset = (
@@ -882,17 +908,20 @@ class GetBookingDetailByBookingNumberForPartnerView(APIView):
     )
     def get(self, request):
         try:
-            partner_session_token = extract_partner_session_token(request)
             booking_number = request.GET.get('booking_number')
 
-            # Check for required parameters
-            if not booking_number or (not partner_session_token and not request_has_partner_visibility_override(request)):
+            if not booking_number:
                 return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
+
+            partner = resolve_partner_for_request(request)
+            if partner is None and not request_has_partner_visibility_override(request):
+                if not extract_partner_session_token(request):
+                    return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
+                return Response({"message": "Partner not found."}, status=status.HTTP_404_NOT_FOUND)
 
             booking = get_booking_detail_for_request_context(
                 request,
                 booking_number,
-                partner_session_token=partner_session_token,
             )
             if not booking:
                 return Response({"message": "Booking detail not found."}, status=status.HTTP_404_NOT_FOUND)
@@ -1662,14 +1691,13 @@ class GetOverallRatingView(APIView):
     )
     def get(self, request):
         try:
-            partner_session_token = request.GET.get('partner_session_token')
-            if not partner_session_token:
-                return Response({"message": "Missing user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Retrieve partner profile using session token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "Partner not found for the given session token."}, status=status.HTTP_404_NOT_FOUND)
+            user, error_response = resolve_partner_or_error_response(
+                request,
+                missing_message="Missing user information.",
+                not_found_message="Partner not found for the given session token.",
+            )
+            if error_response:
+                return error_response
 
             partner_ratings = BookingRatingAndReview.objects.filter(rating_for_partner=user)
             total_star_counts = build_star_distribution(partner_ratings, "total_star")
@@ -1707,15 +1735,13 @@ class GetRatingPackageWiseView(APIView):
     )
     def get(self, request):
         try:
-            partner_session_token = extract_partner_session_token(request)
             huz_token = request.GET.get('huz_token')
             search = str(request.GET.get('search') or "").strip()[:100]
             requested_sort = str(request.GET.get('sort') or 'newest').strip().lower()
             from_date_raw = str(request.GET.get('from_date') or '').strip()
             to_date_raw = str(request.GET.get('to_date') or '').strip()
 
-            # Check for missing required parameters
-            if not partner_session_token or not huz_token:
+            if not huz_token:
                 return Response({"message": "Missing user or package info."},status=status.HTTP_400_BAD_REQUEST)
 
             if requested_sort and requested_sort not in REVIEW_SORT_ORDERING:
@@ -1742,11 +1768,13 @@ class GetRatingPackageWiseView(APIView):
                         status=status.HTTP_400_BAD_REQUEST,
                     )
 
-            user = resolve_authenticated_partner_profile(request)
-            if not user:
-                user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
+            user, error_response = resolve_partner_or_error_response(
+                request,
+                missing_message="Missing user or package info.",
+                not_found_message="User not found with the provided detail.",
+            )
+            if error_response:
+                return error_response
 
             # Retrieve package detail using package token and partner profile
             package_detail = HuzBasicDetail.objects.filter(huz_token=huz_token, package_provider=user).first()
@@ -1807,17 +1835,18 @@ class GetPackageOverallRatingView(APIView):
     )
     def get(self, request):
         try:
-            partner_session_token = request.GET.get('partner_session_token')
             huz_token = request.GET.get('huz_token')
 
-            # Check if required fields are provided
-            if not partner_session_token or not huz_token:
+            if not huz_token:
                 return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
 
-            # Retrieve the partner user using the session token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+            user, error_response = resolve_partner_or_error_response(
+                request,
+                missing_message="Missing required data fields.",
+                not_found_message="User not found.",
+            )
+            if error_response:
+                return error_response
 
             # Retrieve the package detail using the huz_token and partner user
             package_detail = HuzBasicDetail.objects.filter(huz_token=huz_token, package_provider=user).first()
@@ -1855,16 +1884,13 @@ class GetOverallPartnerComplaintsView(APIView):
     )
     def get(self, request):
         try:
-            partner_session_token = request.GET.get('partner_session_token')
-
-            # Check if the partner session token is provided
-            if not partner_session_token:
-                return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Retrieve the partner user using the session token
-            user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-            if not user:
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+            user, error_response = resolve_partner_or_error_response(
+                request,
+                missing_message="Missing required data fields.",
+                not_found_message="User not found.",
+            )
+            if error_response:
+                return error_response
 
             # Define the possible complaint statuses
             complaint_statuses = list(VALID_COMPLAINT_STATUSES)
@@ -1914,16 +1940,11 @@ class GetPartnerComplaintsView(APIView):
     )
     def get(self, request):
         try:
-            partner_session_token = extract_partner_session_token(request)
             complaint_status = request.GET.get('complaint_status')
             complaint_id = str(request.GET.get('complaint_id') or "").strip()
             search = str(request.GET.get('search') or "").strip()
             from_date_raw = str(request.GET.get('from_date') or "").strip()
             to_date_raw = str(request.GET.get('to_date') or "").strip()
-
-            # Check if the required parameters are provided
-            if not partner_session_token:
-                return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
 
             normalized_complaint_status = ""
             if complaint_status:
@@ -1952,9 +1973,13 @@ class GetPartnerComplaintsView(APIView):
                         status=status.HTTP_400_BAD_REQUEST
                     )
 
-            user = resolve_authenticated_partner_profile(request)
-            if not user:
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+            user, error_response = resolve_partner_or_error_response(
+                request,
+                missing_message="Missing required data fields.",
+                not_found_message="User not found.",
+            )
+            if error_response:
+                return error_response
 
             complaints = (
                 BookingComplaints.objects.select_related(
@@ -2032,7 +2057,7 @@ class GiveUpdateOnComplaintsView(APIView):
     def post(self, request, *args, **kwargs):
         try:
             data = request.data
-            required_fields = ['partner_session_token', 'complaint_id', 'complaint_status']
+            required_fields = ['complaint_id', 'complaint_status']
 
             # Check for missing fields in the request data
             missing_fields = [field for field in required_fields if field not in data]
@@ -2046,9 +2071,10 @@ class GiveUpdateOnComplaintsView(APIView):
                     {"message": f"Invalid complaint status. Status should be one of: {', '.join(VALID_COMPLAINT_STATUSES)}."},
                     status=status.HTTP_409_CONFLICT)
 
-            # Retrieve the partner user using the session token
-            user = PartnerProfile.objects.filter(partner_session_token=data.get('partner_session_token')).first()
+            user = resolve_partner_for_request(request, partner_session_token=data.get('partner_session_token'))
             if not user:
+                if not data.get("partner_session_token") and not extract_partner_session_token(request):
+                    return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
                 return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
 
             # Retrieve the complaint for the partner using the complaint ID
@@ -2121,13 +2147,13 @@ class GetPartnersOverallBookingStatisticsView(APIView):
     )
     def get(self, request):
         try:
-            partner_session_token = extract_partner_session_token(request)
-            if not partner_session_token:
-                return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
-
-            user = resolve_authenticated_partner_profile(request)
-            if not user:
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+            user, error_response = resolve_partner_or_error_response(
+                request,
+                missing_message="Missing required data fields.",
+                not_found_message="User not found.",
+            )
+            if error_response:
+                return error_response
 
             bookings_queryset = annotate_effective_booking_status(
                 Booking.objects.filter(order_to=user)
@@ -2194,9 +2220,8 @@ class GetYearlyBookingStatisticsView(APIView):
     )
     def get(self, request):
         try:
-            partner_session_token = extract_partner_session_token(request)
             year_raw = str(request.GET.get('year') or '').strip()
-            if not partner_session_token or not year_raw:
+            if not year_raw:
                 return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
 
             try:
@@ -2207,9 +2232,13 @@ class GetYearlyBookingStatisticsView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            user = resolve_authenticated_partner_profile(request)
-            if not user:
-                return Response({"message": "User not found."}, status=status.HTTP_404_NOT_FOUND)
+            user, error_response = resolve_partner_or_error_response(
+                request,
+                missing_message="Missing required data fields.",
+                not_found_message="User not found.",
+            )
+            if error_response:
+                return error_response
 
             booking_status = [BOOKING_STATUS_READY_FOR_TRAVEL, BOOKING_STATUS_COMPLETED]
             yearly_earning = Booking.objects.filter(order_to=user, booking_status__in=booking_status, order_time__year=year).aggregate(total_price=Sum('total_price'))
@@ -2248,14 +2277,13 @@ class PartnersBookingPaymentView(APIView):
     def get(self, request):
 
         try:
-            partner_session_token = extract_partner_session_token(request)
-            if not partner_session_token:
-                return Response({"message": "Missing required data fields."}, status=status.HTTP_400_BAD_REQUEST)
-
-            user = resolve_authenticated_partner_profile(request)
-            if not user:
-                return Response({"message": "User not found for the provided session token."},
-                                status=status.HTTP_404_NOT_FOUND)
+            user, error_response = resolve_partner_or_error_response(
+                request,
+                missing_message="Missing required data fields.",
+                not_found_message="User not found for the provided session token.",
+            )
+            if error_response:
+                return error_response
 
             partner_payments = (
                 PartnersBookingPayment.objects.select_related(
@@ -2387,8 +2415,11 @@ class ReportBookingView(APIView):
             traveler_issue_id = request.data.get("traveler_issue_id")
             partner_session_token = extract_partner_session_token(request)
             booking_number = request.data.get('booking_number')
+            authenticated_partner = get_authenticated_partner_profile(request)
             if not booking_number or (
-                not partner_session_token and not request_has_partner_visibility_override(request)
+                authenticated_partner is None
+                and not partner_session_token
+                and not request_has_partner_visibility_override(request)
             ) or (not passport_id and not traveler_issue_id):
                 return Response(
                     {"message": "Missing required data fields."},
