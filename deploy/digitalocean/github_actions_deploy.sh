@@ -33,5 +33,13 @@ if [[ "${current_branch}" != "${BRANCH}" ]]; then
   git checkout -B "${BRANCH}" "origin/${BRANCH}"
 fi
 
-git pull --ff-only origin "${BRANCH}"
+# Production should always mirror origin/<branch>; discard local drift.
+git reset --hard "origin/${BRANCH}"
+git clean -fd \
+  -e .env \
+  -e .venv/ \
+  -e media/ \
+  -e static/ \
+  -e staticfiles/
+
 sudo /usr/bin/bash "${RELEASE_SCRIPT}"
