@@ -16,15 +16,85 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Load deploy key
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.HUZ_GITHUB_DEPLOY_KEY }}
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate deploy key availability
+        shell: bash
+        env:
+          HUZ_GITHUB_DEPLOY_KEY: ${{ secrets.HUZ_GITHUB_DEPLOY_KEY }}
+        run: |
+          if [ -z "${HUZ_GITHUB_DEPLOY_KEY}" ]; then
+            echo "Missing HUZ_GITHUB_DEPLOY_KEY secret." >&2
+            exit 1
+          fi
+
+      - name: Write deploy key
+        shell: bash
+        env:
+          HUZ_GITHUB_DEPLOY_KEY: ${{ secrets.HUZ_GITHUB_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${HUZ_GITHUB_DEPLOY_KEY}" > ~/.ssh/huz_deploy_key
+          chmod 600 ~/.ssh/huz_deploy_key
 
       - name: Trust production host key
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -H 64.227.173.238 >> ~/.ssh/known_hosts
 
+      - name: Validate SSH access
+        shell: bash
+        run: |
+          ssh -i ~/.ssh/huz_deploy_key \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            huz@64.227.173.238 \
+            "echo deploy-ssh-ok"
+
       - name: Trigger production deploy
-        run: ssh -o BatchMode=yes huz@64.227.173.238
+        shell: bash
+        run: |
+          ssh -i ~/.ssh/huz_deploy_key \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes \
+            huz@64.227.173.238 \
+            'bash -s' < scripts/deploy_production_backend.sh
+
+      - name: Verify production canonical routes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import sys
+          import urllib.error
+          import urllib.request
+
+          checks = [
+              ("POST", "https://hajjumrah.org/api/v1/operator/auth/login/", {}),
+              ("POST", "https://hajjumrah.org/api/v1/auth/users/exists/", {}),
+              ("GET", "https://hajjumrah.org/api/v1/packages/public/", None),
+          ]
+
+          allowed_statuses = {200, 400, 401, 403, 405}
+
+          for method, url, payload in checks:
+              request = urllib.request.Request(url, method=method)
+              if payload is not None:
+                  body = json.dumps(payload).encode()
+                  request.add_header("Content-Type", "application/json")
+              else:
+                  body = None
+
+              try:
+                  with urllib.request.urlopen(request, data=body, timeout=20) as response:
+                      status = response.status
+              except urllib.error.HTTPError as error:
+                  status = error.code
+
+              print(method, url, status)
+              if status not in allowed_statuses:
+                  print(f"Unexpected production status for {url}: {status}", file=sys.stderr)
+                  sys.exit(1)
+          PY
