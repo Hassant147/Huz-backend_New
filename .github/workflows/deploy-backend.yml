@@ -14,10 +14,12 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Validate deploy key availability
         shell: bash
@@ -36,22 +38,18 @@ jobs:
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          printf '%s\n' "${HUZ_GITHUB_DEPLOY_KEY}" > ~/.ssh/huz_deploy_key
+          printf '%b\n' "${HUZ_GITHUB_DEPLOY_KEY}" | tr -d '\r' > ~/.ssh/huz_deploy_key
           chmod 600 ~/.ssh/huz_deploy_key
+
+      - name: Validate deploy key format
+        shell: bash
+        run: |
+          ssh-keygen -y -f ~/.ssh/huz_deploy_key > /dev/null
 
       - name: Trust production host key
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -H 64.227.173.238 >> ~/.ssh/known_hosts
-
-      - name: Validate SSH access
-        shell: bash
-        run: |
-          ssh -i ~/.ssh/huz_deploy_key \
-            -o BatchMode=yes \
-            -o StrictHostKeyChecking=yes \
-            huz@64.227.173.238 \
-            "echo deploy-ssh-ok"
 
       - name: Trigger production deploy
         shell: bash
@@ -59,6 +57,7 @@ jobs:
           ssh -i ~/.ssh/huz_deploy_key \
             -o BatchMode=yes \
             -o StrictHostKeyChecking=yes \
+            -o ConnectTimeout=20 \
             huz@64.227.173.238 \
             'bash -s' < scripts/deploy_production_backend.sh
 
