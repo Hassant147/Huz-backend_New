@@ -11,5 +11,6 @@ urlpatterns = [
     path("admin/bookings/payments/approve/", approval_task.ApproveBookingPaymentView.as_view(), name="v1-admin-booking-payment-approve"),
     path("admin/receivables/", approval_task.GetPartnerReceiveAblePaymentsView.as_view(), name="v1-admin-receivables"),
     path("admin/receivables/transfer/", approval_task.ManagePartnerReceiveAblePaymentView.as_view(), name="v1-admin-receivables-transfer"),
+    path("admin/packages/featured/", approval_task.ManageFeaturedPackageView.as_view(), name="v1-admin-featured-packages"),
     path("admin/catalog/hotels/", approval_task.ManageMasterHotelsCatalogView.as_view(), name="v1-admin-master-hotels"),
 ]

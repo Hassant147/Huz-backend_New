@@ -262,3 +262,29 @@ class AdminLegacyApiCleanupTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(self.receivable.payment_status, "FirstPayment")
         self.assertEqual(float(self.wallet.wallet_amount), float(self.receivable.receivable_amount))
+
+    def test_featured_package_list_defaults_to_active_packages(self):
+        response = self.client.get("/api/v1/admin/packages/featured/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(response.data.get("count", 0), 1)
+        first_item = (response.data.get("results") or [])[0]
+        self.assertIn("huz_token", first_item)
+        self.assertIn("is_featured", first_item)
+        self.assertEqual(first_item.get("package_status"), "Active")
+
+    def test_featured_package_toggle_updates_status_without_partner_token(self):
+        response = self.client.put(
+            "/api/v1/admin/packages/featured/",
+            {
+                "huz_token": self.package.huz_token,
+                "is_featured": True,
+            },
+            format="json",
+        )
+
+        self.package.refresh_from_db()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(self.package.is_featured)
+        self.assertEqual(response.data.get("huz_token"), self.package.huz_token)
+        self.assertEqual(response.data.get("is_featured"), True)

@@ -23,6 +23,8 @@ from drf_yasg import openapi
 from django.utils import timezone
 from datetime import timedelta
 from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.core.validators import validate_email
 
 
 def build_unique_partner_session_token(email):
@@ -52,6 +54,47 @@ def build_partner_full_phone_number(partner):
     if phone_number.startswith("+"):
         return phone_number
     return f"{country_code}{phone_number}"
+
+
+PARTNER_PROFILE_RESPONSE_PREFETCH_RELATIONS = (
+    "wallet_session",
+    "services_of_partner",
+    "mailing_of_partner",
+    "company_of_partner",
+    "individual_profile_of_partner",
+)
+
+REGISTRATION_OPERATOR_TYPE_CHOICES = {"Company", "Sole Proprietor"}
+REGISTRATION_PROOF_DOCUMENT_TYPE_CHOICES = {
+    "DTS License",
+    "MoRA Umrah Attestation",
+    "MoRA Hajj Approval",
+    "Munazzam / DHC Affiliation Proof",
+}
+REGISTRATION_PROOF_FILE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.pdf')
+REGISTRATION_PROOF_FILE_MAX_SIZE_BYTES = 5 * 1024 * 1024
+
+
+def _has_prefetched_partner_profile_relations(partner):
+    prefetched_cache = getattr(partner, "_prefetched_objects_cache", None) or {}
+    return all(relation in prefetched_cache for relation in PARTNER_PROFILE_RESPONSE_PREFETCH_RELATIONS)
+
+
+def get_prefetched_partner_profile_snapshot(partner):
+    if not partner:
+        return partner
+
+    if _has_prefetched_partner_profile_relations(partner):
+        return normalize_legacy_review_status(partner)
+
+    partner_snapshot = (
+        PartnerProfile.objects.filter(partner_id=partner.partner_id)
+        .prefetch_related(*PARTNER_PROFILE_RESPONSE_PREFETCH_RELATIONS)
+        .first()
+    )
+    if partner_snapshot is None:
+        return normalize_legacy_review_status(partner)
+    return normalize_legacy_review_status(partner_snapshot)
 
 
 def send_partner_verification_sms(phone_number, otp):
@@ -235,7 +278,10 @@ class PartnerLoginView(APIView):
                 user.save()
 
             # Return the serialized user data
-            return Response(PartnerProfileSerializer(user).data, status=status.HTTP_200_OK)
+            return Response(
+                PartnerProfileSerializer(get_prefetched_partner_profile_snapshot(user)).data,
+                status=status.HTTP_200_OK,
+            )
 
         except PartnerProfile.DoesNotExist:
             return Response({"message": "User does not exist."}, status=status.HTTP_404_NOT_FOUND)
@@ -471,7 +517,7 @@ class CreatePartnerProfileView(APIView):
                         )
 
                         # Serialize and return the user data
-                        serialized_user = PartnerProfileSerializer(user)
+                        serialized_user = PartnerProfileSerializer(get_prefetched_partner_profile_snapshot(user))
                         return Response(serialized_user.data, status=status.HTTP_201_CREATED)
                 except Exception as e:
                     # add logs in file
@@ -516,7 +562,10 @@ class GetPartnerProfileView(APIView):
             if error_response:
                 return error_response
 
-            return Response(PartnerProfileSerializer(user).data, status=status.HTTP_200_OK)
+            return Response(
+                PartnerProfileSerializer(get_prefetched_partner_profile_snapshot(user)).data,
+                status=status.HTTP_200_OK,
+            )
         except Exception as e:
             logger.error("GetPartnerProfileView error: %s", str(e))
             return Response({"message": "Failed to fetch partner profile. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -549,17 +598,15 @@ class SendEmailOTPView(APIView):
 
             otp = random_six_digits()
             full_phone_number = build_partner_full_phone_number(user)
-            is_sent = dispatch_partner_verification_email(
+            user.otp = otp
+            user.save()
+            dispatch_partner_verification_email(
                 user.email,
                 user.name,
                 otp,
                 full_phone_number,
-                wait_for_result=True,
+                wait_for_result=False,
             )
-            if not is_sent:
-                return Response({"message": "Failed to send OTP. Please try again."}, status=status.HTTP_502_BAD_GATEWAY)
-            user.otp = otp
-            user.save()
             return Response({"message": "OTP sent successfully."}, status=status.HTTP_200_OK)
         except Exception as e:
             # Adding logs
@@ -615,7 +662,7 @@ class MatchEmailOTPView(APIView):
                 user.save()
 
             # Returning user profile
-            serialized_user = PartnerProfileSerializer(user)
+            serialized_user = PartnerProfileSerializer(get_prefetched_partner_profile_snapshot(user))
             return Response(serialized_user.data, status=status.HTTP_200_OK)
         except Exception as e:
             # adding logs
@@ -708,7 +755,7 @@ class PartnerServicesView(AuthenticatedPartnerMutationAPIView):
 
 
                 # Serialize and return the updated user profile
-                serialized_user = PartnerProfileSerializer(user)
+                serialized_user = PartnerProfileSerializer(get_prefetched_partner_profile_snapshot(user))
                 return Response(serialized_user.data, status=status.HTTP_201_CREATED)
         except Exception as e:
             logger.error("PartnerServicesView: %s", str(e))
@@ -721,107 +768,6 @@ class PartnerServicesView(AuthenticatedPartnerMutationAPIView):
         else:
             user.partner_type = "NA"
         user.save()
-
-
-class IndividualPartnerView(AuthenticatedPartnerMutationAPIView):
-    parser_classes = [MultiPartParser, FormParser]
-
-    @swagger_auto_schema(
-        operation_description="Create an individual partner profile with driving license details and mailing address.",
-        manual_parameters=[
-            openapi.Parameter('contact_name', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Contact name of the partner"),
-            openapi.Parameter('contact_number', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Contact number of the partner"),
-            openapi.Parameter('driving_license_number', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Driving license number of the partner"),
-            openapi.Parameter('front_side_photo', openapi.IN_FORM, type=openapi.TYPE_FILE, required=True, description="Front side photo of the driving license"),
-            openapi.Parameter('back_side_photo', openapi.IN_FORM, type=openapi.TYPE_FILE, required=True, description="Back side photo of the driving license"),
-            openapi.Parameter('street_address', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Street address of the partner"),
-            openapi.Parameter('address_line2', openapi.IN_FORM, type=openapi.TYPE_STRING, required=False, description="Address line 2 of the partner"),
-            openapi.Parameter('city', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="City of the partner"),
-            openapi.Parameter('state', openapi.IN_FORM, type=openapi.TYPE_STRING, description="State of the partner"),
-            openapi.Parameter('country', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Country of the partner"),
-            openapi.Parameter('postal_code', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Postal code of the partner"),
-            openapi.Parameter('lat', openapi.IN_FORM, type=openapi.TYPE_STRING, required=False, description="Latitude coordinate of the address"),
-            openapi.Parameter('long', openapi.IN_FORM, type=openapi.TYPE_STRING, required=False, description="Longitude coordinate of the address"),
-        ],
-        responses={
-            201: openapi.Response("Success: created successfully", PartnerProfileSerializer),
-            400: "Bad Request: Missing or invalid input data.",
-            401: "Unauthorized: Admin permissions required",
-            404: "Not Found: User not found.",
-            409: "Conflict: Record already exists or update Service section first.",
-            500: "Server Error: Internal server error."
-        }
-    )
-    def post(self, request, *args, **kwargs):
-        data = self.get_request_data_without_partner_token(request)
-
-        # Validate required fields
-        required_fields = [
-            'contact_name', 'contact_number', 'driving_license_number', 'front_side_photo', 'back_side_photo',
-            'street_address', 'city', 'state', 'country', 'postal_code'
-        ]
-        error_response = validate_required_fields(required_fields, data)
-        if error_response:
-            return error_response
-
-        # Extract and validate photos
-        front_side_photo = request.data.get('front_side_photo')
-        back_side_photo = request.data.get('back_side_photo')
-        if not check_photo_format_and_size(front_side_photo) or not check_photo_format_and_size(back_side_photo):
-            return Response({"message": "Invalid file format or size."}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Validate the phone number using serializer validation
-        serializer1 = PartnerProfileSerializer(data=data)
-        try:
-            serializer1.validate_phone_number(data["contact_number"])
-        except serializers.ValidationError as e:
-            return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
-
-        user = self.get_partner(request)
-
-        # Check partner type
-        if user.partner_type == "NA":
-            return Response({"message": "Please update the Service section first."}, status=status.HTTP_409_CONFLICT)
-        if user.partner_type == "Company":
-            return Response({"message": "User is enrolled as a company."}, status=status.HTTP_409_CONFLICT)
-
-        if PartnerMailingDetail.objects.filter(mailing_of_partner=user).exists():
-            return Response({"message": "Address detail already exists."}, status=status.HTTP_409_CONFLICT)
-
-        # Check if individual profile already exists
-        if IndividualProfile.objects.filter(individual_profile_of_partner=user).exists():
-            return Response({"message": "Record already exists for this user."}, status=status.HTTP_409_CONFLICT)
-
-        try:
-            # Create individual profile and mailing detail within a transaction
-            with transaction.atomic():
-                # Create Address detail
-                serializer = PartnerProfileSerializer(data=data)
-                if serializer.is_valid():
-                    serializer.save(mailing_of_partner=user)
-                else:
-                    first_error_field = next(iter(serializer.errors))
-                    first_error_message = f"{first_error_field}: {serializer.errors[first_error_field][0]}"
-                    return Response({"message": first_error_message}, status=status.HTTP_400_BAD_REQUEST)
-
-                front_path = save_file_in_directory(front_side_photo)
-                back_path = save_file_in_directory(back_side_photo)
-
-                # Create individual profile
-                IndividualProfile.objects.create(
-                    contact_name=data['contact_name'],
-                    contact_number=data['contact_number'],
-                    driving_license_number=data['driving_license_number'],
-                    front_side_photo=front_path,
-                    back_side_photo=back_path,
-                    individual_profile_of_partner=user
-                )
-                # Create mailing detail
-            # Return serialized user data
-            return Response(PartnerProfileSerializer(user).data, status=status.HTTP_201_CREATED)
-        except Exception as e:
-            logger.error(f"IndividualPartnerView: {str(e)}")
-            return Response({"message": "An internal server error occurred."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class UpdatePartnerIndividualProfileView(AuthenticatedPartnerMutationAPIView):
@@ -879,140 +825,11 @@ class UpdatePartnerIndividualProfileView(AuthenticatedPartnerMutationAPIView):
             ind_profile.save()
 
             # Serialize the updated user profile
-            serialized_package = PartnerProfileSerializer(user)
+            serialized_package = PartnerProfileSerializer(get_prefetched_partner_profile_snapshot(user))
             return Response(serialized_package.data, status=status.HTTP_200_OK)
         except Exception as e:
             # Add in logs file
             logger.error(f"UpdatePartnerIndividualProfileView: {str(e)}")
-            return Response({"message": "An internal server error occurred."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-class BusinessPartnerView(AuthenticatedPartnerMutationAPIView):
-    parser_classes = [JSONParser, MultiPartParser, FormParser]
-
-    @swagger_auto_schema(
-        operation_description="Create a business partner profile with company details and mailing address.",
-        manual_parameters=[
-            openapi.Parameter('company_name', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Name of the company"),
-            openapi.Parameter('contact_name', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Contact name of the partner"),
-            openapi.Parameter('contact_number', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Contact number of the partner"),
-            openapi.Parameter('company_website', openapi.IN_FORM, type=openapi.TYPE_STRING, required=False, description="Website of the company"),
-            openapi.Parameter('license_type', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="License type of the company"),
-            openapi.Parameter('license_number', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="License number of the company"),
-            openapi.Parameter('total_experience', openapi.IN_FORM, type=openapi.TYPE_INTEGER, required=True, description="Total experience of the company"),
-            openapi.Parameter('company_bio', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Bio of the company"),
-            openapi.Parameter('company_logo', openapi.IN_FORM, type=openapi.TYPE_FILE, required=True, description="Logo of the company"),
-            openapi.Parameter('license_certificate', openapi.IN_FORM, type=openapi.TYPE_FILE, required=True, description="Certificate of the company"),
-            openapi.Parameter('street_address', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Street address of the partner"),
-            openapi.Parameter('address_line2', openapi.IN_FORM, type=openapi.TYPE_STRING, required=False, description="Address line 2 of the partner"),
-            openapi.Parameter('city', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="City of the partner"),
-            openapi.Parameter('state', openapi.IN_FORM, type=openapi.TYPE_STRING, description="State of the partner"),
-            openapi.Parameter('country', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Country of the partner"),
-            openapi.Parameter('postal_code', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Postal code of the partner"),
-            openapi.Parameter('lat', openapi.IN_FORM, type=openapi.TYPE_STRING, required=False, description="Latitude coordinate of the address"),
-            openapi.Parameter('long', openapi.IN_FORM, type=openapi.TYPE_STRING, required=False, description="Longitude coordinate of the address"),
-            openapi.Parameter('user_name', openapi.IN_FORM, type=openapi.TYPE_STRING, required=True, description="Username of the partner"),
-        ],
-        responses={
-            201: openapi.Response("Success: Business partner profile created", PartnerProfileSerializer),
-            400: "Bad Request: Missing or invalid input data.",
-            401: "Unauthorized: Admin permissions required",
-            404: "Not Found: User not found with the provided detail.",
-            409: "Conflict: Record already exists or update Service section first.",
-            500: "Server Error: Internal server error."
-        }
-    )
-    def post(self, request, *args, **kwargs):
-        data = self.get_request_data_without_partner_token(request)
-        required_fields = ['company_name', 'contact_name', 'contact_number', 'company_website', 'license_type',
-                           'license_number', 'total_experience', 'company_bio', 'company_logo', 'license_certificate',
-                           'street_address', 'city', 'state', 'country', 'postal_code', 'user_name']
-
-        error_response = validate_required_fields(required_fields, data)
-        if error_response:
-            return error_response
-
-        company_logo = data.get('company_logo')
-        license_certificate = data.get('license_certificate')
-        user = self.get_partner(request)
-
-        # Validate the username format
-        if not re.match(r'^\w+$', data['user_name']):
-            return Response({"message": "Invalid user name. Only alphanumeric characters and underscores are allowed."}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Validate the phone number using serializer validation
-        serializer1 = PartnerProfileSerializer(data=data)
-        try:
-            serializer1.validate_phone_number(data["contact_number"])
-        except serializers.ValidationError as e:
-            return Response({"message": str(e.detail[0])}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Check if the username is already taken
-        check_username = PartnerProfile.objects.filter(user_name=data['user_name'].lower()).first()
-        if check_username:
-            return Response({"message": "Sorry, this User name is already taken."}, status=status.HTTP_409_CONFLICT)
-
-        # Check if the user needs to update the Service section first
-        if user.partner_type == "NA":
-            return Response({"message": "Sorry, update Service section first."}, status=status.HTTP_409_CONFLICT)
-
-        # Check if the user is enrolled as an Individual
-        if user.partner_type == "Individual":
-            return Response({"message": "Sorry, you're enrolled as Individual."}, status=status.HTTP_409_CONFLICT)
-
-        # Validate the format and size of the company logo
-        if not check_photo_format_and_size(company_logo):
-            return Response({"message": "Invalid file format or size for company logo."}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Validate the format and size of the license certificate
-        if not check_file_format_and_size(license_certificate):
-            return Response({"message": "Invalid file format or size for certificate."}, status=status.HTTP_400_BAD_REQUEST)
-
-        if PartnerMailingDetail.objects.filter(mailing_of_partner=user).exists():
-            return Response({"message": "Address detail already exists."}, status=status.HTTP_409_CONFLICT)
-
-        # Check if a record already exists for this user
-        already_exist = BusinessProfile.objects.filter(company_of_partner=user).first()
-        if already_exist:
-            return Response({"message": "Record already exists for this user."}, status=status.HTTP_409_CONFLICT)
-
-        try:
-            with transaction.atomic():
-                # Create address detail
-                serializer = PartnerMailingDetailSerializer(data=data)
-                if serializer.is_valid():
-                    serializer.save(mailing_of_partner=user)
-                else:
-                    first_error_field = next(iter(serializer.errors))
-                    first_error_message = f"{first_error_field}: {serializer.errors[first_error_field][0]}"
-                    return Response({"message": first_error_message}, status=status.HTTP_400_BAD_REQUEST)
-
-                # Save company logo and certificate to file system
-                company_logo_path = save_file_in_directory(company_logo)
-                license_certificate_path = save_file_in_directory(license_certificate)
-
-                # Create a new BusinessProfile instance
-                BusinessProfile.objects.create(
-                    company_name=data['company_name'],
-                    contact_name=data['contact_name'],
-                    contact_number=data['contact_number'],
-                    company_website=data['company_website'],
-                    license_type=data['license_type'],
-                    license_number=data['license_number'],
-                    total_experience=data['total_experience'],
-                    company_bio=data['company_bio'],
-                    company_logo=company_logo_path,
-                    license_certificate=license_certificate_path,
-                    company_of_partner=user
-                )
-
-                # Update user's username
-                user.user_name = data['user_name'].lower()
-                user.save()
-                return Response(PartnerProfileSerializer(user).data, status=status.HTTP_201_CREATED)
-
-        except Exception as e:
-            logger.error(f"BusinessPartnerView: {str(e)}")
             return Response({"message": "An internal server error occurred."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
@@ -1045,7 +862,14 @@ class UpdateBusinessProfileView(AuthenticatedPartnerMutationAPIView):
     def put(self, request, *args, **kwargs):
         data = self.get_request_data_without_partner_token(request)
         user_name = data.get('user_name') or data.get('company_profile_url')
-        license_certificate = data.get('license_certificate')
+        proof_document_file = data.get('proof_document_file') or data.get('license_certificate')
+        proof_document_type = data.get('proof_document_type')
+        document_number = data.get('document_number')
+
+        def _normalize_text(value):
+            if value is None:
+                return ""
+            return f"{value}".strip()
 
         # Validate optional phone number if provided
         contact_number = data.get('contact_number')
@@ -1079,6 +903,123 @@ class UpdateBusinessProfileView(AuthenticatedPartnerMutationAPIView):
                 # Upsert business profile so first-time setup can be done progressively across tabs.
                 bus_profile, _ = BusinessProfile.objects.get_or_create(company_of_partner=user)
 
+                is_registration_update = (
+                    any(
+                        field in data
+                        for field in (
+                            'operator_type',
+                            'ntn',
+                            'owner_cnic',
+                            'mobile_number',
+                            'official_email',
+                            'proof_document_type',
+                            'document_number',
+                            'license_type',
+                            'license_number',
+                        )
+                    )
+                    or bool(proof_document_file)
+                )
+
+                resolved_proof_document_type = _normalize_text(
+                    proof_document_type
+                    if 'proof_document_type' in data
+                    else data.get('license_type')
+                    if 'license_type' in data
+                    else bus_profile.license_type
+                )
+                resolved_document_number = _normalize_text(
+                    document_number
+                    if 'document_number' in data
+                    else data.get('license_number')
+                    if 'license_number' in data
+                    else bus_profile.license_number
+                )
+                resolved_registration = {
+                    'company_name': _normalize_text(
+                        data.get('company_name') if 'company_name' in data else bus_profile.company_name
+                    ),
+                    'operator_type': _normalize_text(
+                        data.get('operator_type') if 'operator_type' in data else bus_profile.operator_type
+                    ),
+                    'ntn': _normalize_text(
+                        data.get('ntn') if 'ntn' in data else bus_profile.ntn
+                    ),
+                    'owner_cnic': _normalize_text(
+                        data.get('owner_cnic') if 'owner_cnic' in data else bus_profile.owner_cnic
+                    ),
+                    'mobile_number': _normalize_text(
+                        data.get('mobile_number') if 'mobile_number' in data else bus_profile.mobile_number
+                    ),
+                    'official_email': _normalize_text(
+                        data.get('official_email') if 'official_email' in data else bus_profile.official_email
+                    ),
+                    'proof_document_type': resolved_proof_document_type,
+                    'document_number': resolved_document_number,
+                }
+
+                if is_registration_update:
+                    required_fields = {
+                        'company_name': "Business name",
+                        'operator_type': "Operator type",
+                        'ntn': "NTN",
+                        'owner_cnic': "Owner / Authorized Person CNIC",
+                        'mobile_number': "Mobile number",
+                        'official_email': "Official email",
+                        'proof_document_type': "Proof document type",
+                        'document_number': "Document number",
+                    }
+
+                    missing_fields = [
+                        label
+                        for field, label in required_fields.items()
+                        if not resolved_registration[field]
+                    ]
+                    if missing_fields:
+                        return Response(
+                            {"message": f"Missing required field: {missing_fields[0]}"},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+
+                    if resolved_registration['operator_type'] not in REGISTRATION_OPERATOR_TYPE_CHOICES:
+                        return Response(
+                            {"message": "Invalid operator type. Allowed values are Company or Sole Proprietor."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+
+                    if resolved_registration['proof_document_type'] not in REGISTRATION_PROOF_DOCUMENT_TYPE_CHOICES:
+                        return Response(
+                            {"message": "Invalid proof document type for selected services."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+
+                    if not re.match(r'^(\d{5}-\d{7}-\d|\d{13})$', resolved_registration['owner_cnic']):
+                        return Response(
+                            {"message": "Owner / Authorized Person CNIC must be 13 digits (with or without dashes)."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+
+                    if not re.match(r'^\+?[\d\s()-]{10,20}$', resolved_registration['mobile_number']):
+                        return Response(
+                            {"message": "Invalid mobile number format."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+
+                    try:
+                        validate_email(resolved_registration['official_email'])
+                    except ValidationError:
+                        return Response(
+                            {"message": "Invalid official email address."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+
+                    has_existing_proof_document = bool(bus_profile.license_certificate)
+                    if not proof_document_file and not has_existing_proof_document:
+                        return Response(
+                            {"message": "Upload Proof Document is required."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+
                 updateable_fields = [
                     'company_name',
                     'contact_name',
@@ -1086,27 +1027,46 @@ class UpdateBusinessProfileView(AuthenticatedPartnerMutationAPIView):
                     'company_website',
                     'total_experience',
                     'company_bio',
+                    'operator_type',
+                    'ntn',
+                    'owner_cnic',
+                    'mobile_number',
+                    'official_email',
                     'license_type',
                     'license_number',
                 ]
                 for field in updateable_fields:
                     if field in data:
-                        setattr(bus_profile, field, data.get(field))
+                        value = data.get(field)
+                        setattr(bus_profile, field, _normalize_text(value) if isinstance(value, str) else value)
 
-                if license_certificate:
-                    if not check_file_format_and_size(license_certificate):
+                if 'proof_document_type' in data:
+                    bus_profile.license_type = _normalize_text(data.get('proof_document_type'))
+                elif 'license_type' in data:
+                    bus_profile.license_type = _normalize_text(data.get('license_type'))
+
+                if 'document_number' in data:
+                    bus_profile.license_number = _normalize_text(data.get('document_number'))
+                elif 'license_number' in data:
+                    bus_profile.license_number = _normalize_text(data.get('license_number'))
+
+                if proof_document_file:
+                    if (
+                        not proof_document_file.name.lower().endswith(REGISTRATION_PROOF_FILE_EXTENSIONS)
+                        or proof_document_file.size > REGISTRATION_PROOF_FILE_MAX_SIZE_BYTES
+                    ):
                         return Response(
-                            {"message": "Invalid file format or size for certificate."},
+                            {"message": "Invalid file format or size for proof document."},
                             status=status.HTTP_400_BAD_REQUEST
                         )
                     if bus_profile.license_certificate:
                         delete_file_from_directory(bus_profile.license_certificate.name)
-                    file_path = save_file_in_directory(license_certificate)
+                    file_path = save_file_in_directory(proof_document_file)
                     bus_profile.license_certificate = file_path
 
                 bus_profile.save()
 
-            serialized_package = PartnerProfileSerializer(user)
+            serialized_package = PartnerProfileSerializer(get_prefetched_partner_profile_snapshot(user))
             return Response(serialized_package.data, status=status.HTTP_200_OK)
 
         except Exception as e:
@@ -1344,7 +1304,7 @@ class UpdatePartnerAvatarView(AuthenticatedPartnerMutationAPIView):
             user.save(update_fields=['user_photo'])
             user = normalize_legacy_review_status(user)
 
-            serialized_user = PartnerProfileSerializer(user)
+            serialized_user = PartnerProfileSerializer(get_prefetched_partner_profile_snapshot(user))
             return Response(serialized_user.data, status=status.HTTP_200_OK)
         except Exception as e:
             logger.error("UpdatePartnerAvatarView: %s", str(e))
@@ -1402,7 +1362,7 @@ class UpdateCompanyLogoView(AuthenticatedPartnerMutationAPIView):
             user = normalize_legacy_review_status(user)
 
             # Serialize user data for response
-            serialized_user = PartnerProfileSerializer(user)
+            serialized_user = PartnerProfileSerializer(get_prefetched_partner_profile_snapshot(user))
             return Response(serialized_user.data, status=status.HTTP_200_OK)
 
         except Exception as e:

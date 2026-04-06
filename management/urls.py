@@ -14,5 +14,6 @@ urlpatterns = [
     path('fetch_all_paid_bookings/', approval_task.FetchPaidBookingView.as_view()),
     path('fetch_all_partner_receive_able_payments_details/', approval_task.GetPartnerReceiveAblePaymentsView.as_view()),
     path('transfer_partner_receive_able_payments/', approval_task.ManagePartnerReceiveAblePaymentView.as_view()),
+    path('manage_featured_packages/', approval_task.ManageFeaturedPackageView.as_view()),
     path('manage_master_hotels/', approval_task.ManageMasterHotelsCatalogView.as_view()),
 ]

@@ -7,6 +7,12 @@ from partners.models import PartnerProfile
 
 
 EMPTY_TOKEN_VALUES = {"", "null", "none", "undefined"}
+OPERATOR_PARTNER_PATH_PREFIX = "/api/v1/operator/"
+OPERATOR_PARTNER_PREFETCH_PATHS = {
+    "/api/v1/operator/me/profile/",
+    "/api/v1/operator/me/profile/avatar/",
+    "/api/v1/operator/auth/otp/verify/",
+}
 
 
 @dataclass(frozen=True)
@@ -56,7 +62,38 @@ def _normalize_token(raw_token):
     return token
 
 
-def _build_auth_context(token, source):
+def _get_request_path(request):
+    path = getattr(request, "path", "") or getattr(getattr(request, "_request", None), "path", "")
+    return str(path or "").strip()
+
+
+def _fetch_partner_profile(token, request_path=""):
+    partner_query = PartnerProfile.objects.filter(partner_session_token=token)
+
+    if request_path in OPERATOR_PARTNER_PREFETCH_PATHS:
+        partner_query = partner_query.prefetch_related(
+            "wallet_session",
+            "services_of_partner",
+            "mailing_of_partner",
+            "company_of_partner",
+            "individual_profile_of_partner",
+        )
+
+    return partner_query.first()
+
+
+def _build_auth_context(token, source, request_path=""):
+    if request_path.startswith(OPERATOR_PARTNER_PATH_PREFIX):
+        partner = _fetch_partner_profile(token, request_path=request_path)
+        if partner:
+            return SessionTokenAuthContext(
+                principal=partner,
+                principal_type="partner",
+                token=token,
+                source=source,
+            )
+        return None
+
     user = UserProfile.objects.filter(session_token=token).first()
     partner = PartnerProfile.objects.filter(partner_session_token=token).first()
 
@@ -107,7 +144,7 @@ class SessionTokenHeaderAuthentication(BaseAuthentication):
         if not token:
             return None
 
-        context = _build_auth_context(token, "authorization")
+        context = _build_auth_context(token, "authorization", _get_request_path(request))
         if context is None:
             return None
 

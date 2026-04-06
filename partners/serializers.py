@@ -315,11 +315,17 @@ class IndividualSerializer(serializers.ModelSerializer):
 
 
 class BusinessSerializer(serializers.ModelSerializer):
+    proof_document_type = serializers.CharField(source='license_type', read_only=True)
+    document_number = serializers.CharField(source='license_number', read_only=True)
+    proof_document_file = serializers.FileField(source='license_certificate', read_only=True)
+
     class Meta:
         model = BusinessProfile
         fields = [
             'company_id', 'company_name', 'contact_name', 'contact_number', 'company_website', 'total_experience',
-            'company_bio', 'license_type', 'license_number', 'license_certificate', 'company_logo'
+            'company_bio', 'operator_type', 'ntn', 'owner_cnic', 'mobile_number', 'official_email',
+            'license_type', 'license_number', 'license_certificate', 'company_logo',
+            'proof_document_type', 'document_number', 'proof_document_file',
         ]
 
 

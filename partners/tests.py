@@ -4,6 +4,7 @@ from unittest.mock import patch
 from django.apps import apps
 from django.db import connection
 from django.utils import timezone
+from django.test.utils import CaptureQueriesContext
 from rest_framework import status
 from django.core.files.uploadedfile import SimpleUploadedFile
 from rest_framework.test import APIRequestFactory, APITransactionTestCase
@@ -18,6 +19,7 @@ from .models import (
     HuzPackageDateRange,
     HuzTransportDetail,
     HuzZiyarahDetail,
+    BusinessProfile,
     PartnerBankAccount,
     PartnerMailingDetail,
     PartnerProfile,
@@ -45,7 +47,9 @@ from .partner_profile import (
     CreatePartnerProfileView,
     PartnerServicesView,
     dispatch_partner_verification_email,
+    get_prefetched_partner_profile_snapshot,
 )
+from .serializers import PartnerProfileSerializer
 
 
 def ensure_tables_for_apps(app_labels):
@@ -210,6 +214,31 @@ class PartnerProfileSignupTests(APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["message"], "This username is available.")
 
+    def test_canonical_operator_username_exists_alias_avoids_user_profile_lookup(self):
+        partner = PartnerProfile.objects.create(
+            partner_session_token="canonical-lookup-session-token",
+            email="operator-lookup@example.com",
+            name="Operator Lookup",
+            country_code="+92",
+            phone_number="3001234592",
+            partner_type="Company",
+            sign_type="Email",
+            user_name="current_name",
+            account_status="Active",
+        )
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.post(
+                "/api/v1/operator/me/usernames/exists/",
+                {"user_name": "current_name"},
+                format="json",
+                HTTP_AUTHORIZATION=f"Bearer {partner.partner_session_token}",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["message"], "This username is available.")
+        self.assertFalse(any("common_userprofile" in query["sql"] for query in queries))
+
     @patch("partners.partner_profile.send_partner_verification_sms", return_value=True)
     @patch("partners.partner_profile.send_verification_email", return_value=False)
     def test_dispatch_partner_verification_email_falls_back_to_sms_when_email_send_fails(
@@ -234,8 +263,13 @@ class PartnerProfileSignupTests(APITransactionTestCase):
         )
         mocked_sms.assert_called_once_with("+923001234567", "123456")
 
-    @patch("partners.partner_profile.send_verification_email", return_value=True)
-    def test_resend_otp_returns_success_and_updates_partner_otp(self, mocked_email):
+    @patch("partners.partner_profile.dispatch_partner_verification_email", return_value=True)
+    @patch("partners.partner_profile.random_six_digits", return_value="654321")
+    def test_resend_otp_returns_success_and_queues_background_delivery(
+        self,
+        mocked_otp,
+        mocked_dispatch,
+    ):
         partner = PartnerProfile.objects.create(
             partner_session_token="partner-otp-session-token",
             email="operator-resend@example.com",
@@ -256,95 +290,72 @@ class PartnerProfileSignupTests(APITransactionTestCase):
         partner.refresh_from_db()
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["message"], "OTP sent successfully.")
-        self.assertRegex(partner.otp or "", r"^\d{6}$")
-        mocked_email.assert_called_once_with(partner.email, partner.name, partner.otp, wait_for_result=True)
+        self.assertEqual(partner.otp, "654321")
+        self.assertIsNotNone(partner.otp_time)
+        mocked_otp.assert_called_once()
+        mocked_dispatch.assert_called_once_with(
+            partner.email,
+            partner.name,
+            "654321",
+            "+923001234568",
+            wait_for_result=False,
+        )
 
-    @patch("partners.partner_profile.send_verification_email", return_value=True)
-    def test_canonical_operator_auth_resend_otp_accepts_bearer_token(self, mocked_email):
+    def test_prefetched_partner_profile_snapshot_serializes_without_additional_queries(self):
         partner = PartnerProfile.objects.create(
-            partner_session_token="canonical-resend-session-token",
-            email="operator-canonical-resend@example.com",
-            name="Operator Canonical Resend",
+            partner_session_token="snapshot-session-token",
+            email="operator-snapshot@example.com",
+            name="Operator Snapshot",
             country_code="+92",
-            phone_number="3001234572",
-            partner_type="NA",
+            phone_number="3001234593",
+            partner_type="Company",
             sign_type="Email",
+            user_name="snapshot-company",
+            account_status="Active",
+        )
+        Wallet.objects.create(
+            wallet_code="snapshot-wallet-code",
+            wallet_amount=1200.0,
+            wallet_session=partner,
+        )
+        PartnerServices.objects.create(
+            is_hajj_service_offer=True,
+            is_umrah_service_offer=True,
+            services_of_partner=partner,
+        )
+        PartnerMailingDetail.objects.create(
+            street_address="Main Street",
+            address_line2="Suite 2",
+            city="Makkah",
+            state="Makkah",
+            country="Saudi Arabia",
+            postal_code="12345",
+            lat="21.3891",
+            long="39.8579",
+            mailing_of_partner=partner,
+        )
+        BusinessProfile.objects.create(
+            company_name="Snapshot Travels",
+            contact_name="Snapshot Contact",
+            contact_number="3001234593",
+            company_website="https://snapshot.example.com",
+            license_type="Tourism",
+            license_number="LIC-123",
+            total_experience="10",
+            company_bio="Snapshot partner profile",
+            company_of_partner=partner,
         )
 
-        response = self.client.put(
-            "/api/v1/operator/auth/otp/resend/",
-            {},
-            format="json",
-            HTTP_AUTHORIZATION=f"Bearer {partner.partner_session_token}",
-        )
+        snapshot = get_prefetched_partner_profile_snapshot(partner)
 
-        partner.refresh_from_db()
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertRegex(partner.otp or "", r"^\d{6}$")
-        mocked_email.assert_called_once_with(partner.email, partner.name, partner.otp, wait_for_result=True)
+        with CaptureQueriesContext(connection) as queries:
+            payload = PartnerProfileSerializer(snapshot).data
 
-    @patch("partners.partner_profile.send_partner_verification_sms", return_value=True)
-    @patch("partners.partner_profile.send_verification_email", return_value=False)
-    def test_resend_otp_falls_back_to_sms_when_email_send_fails(
-        self,
-        mocked_email,
-        mocked_sms,
-    ):
-        partner = PartnerProfile.objects.create(
-            partner_session_token="partner-otp-fallback-session-token",
-            email="operator-resend-fallback@example.com",
-            name="Operator Resend Fallback",
-            country_code="+92",
-            phone_number="3001234570",
-            partner_type="NA",
-            sign_type="Email",
-        )
-
-        response = self.client.put(
-            "/api/v1/operator/auth/otp/resend/",
-            {},
-            format="json",
-            HTTP_AUTHORIZATION=f"Bearer {partner.partner_session_token}",
-        )
-
-        partner.refresh_from_db()
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertRegex(partner.otp or "", r"^\d{6}$")
-        mocked_email.assert_called_once_with(partner.email, partner.name, partner.otp, wait_for_result=True)
-        mocked_sms.assert_called_once_with("+923001234570", partner.otp)
-
-    @patch("partners.partner_profile.send_partner_verification_sms", side_effect=Exception("sms unavailable"))
-    @patch("partners.partner_profile.send_verification_email", return_value=False)
-    def test_resend_otp_returns_502_when_email_and_sms_delivery_fail(
-        self,
-        mocked_email,
-        mocked_sms,
-    ):
-        partner = PartnerProfile.objects.create(
-            partner_session_token="partner-otp-failure-session-token",
-            email="operator-resend-failure@example.com",
-            name="Operator Resend Failure",
-            country_code="+92",
-            phone_number="3001234571",
-            partner_type="NA",
-            sign_type="Email",
-        )
-
-        response = self.client.put(
-            "/api/v1/operator/auth/otp/resend/",
-            {},
-            format="json",
-            HTTP_AUTHORIZATION=f"Bearer {partner.partner_session_token}",
-        )
-
-        partner.refresh_from_db()
-        attempted_otp = mocked_email.call_args.args[2]
-        self.assertEqual(response.status_code, status.HTTP_502_BAD_GATEWAY)
-        self.assertIn("Failed to send OTP", response.data["message"])
-        self.assertFalse(partner.otp)
-        self.assertRegex(attempted_otp, r"^\d{6}$")
-        mocked_email.assert_called_once_with(partner.email, partner.name, attempted_otp, wait_for_result=True)
-        mocked_sms.assert_called_once_with("+923001234571", attempted_otp)
+        self.assertEqual(len(queries), 0)
+        self.assertEqual(payload["wallet_amount"], 1200.0)
+        self.assertEqual(payload["partner_service_detail"]["is_hajj_service_offer"], True)
+        self.assertEqual(payload["partner_type_and_detail"]["company_name"], "Snapshot Travels")
+        self.assertEqual(payload["mailing_detail"]["city"], "Makkah")
 
     def test_verify_otp_marks_email_verified(self):
         partner = PartnerProfile.objects.create(
@@ -395,6 +406,106 @@ class PartnerProfileSignupTests(APITransactionTestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(partner.is_email_verified)
         self.assertEqual(partner.otp, "")
+
+
+class BusinessProfileRegistrationMutationTests(APITransactionTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        ensure_tables_for_apps(["common", "partners"])
+
+    def setUp(self):
+        self.partner = PartnerProfile.objects.create(
+            partner_session_token="registration-profile-session-token",
+            user_name="registration-profile-user",
+            email="registration-profile@example.com",
+            name="Registration Partner",
+            partner_type="Company",
+            sign_type="Email",
+            account_status="Active",
+            country_code="+92",
+            phone_number="3001234567",
+        )
+
+    def test_company_profile_registration_update_requires_proof_document(self):
+        response = self.client.put(
+            "/api/v1/operator/me/company/profile/",
+            {
+                "company_name": "QA Registration Co",
+                "operator_type": "Company",
+                "ntn": "9876543-2",
+                "owner_cnic": "35202-1234567-1",
+                "mobile_number": "+923001234567",
+                "official_email": "ops@qa-registration.example",
+                "proof_document_type": "MoRA Hajj Approval",
+                "document_number": "REG-12233",
+            },
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {self.partner.partner_session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data.get("message"), "Invalid official email address.")
+
+        response = self.client.put(
+            "/api/v1/operator/me/company/profile/",
+            {
+                "company_name": "QA Registration Co",
+                "operator_type": "Company",
+                "ntn": "9876543-2",
+                "owner_cnic": "35202-1234567-1",
+                "mobile_number": "+923001234567",
+                "official_email": "ops@qa-registration.example.com",
+                "proof_document_type": "MoRA Hajj Approval",
+                "document_number": "REG-12233",
+            },
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {self.partner.partner_session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.data.get("message"), "Upload Proof Document is required.")
+
+    def test_company_profile_registration_update_persists_new_registration_fields(self):
+        proof_document_file = SimpleUploadedFile(
+            "proof-document.pdf",
+            b"%PDF-1.4 registration proof",
+            content_type="application/pdf",
+        )
+
+        response = self.client.put(
+            "/api/v1/operator/me/company/profile/",
+            {
+                "company_name": "QA Registration Co",
+                "operator_type": "Company",
+                "ntn": "9876543-2",
+                "owner_cnic": "35202-1234567-1",
+                "mobile_number": "+923001234567",
+                "official_email": "ops@qa-registration.example.com",
+                "proof_document_type": "MoRA Hajj Approval",
+                "document_number": "REG-12233",
+                "proof_document_file": proof_document_file,
+            },
+            format="multipart",
+            HTTP_AUTHORIZATION=f"Bearer {self.partner.partner_session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        business_profile = BusinessProfile.objects.get(company_of_partner=self.partner)
+        self.assertEqual(business_profile.operator_type, "Company")
+        self.assertEqual(business_profile.ntn, "9876543-2")
+        self.assertEqual(business_profile.owner_cnic, "35202-1234567-1")
+        self.assertEqual(business_profile.mobile_number, "+923001234567")
+        self.assertEqual(business_profile.official_email, "ops@qa-registration.example.com")
+        self.assertEqual(business_profile.license_type, "MoRA Hajj Approval")
+        self.assertEqual(business_profile.license_number, "REG-12233")
+        self.assertTrue(bool(business_profile.license_certificate))
+
+        response_profile = response.data.get("partner_type_and_detail", {})
+        self.assertEqual(response_profile.get("proof_document_type"), "MoRA Hajj Approval")
+        self.assertEqual(response_profile.get("document_number"), "REG-12233")
+        self.assertTrue(bool(response_profile.get("proof_document_file")))
 
 
 class PackageManagementOperatorViewTests(APITransactionTestCase):

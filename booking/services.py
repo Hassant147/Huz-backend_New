@@ -104,7 +104,7 @@ ROOM_COUNT_FIELDS = {
 }
 TRAVELER_TYPE_CHILD_GENERIC = "Child"
 PASSPORT_EXPIRY_AFTER_RETURN_DATE_MESSAGE = (
-    "Passport expiry must be later than the package return date. Please renew the passport before continuing with this booking."
+    "Passport expiry must be later than the package return date. Please renew your passport before continuing with this booking."
 )
 
 

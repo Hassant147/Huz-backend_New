@@ -10,12 +10,11 @@ from .phone_utils import (
     resolve_signup_phone_identity,
 )
 import requests
-from .utility import random_six_digits, generate_token, save_notification, delete_file_from_directory, save_file_in_directory, check_photo_format_and_size, validate_required_fields, send_verification_email, new_user_welcome_email
+from .utility import random_six_digits, generate_token, save_notification, validate_required_fields, send_verification_email, new_user_welcome_email
 from .logs_file import logger
 from .throttling import OTPAnonRateThrottle, OTPUserRateThrottle
 from datetime import datetime
 from django.db import transaction
-from rest_framework.parsers import MultiPartParser, FormParser
 from decouple import config
 from django.utils import timezone
 from datetime import timedelta
@@ -454,118 +453,3 @@ class CreateMemberProfileView(APIView):
         title = "Welcome to Hajjumrah.co Family"
         message = "Hajjumrah.co is the world's largest platform offering Hajj, Umrah, and transport packages. Our aim is to provide the best services at competitive rates. \nThank you for joining us."
         save_notification(user, title, message, data.get('firebase_token', ''), data.get('web_firebase_token', ''))
-
-
-class UploadUserImageView(APIView):
-    permission_classes = [IsAdminUser]
-    parser_classes = [MultiPartParser, FormParser]
-
-    @swagger_auto_schema(
-        manual_parameters=[
-            openapi.Parameter('session_token', openapi.IN_FORM, type=openapi.TYPE_STRING, description='Session token of the user', required=True),
-            openapi.Parameter('user_photo', openapi.IN_FORM, type=openapi.TYPE_FILE, description='User photo file', required=True)
-        ],
-        responses={
-            200: openapi.Response("Success: User photo updated successfully", UserProfileSerializer),
-            400: "Bad Request: Missing file or user information, invalid file format or size, or user not recognized",
-            401: "Unauthorized: Admin permissions required",
-            404: "Not Found: User not recognized.",
-            500: "Server Error: Internal server error"
-        },
-        operation_description="Upload or update user profile photo"
-    )
-    def put(self, request, *args, **kwargs):
-        try:
-            # Extract the file and session_token from the request data
-            file = request.data.get('user_photo')
-            session_token = request.data.get('session_token')
-
-            # Validate the presence of required data
-            if not file or not session_token:
-                return Response({"message": "Missing file or user information."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Validate the file format and size
-            if not check_photo_format_and_size(file):
-                return Response({"message": "Invalid file format or size."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Retrieve the user profile associated with the session_token
-            user = UserProfile.objects.filter(session_token=session_token).first()
-            if not user:
-                return Response({"message": "User not recognized."}, status=status.HTTP_404_NOT_FOUND)
-
-            # Delete the old user photo if it exists
-            if user.user_photo:
-                delete_file_from_directory(user.user_photo.name)
-
-            # Save the new file in the directory and update the user profile
-            file_path = save_file_in_directory(file)
-            user.user_photo = file_path
-            user.save()
-
-            # Serialize the updated user profile
-            serialized_user = UserProfileSerializer(user)
-            return Response(serialized_user.data, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            # Log the error and return a server error response
-            logger.error("UploadUserImageView: %s", str(e))
-            return Response({"message": "Failed to upload profile photo. Internal server error."},
-                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
-class UpdateFirebaseTokenView(APIView):
-    permission_classes = [IsAdminUser]
-
-    @swagger_auto_schema(
-        request_body=openapi.Schema(
-            type=openapi.TYPE_OBJECT,
-            properties={
-                'session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the user'),
-                'firebase_token': openapi.Schema(type=openapi.TYPE_STRING, description='Firebase token for mobile devices', nullable=True),
-                'web_firebase_token': openapi.Schema(type=openapi.TYPE_STRING, description='Firebase token for web browsers', nullable=True),
-            },
-            required=['session_token']
-        ),
-        responses={
-            200: openapi.Response("Success: Firebase token updated successfully", UserProfileSerializer),
-            400: "Bad Request: Missing required information or user not recognized",
-            401: "Unauthorized: Admin permissions required",
-            404: "Not Found: User not recognized",
-            500: "Server Error: Internal server error"
-        },
-        operation_description="Update Firebase token for mobile or web browsers"
-    )
-    def put(self, request, *args, **kwargs):
-        try:
-            # Extract the data from the request data
-            session_token = request.data.get('session_token')
-            firebase_token = request.data.get('firebase_token')
-            web_firebase_token = request.data.get('web_firebase_token')
-
-            # Validate the presence of the session_token
-            if not session_token:
-                return Response({"message": "Missing session token."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Validate that at least one token is given
-            if not firebase_token and not web_firebase_token:
-                return Response({"message": "Missing firebase token for mobile or web."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # fetching user profile associated with the session_token
-            user = UserProfile.objects.filter(session_token=session_token).first()
-            if not user:
-                return Response({"message": "User not recognized."}, status=status.HTTP_404_NOT_FOUND)
-
-            if firebase_token:
-                user.firebase_token = firebase_token
-
-            if web_firebase_token:
-                user.web_firebase_token = web_firebase_token
-
-            user.save()
-
-            serialized_user = UserProfileSerializer(user)
-            return Response(serialized_user.data, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            logger.error("UpdateFirebaseTokenView: %s", str(e))
-            return Response({"message": "Failed to update firebase token. Internal server error."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

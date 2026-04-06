@@ -689,7 +689,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
 
         expected_message = (
             "Passport expiry must be later than the package return date. "
-            "Please renew the passport before continuing with this booking."
+            "Please renew your passport before continuing with this booking."
         )
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -744,7 +744,7 @@ class BookingWorkflowServiceValidationTests(APITransactionTestCase):
 
         expected_message = (
             "Passport expiry must be later than the package return date. "
-            "Please renew the passport before continuing with this booking."
+            "Please renew your passport before continuing with this booking."
         )
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)

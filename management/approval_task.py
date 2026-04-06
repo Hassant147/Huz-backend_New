@@ -4,7 +4,7 @@ from urllib.parse import urlencode
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework import status
+from rest_framework import serializers, status
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 from rest_framework.permissions import IsAdminUser
@@ -27,7 +27,7 @@ from partners.models import (
     PartnerServices,
     PartnerMailingDetail,
 )
-from partners.serializers import PartnerProfileSerializer, HuzBasicSerializer, HuzHotelSerializer
+from partners.serializers import PartnerProfileSerializer, HuzHotelSerializer
 from common.logs_file import logger
 from common.utility import (
     save_notification,
@@ -62,14 +62,12 @@ from django.utils import timezone
 
 
 CACHE_KEY_PENDING_COMPANIES = "management:pending_companies:v1"
-CACHE_KEY_APPROVED_COMPANIES = "management:approved_companies:v1"
 CACHE_KEY_PAID_BOOKINGS = "management:paid_bookings:v1"
 CACHE_KEY_PARTNER_RECEIVABLES = "management:partner_receivables:v1"
 CACHE_KEY_MASTER_HOTELS = "management:master_hotels:v1"
 MANAGEMENT_CACHE_TIMEOUT_SECONDS = 30
 MANAGEMENT_CACHE_KEYS = [
     CACHE_KEY_PENDING_COMPANIES,
-    CACHE_KEY_APPROVED_COMPANIES,
     CACHE_KEY_PAID_BOOKINGS,
     CACHE_KEY_PARTNER_RECEIVABLES,
     CACHE_KEY_MASTER_HOTELS,
@@ -374,6 +372,43 @@ def _coerce_bool(value):
         if normalized in {"false", "0", "no"}:
             return False
     return None
+
+
+def _normalize_admin_package_type(value):
+    normalized = str(value or "").strip().lower()
+    if not normalized or normalized in {"all", "any"}:
+        return ""
+    if normalized == "hajj":
+        return "Hajj"
+    if normalized == "umrah":
+        return "Umrah"
+    return None
+
+
+class AdminFeaturedPackageSerializer(serializers.ModelSerializer):
+    partner_session_token = serializers.CharField(
+        source="package_provider.partner_session_token",
+        read_only=True,
+    )
+    partner_name = serializers.CharField(source="package_provider.name", read_only=True)
+    partner_email = serializers.CharField(source="package_provider.email", read_only=True)
+
+    class Meta:
+        model = HuzBasicDetail
+        fields = [
+            "huz_token",
+            "package_type",
+            "package_name",
+            "package_base_cost",
+            "package_status",
+            "start_date",
+            "end_date",
+            "created_time",
+            "is_featured",
+            "partner_session_token",
+            "partner_name",
+            "partner_email",
+        ]
 
 
 def _serialize_master_hotel(hotel):
@@ -1036,92 +1071,6 @@ class GetAllPendingApprovalsView(APIView):
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class GetAllApprovedCompaniesView(APIView):
-    permission_classes = [IsAdminUser]
-
-    @swagger_auto_schema(
-        operation_description="Fetch all approved partners profiles.",
-        responses={
-            200: openapi.Response('Success: List of approved profiles fetched', PartnerProfileSerializer(many=True)),
-            401: "Unauthorized: Admin permissions required",
-            404: "Not Found: No Approved profiles found.",
-            500: "Server Error: Internal server error."
-        }
-    )
-    def get(self, request):
-        try:
-            cached_payload = cache.get(CACHE_KEY_APPROVED_COMPANIES)
-            if cached_payload is not None:
-                return Response(cached_payload, status=status.HTTP_200_OK)
-
-            approved_profiles_qs = PartnerProfile.objects.filter(
-                account_status="Active",
-                partner_type="Company",
-            ).prefetch_related(
-                Prefetch(
-                    'company_of_partner',
-                    queryset=BusinessProfile.objects.only(
-                        'company_of_partner_id',
-                        'company_id',
-                        'company_name',
-                        'contact_name',
-                        'contact_number',
-                        'company_website',
-                        'total_experience',
-                        'company_bio',
-                        'license_type',
-                        'license_number',
-                        'license_certificate',
-                        'company_logo',
-                    ),
-                ),
-                Prefetch(
-                    'services_of_partner',
-                    queryset=PartnerServices.objects.only(
-                        'services_of_partner_id',
-                        'is_hajj_service_offer',
-                        'is_umrah_service_offer',
-                        'is_ziyarah_service_offer',
-                        'is_transport_service_offer',
-                        'is_visa_service_offer',
-                    ),
-                ),
-                Prefetch(
-                    'mailing_of_partner',
-                    queryset=PartnerMailingDetail.objects.only(
-                        'mailing_of_partner_id',
-                        'address_id',
-                        'street_address',
-                        'address_line2',
-                        'city',
-                        'state',
-                        'country',
-                        'postal_code',
-                        'lat',
-                        'long',
-                    ),
-                ),
-                Prefetch(
-                    'wallet_session',
-                    queryset=Wallet.objects.only('wallet_session_id', 'wallet_amount'),
-                ),
-            ).distinct()
-
-            approved_profiles = list(approved_profiles_qs)
-            if approved_profiles:
-                serializer = PartnerProfileSerializer(approved_profiles, many=True)
-                response_payload = serializer.data
-                cache.set(CACHE_KEY_APPROVED_COMPANIES, response_payload, MANAGEMENT_CACHE_TIMEOUT_SECONDS)
-                return Response(response_payload, status=status.HTTP_200_OK)
-
-            return Response({"message": "No approved profiles found."}, status=status.HTTP_404_NOT_FOUND)
-
-        except Exception as e:
-            logger.error(f"Error in GetAllApprovedCompaniesView: {str(e)}")
-            return Response({"message": "Failed to get approved profiles. Internal server error."},
-                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
 class GetAllSaleDirectorsView(APIView):
     permission_classes = [IsAdminUser]
 
@@ -1514,54 +1463,194 @@ class ManageFeaturedPackageView(APIView):
     permission_classes = [IsAdminUser]
 
     @swagger_auto_schema(
-        operation_description="Update an existing Huz Hajj or Umrah package.",
+        operation_description="Get paginated packages for featured management.",
+        manual_parameters=[
+            openapi.Parameter(
+                "search",
+                openapi.IN_QUERY,
+                description="Search by package token, package name, or partner details.",
+                type=openapi.TYPE_STRING,
+                required=False,
+            ),
+            openapi.Parameter(
+                "package_type",
+                openapi.IN_QUERY,
+                description="Filter by package type: Hajj or Umrah.",
+                type=openapi.TYPE_STRING,
+                required=False,
+            ),
+            openapi.Parameter(
+                "package_status",
+                openapi.IN_QUERY,
+                description="Filter by package status. Defaults to Active.",
+                type=openapi.TYPE_STRING,
+                required=False,
+            ),
+            openapi.Parameter(
+                "is_featured",
+                openapi.IN_QUERY,
+                description="Filter by featured flag: true or false.",
+                type=openapi.TYPE_BOOLEAN,
+                required=False,
+            ),
+            openapi.Parameter(
+                "page",
+                openapi.IN_QUERY,
+                description="Page number.",
+                type=openapi.TYPE_INTEGER,
+                required=False,
+            ),
+            openapi.Parameter(
+                "page_size",
+                openapi.IN_QUERY,
+                description="Page size.",
+                type=openapi.TYPE_INTEGER,
+                required=False,
+            ),
+        ],
+        responses={
+            200: openapi.Response("Successful retrieval", AdminFeaturedPackageSerializer(many=True)),
+            400: "Bad Request: Missing or invalid input data.",
+            401: "Unauthorized: Admin permissions required.",
+            500: "Server Error: Internal server error.",
+        },
+    )
+    def get(self, request, *args, **kwargs):
+        try:
+            requested_package_type = request.query_params.get("package_type")
+            package_type = _normalize_admin_package_type(requested_package_type)
+            if package_type is None:
+                return Response(
+                    {"message": "Invalid package_type. Use Hajj, Umrah, or leave blank for all."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            package_status = str(
+                request.query_params.get("package_status", "Active")
+            ).strip()
+            featured_raw = request.query_params.get("is_featured")
+            if str(featured_raw or "").strip() == "":
+                is_featured = None
+            else:
+                is_featured = _coerce_bool(featured_raw)
+                if is_featured is None:
+                    return Response(
+                        {"message": "is_featured must be true or false."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+            search = str(request.query_params.get("search") or "").strip()
+
+            queryset = HuzBasicDetail.objects.select_related("package_provider").all()
+            if package_type:
+                queryset = queryset.filter(package_type=package_type)
+            if package_status and package_status.lower() != "all":
+                queryset = queryset.filter(package_status__iexact=package_status)
+            if is_featured is not None:
+                queryset = queryset.filter(is_featured=is_featured)
+            if search:
+                queryset = queryset.filter(
+                    Q(huz_token__icontains=search)
+                    | Q(package_name__icontains=search)
+                    | Q(package_provider__name__icontains=search)
+                    | Q(package_provider__email__icontains=search)
+                )
+
+            queryset = queryset.order_by("-created_time")
+            response = _build_paginated_response(
+                request,
+                queryset,
+                AdminFeaturedPackageSerializer,
+            )
+            return response
+        except Exception as e:
+            logger.error(f"ManageFeaturedPackageView - Get: {str(e)}")
+            return Response(
+                {"message": "Failed to fetch package list. Internal server error."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @swagger_auto_schema(
+        operation_description="Update featured status of an existing package.",
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
             properties={
-                'partner_session_token': openapi.Schema(type=openapi.TYPE_STRING, description='Session token of the partner'),
-                'huz_token': openapi.Schema(type=openapi.TYPE_STRING, description='Huz package token'),
-                'is_featured': openapi.Schema(type=openapi.TYPE_BOOLEAN, description='True or false'),
+                "partner_session_token": openapi.Schema(
+                    type=openapi.TYPE_STRING,
+                    description="Optional partner session token for compatibility checks.",
+                ),
+                "huz_token": openapi.Schema(
+                    type=openapi.TYPE_STRING,
+                    description="Huz package token.",
+                ),
+                "is_featured": openapi.Schema(
+                    type=openapi.TYPE_BOOLEAN,
+                    description="True or false.",
+                ),
             },
-            required=['partner_session_token', 'huz_token', 'is_featured']
+            required=["huz_token", "is_featured"],
         ),
         responses={
-            200: openapi.Response("Successful update", HuzBasicSerializer),
+            200: "Successful update.",
             400: "Bad Request: Missing or invalid input data.",
             401: "Unauthorized: Admin permissions required.",
             404: "Not Found: User or package not found.",
-            409: "Conflict: Account status or type issue.",
+            409: "Conflict: User does not own this package.",
             500: "Server Error: Internal server error."
-        }
+        },
     )
     def put(self, request, *args, **kwargs):
-        partner_session_token = request.data.get('partner_session_token')
-        huz_token = request.data.get('huz_token')
-        is_featured = _coerce_bool(request.data.get('is_featured'))
-        if not partner_session_token or not huz_token or is_featured is None:
-            return Response({"message": "Missing user or package information."}, status=status.HTTP_400_BAD_REQUEST)
+        partner_session_token = str(request.data.get("partner_session_token") or "").strip()
+        huz_token = str(request.data.get("huz_token") or "").strip()
+        is_featured = _coerce_bool(request.data.get("is_featured"))
+        if not huz_token or is_featured is None:
+            return Response(
+                {"message": "huz_token and is_featured are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        # Retrieve the partner profile based on the session token
-        user = PartnerProfile.objects.filter(partner_session_token=partner_session_token).first()
-        if not user:
-            return Response({"message": "User not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
-
-        # Check the account status and partner type
-        if user.account_status != "Active":
-            return Response({"message": "Account status does not allow you to perform this task."}, status=status.HTTP_409_CONFLICT)
-
-        # Retrieve the package based on the huz token
-        package = HuzBasicDetail.objects.filter(huz_token=huz_token).first()
+        package = HuzBasicDetail.objects.select_related("package_provider").filter(
+            huz_token=huz_token
+        ).first()
         if not package:
-            return Response({"message": "Package not found with the provided detail."}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"message": "Package not found with the provided detail."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if partner_session_token:
+            user = PartnerProfile.objects.filter(
+                partner_session_token=partner_session_token
+            ).first()
+            if not user:
+                return Response(
+                    {"message": "User not found with the provided detail."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            if package.package_provider_id != user.id:
+                return Response(
+                    {"message": "Package does not belong to the provided partner."},
+                    status=status.HTTP_409_CONFLICT,
+                )
 
         try:
             package.is_featured = is_featured
-            package.save()
-            serialized_package = HuzBasicSerializer(package)
-            return Response(serialized_package.data, status=status.HTTP_200_OK)
+            package.save(update_fields=["is_featured"])
+            return Response(
+                {
+                    "message": "Package feature status updated successfully.",
+                    "huz_token": package.huz_token,
+                    "package_name": package.package_name,
+                    "is_featured": bool(package.is_featured),
+                },
+                status=status.HTTP_200_OK,
+            )
         except Exception as e:
             logger.error(f"ManageFeaturedPackageView - Put: {str(e)}")
-            return Response({"message": "Failed to update package detail. Internal server error."},  status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response(
+                {"message": "Failed to update package detail. Internal server error."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 class GetPartnerReceiveAblePaymentsView(APIView):
