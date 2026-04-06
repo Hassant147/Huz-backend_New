@@ -54,12 +54,14 @@ jobs:
       - name: Trigger production deploy
         shell: bash
         run: |
+          # The deploy key on production is restricted with a forced command.
+          # Opening an SSH session triggers the server-side deploy command.
           ssh -i ~/.ssh/huz_deploy_key \
             -o BatchMode=yes \
             -o StrictHostKeyChecking=yes \
             -o ConnectTimeout=20 \
-            huz@64.227.173.238 \
-            'bash -s' < scripts/deploy_production_backend.sh
+            -T \
+            huz@64.227.173.238
 
       - name: Verify production canonical routes
         shell: bash
