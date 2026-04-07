@@ -189,6 +189,10 @@ def _to_decimal_amount(value):
 
 
 def get_total_approved_payment_amount(booking):
+    annotated_total = getattr(booking, "annotated_total_approved_payment_amount", None)
+    if annotated_total is not None:
+        return float(_to_decimal_amount(annotated_total))
+
     total = Decimal("0.00")
     for payment in get_booking_payments(booking):
         if normalize_payment_status(getattr(payment, "payment_status", "")) == PAYMENT_STATUS_APPROVED:
@@ -293,6 +297,10 @@ def booking_airline_details_are_complete(booking):
 
 
 def booking_passports_are_complete(booking):
+    annotated_passports_complete = getattr(booking, "annotated_passports_complete", None)
+    if annotated_passports_complete is not None:
+        return bool(annotated_passports_complete)
+
     traveller_status = _get_related_items(booking, "passport_for_booking_number")
     expected_traveller_count = get_expected_traveller_count(booking)
     if len(traveller_status) < expected_traveller_count:
@@ -458,6 +466,14 @@ def get_open_traveler_issues(booking):
     ]
 
 
+def booking_has_open_traveler_issues(booking):
+    annotated_has_open_issues = getattr(booking, "annotated_has_open_traveler_issues", None)
+    if annotated_has_open_issues is not None:
+        return bool(annotated_has_open_issues)
+
+    return bool(get_open_traveler_issues(booking))
+
+
 def booking_fulfillment_summary(booking):
     return {
         "visa_completed": booking_visa_documents_are_complete(booking),
@@ -544,7 +560,7 @@ def booking_can_manage_traveler_issues(booking):
 def booking_can_complete(booking):
     return (
         normalize_booking_status(getattr(booking, "booking_status", "")) == BOOKING_STATUS_READY_FOR_TRAVEL
-        and not get_open_traveler_issues(booking)
+        and not booking_has_open_traveler_issues(booking)
     )
 
 
@@ -601,7 +617,7 @@ def resolve_operator_workflow_bucket(booking):
     issue_status = str(getattr(booking, "issue_status", ISSUE_STATUS_NONE) or ISSUE_STATUS_NONE).strip().upper()
     if issue_status == ISSUE_STATUS_OPERATOR_OBJECTION:
         return WORKFLOW_BUCKET_ISSUES
-    if issue_status == ISSUE_STATUS_REPORTED or get_open_traveler_issues(booking):
+    if issue_status == ISSUE_STATUS_REPORTED or booking_has_open_traveler_issues(booking):
         return WORKFLOW_BUCKET_ISSUES
 
     if booking_status in {BOOKING_STATUS_TRAVELER_DETAILS_PENDING, BOOKING_STATUS_AWAITING_FINAL_PAYMENT}:
@@ -697,7 +713,7 @@ def sync_booking_state(booking, *, now=None, save=True):
     ).strip().upper()
     if current_issue_status == ISSUE_STATUS_OPERATOR_OBJECTION:
         normalized_issue_status = ISSUE_STATUS_OPERATOR_OBJECTION
-    elif get_open_traveler_issues(booking):
+    elif booking_has_open_traveler_issues(booking):
         normalized_issue_status = ISSUE_STATUS_REPORTED
     else:
         normalized_issue_status = ISSUE_STATUS_NONE

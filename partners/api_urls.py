@@ -72,9 +72,11 @@ urlpatterns = [
     path("admin/operators/bookings/ratings/package/", manage_partner_booking.GetRatingPackageWiseView.as_view(), name="v1-admin-operator-rating-package"),
     path("admin/operators/bookings/ratings/package-summary/", manage_partner_booking.GetPackageOverallRatingView.as_view(), name="v1-admin-operator-rating-package-summary"),
     path("admin/operators/bookings/complaints/", manage_partner_booking.GetPartnerComplaintsView.as_view(), name="v1-admin-operator-complaints"),
+    path("admin/operators/bookings/complaints/detail/", manage_partner_booking.GetPartnerComplaintDetailView.as_view(), name="v1-admin-operator-complaints-detail"),
     path("admin/operators/bookings/complaints/summary/", manage_partner_booking.GetOverallPartnerComplaintsView.as_view(), name="v1-admin-operator-complaints-summary"),
     path("admin/operators/bookings/complaints/respond/", manage_partner_booking.GiveUpdateOnComplaintsView.as_view(), name="v1-admin-operator-complaints-respond"),
     path("admin/operators/bookings/statistics/", manage_partner_booking.GetPartnersOverallBookingStatisticsView.as_view(), name="v1-admin-operator-booking-statistics"),
     path("admin/operators/bookings/earnings/yearly/", manage_partner_booking.GetYearlyBookingStatisticsView.as_view(), name="v1-admin-operator-booking-earnings"),
     path("admin/operators/bookings/payments/", manage_partner_booking.PartnersBookingPaymentView.as_view(), name="v1-admin-operator-booking-payments"),
+    path("admin/operators/dashboard/summary/", manage_partner_booking.GetOperatorDashboardSummaryView.as_view(), name="v1-admin-operator-dashboard-summary"),
 ]

@@ -1,12 +1,14 @@
 import importlib
 import smtplib
+import time
 from unittest.mock import Mock, patch
 
 from django.core.cache import cache
 from django.db import connection
+from django.http import JsonResponse
 from django.test import SimpleTestCase, override_settings
 from django.test.utils import CaptureQueriesContext
-from django.urls import Resolver404, clear_url_caches, resolve
+from django.urls import Resolver404, clear_url_caches, path, resolve
 from uuid import uuid4
 from rest_framework import serializers, status
 from rest_framework.test import APIRequestFactory, APITestCase
@@ -18,6 +20,15 @@ from .serializers import UserProfileSerializer
 from .utility import _send_email
 from .user_profile import CreateMemberProfileView, SendOTPSMSAPIView, send_otp_via_sms_gateway
 from huz import urls as huz_urls
+
+
+def _perf_metrics_test_view(_request):
+    return JsonResponse({"ok": True})
+
+
+urlpatterns = [
+    path("_perf-middleware-test/", _perf_metrics_test_view, name="perf-middleware-test"),
+]
 
 
 class PhoneIdentityTests(SimpleTestCase):
@@ -107,6 +118,42 @@ class ProductionOriginContractCheckTests(SimpleTestCase):
         self.assertEqual(errors, [])
 
 
+@override_settings(
+    ENABLE_PERF_METRICS=True,
+    ROOT_URLCONF="common.tests",
+)
+class RequestPerformanceMetricsMiddlewareTests(SimpleTestCase):
+    def test_perf_headers_are_not_added_without_opt_in_flag(self):
+        response = self.client.get("/_perf-middleware-test/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertNotIn("X-Perf-Duration-Ms", response)
+        self.assertNotIn("X-Perf-Query-Count", response)
+        self.assertNotIn("X-Perf-Query-Time-Ms", response)
+
+    def test_perf_headers_are_added_when_opt_in_query_flag_is_set(self):
+        response = self.client.get("/_perf-middleware-test/?__perf=1")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("X-Perf-Duration-Ms", response)
+        self.assertIn("X-Perf-Query-Count", response)
+        self.assertIn("X-Perf-Query-Time-Ms", response)
+        self.assertGreaterEqual(float(response["X-Perf-Duration-Ms"]), 0.0)
+        self.assertGreaterEqual(int(response["X-Perf-Query-Count"]), 0)
+        self.assertGreaterEqual(float(response["X-Perf-Query-Time-Ms"]), 0.0)
+
+    def test_perf_headers_are_added_when_opt_in_header_is_set(self):
+        response = self.client.get(
+            "/_perf-middleware-test/",
+            HTTP_X_PERF_METRICS="1",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("X-Perf-Duration-Ms", response)
+        self.assertIn("X-Perf-Query-Count", response)
+        self.assertIn("X-Perf-Query-Time-Ms", response)
+
+
 class SendOTPSMSAPIViewThrottleTests(APITestCase):
     def setUp(self):
         cache.clear()
@@ -124,21 +171,45 @@ class SendOTPSMSAPIViewThrottleTests(APITestCase):
 
         for _ in range(3):
             request = self.factory.post(
-                "/common/send_otp_sms/",
-                {"phone_number": "+14155552671"},
+                "/api/v1/auth/otp/send/",
+                {"phone_number": "+14155550001"},
                 format="json",
             )
             response = view(request)
             self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         throttled_request = self.factory.post(
-            "/common/send_otp_sms/",
-            {"phone_number": "+14155552671"},
+            "/api/v1/auth/otp/send/",
+            {"phone_number": "+14155550001"},
             format="json",
         )
         throttled_response = view(throttled_request)
 
         self.assertEqual(throttled_response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    @patch("common.user_profile.get_sms_gateway_api_key", return_value="test-api-key")
+    @patch("common.user_profile.send_otp_via_sms_gateway")
+    def test_send_otp_api_returns_without_waiting_for_slow_gateway(
+        self,
+        mocked_send_otp,
+        _mocked_api_key,
+    ):
+        def delayed_send(_phone_number):
+            time.sleep(0.5)
+            return "123456"
+
+        mocked_send_otp.side_effect = delayed_send
+
+        start_time = time.perf_counter()
+        response = self.client.post(
+            "/api/v1/auth/otp/send/",
+            {"phone_number": "+14155550002"},
+            format="json",
+        )
+        elapsed_seconds = time.perf_counter() - start_time
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertLess(elapsed_seconds, 0.3)
 
 
 class OTPGatewayRequestTests(APITestCase):
@@ -394,7 +465,7 @@ class PublicAuthContractTests(APITestCase):
 
     def test_is_user_exist_does_not_leak_session_token(self):
         response = self.client.post(
-            "/common/is_user_exist/",
+            "/api/v1/auth/users/exists/",
             {
                 "phone_number": "+14155552671",
             },
@@ -409,7 +480,7 @@ class PublicAuthContractTests(APITestCase):
         UserOTP.objects.create(phone_number="+14155552671", otp_password="654321")
 
         response = self.client.put(
-            "/common/verify_otp/",
+            "/api/v1/auth/otp/verify/",
             {
                 "phone_number": "+14155552671",
                 "otp_password": "654321",
@@ -442,7 +513,7 @@ class PublicAuthContractTests(APITestCase):
         UserOTP.objects.create(phone_number="+923395690614", otp_password="123456")
 
         response = self.client.put(
-            "/common/verify_otp/",
+            "/api/v1/auth/otp/verify/",
             {
                 "phone_number": "+9203395690614",
                 "otp_password": "123456",
@@ -459,7 +530,7 @@ class PublicAuthContractTests(APITestCase):
     @override_settings(DEBUG=True)
     def test_verify_otp_does_not_accept_the_old_debug_bypass_code(self):
         response = self.client.put(
-            "/common/verify_otp/",
+            "/api/v1/auth/otp/verify/",
             {
                 "phone_number": "+14155552671",
                 "otp_password": "123456",

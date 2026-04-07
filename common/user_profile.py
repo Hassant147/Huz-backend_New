@@ -20,6 +20,7 @@ from django.utils import timezone
 from datetime import timedelta
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
+import threading
 
 GENDER_CHOICES = ['male', 'female', 'non_binary', 'prefer_not_to_say', 'other']
 SMS_GATEWAY_URL = "https://api.veevotech.com/v3/sendsms"
@@ -74,10 +75,18 @@ def send_sms_gateway_request(params):
 
 
 def upsert_user_otp(phone_number, otp_code):
-    user_otp, _ = UserOTP.objects.get_or_create(phone_number=phone_number)
-    user_otp.otp_password = otp_code
-    user_otp.save()
-    return user_otp
+    with transaction.atomic():
+        existing_qs = UserOTP.objects.filter(phone_number=phone_number).order_by("-created_time")
+        user_otp = existing_qs.first()
+
+        if user_otp is None:
+            user_otp = UserOTP.objects.create(phone_number=phone_number, otp_password=otp_code)
+        else:
+            user_otp.otp_password = otp_code
+            user_otp.save(update_fields=["otp_password", "created_time"])
+
+        UserOTP.objects.filter(phone_number=phone_number).exclude(otp_id=user_otp.otp_id).delete()
+        return user_otp
 
 
 def get_sms_gateway_api_key():
@@ -124,6 +133,34 @@ def send_otp_via_sms_gateway(phone_number):
 
     upsert_user_otp(phone_number, otp_code)
     return otp_code
+
+
+def _deliver_otp_via_sms_gateway(phone_number):
+    try:
+        send_otp_via_sms_gateway(phone_number)
+    except Exception as exc:
+        logger.error("Async OTP delivery failed for %s: %s", phone_number, str(exc))
+
+
+def dispatch_otp_via_sms_gateway(phone_number, wait_for_result=False):
+    if wait_for_result:
+        send_otp_via_sms_gateway(phone_number)
+        return True
+
+    api_key = get_sms_gateway_api_key()
+    if not api_key:
+        logger.error(
+            "SMS gateway API key is missing while scheduling OTP for %s. Checked SMS_GATEWAY_API_KEY and APIKey.",
+            phone_number,
+        )
+        raise OTPDeliveryError("Failed to send OTP. Please try again later.")
+
+    threading.Thread(
+        target=_deliver_otp_via_sms_gateway,
+        args=(phone_number,),
+        daemon=True,
+    ).start()
+    return True
 
 
 def get_phone_identity_from_request(request, *, allow_lookup_only=False):
@@ -188,7 +225,7 @@ class SendOTPSMSAPIView(APIView):
             return Response({"message": str(exc.detail)}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            send_otp_via_sms_gateway(phone_number)
+            dispatch_otp_via_sms_gateway(phone_number, wait_for_result=False)
             return Response({"message": "OTP sent successfully."}, status=status.HTTP_200_OK)
         except OTPDeliveryError as exc:
             return Response({"message": str(exc)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -229,10 +266,11 @@ class MatchOTPSMSAPIView(APIView):
             return Response({"message": str(exc.detail)}, status=status.HTTP_400_BAD_REQUEST)
 
         # If OTP record exists for the provided phone number
-        try:
-            user_otp = UserOTP.objects.get(phone_number=phone_number)
-        except UserOTP.DoesNotExist:
+        user_otp = UserOTP.objects.filter(phone_number=phone_number).order_by("-created_time").first()
+        if user_otp is None:
             return Response({"message": "OTP not found for this phone number."}, status=status.HTTP_400_BAD_REQUEST)
+
+        UserOTP.objects.filter(phone_number=phone_number).exclude(otp_id=user_otp.otp_id).delete()
 
         # If OTP has expired (within 2 minute)
         time_difference = timezone.now() - user_otp.created_time

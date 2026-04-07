@@ -12,10 +12,82 @@ from common.authentication import (
 from common.auth_utils import require_partner_profile
 from common.utility import validate_required_fields
 from common.logs_file import logger
+from common.pagination import CustomPagination
 from django.db import transaction
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
-from django.db.models import Sum, Count
+from django.db.models import Count, Q, Sum
+from django.utils.dateparse import parse_date
+
+
+WALLET_DEFAULT_PAGE_SIZE = 25
+WALLET_MAX_PAGE_SIZE = 100
+TRANSACTION_ALLOWED_SORTS = {
+    "transaction_time": "transaction_time",
+    "-transaction_time": "-transaction_time",
+    "transaction_amount": "transaction_amount",
+    "-transaction_amount": "-transaction_amount",
+}
+WITHDRAW_ALLOWED_SORTS = {
+    "request_time": "request_time",
+    "-request_time": "-request_time",
+    "process_time": "process_time",
+    "-process_time": "-process_time",
+    "withdraw_amount": "withdraw_amount",
+    "-withdraw_amount": "-withdraw_amount",
+}
+
+
+class WalletPagination(CustomPagination):
+    page_size = WALLET_DEFAULT_PAGE_SIZE
+    max_page_size = WALLET_MAX_PAGE_SIZE
+
+
+def _parse_iso_date_param(raw_value):
+    if raw_value in (None, ""):
+        return None
+
+    parsed = parse_date(str(raw_value))
+    return parsed
+
+
+def _normalize_sort_param(raw_value, allowed_sorts, default_sort):
+    if raw_value in (None, ""):
+        return default_sort
+
+    normalized = str(raw_value).strip()
+    return allowed_sorts.get(normalized, default_sort)
+
+
+def _normalize_transaction_type(raw_value):
+    if raw_value in (None, ""):
+        return None
+
+    normalized = str(raw_value).strip().lower()
+    if normalized in {"all", "*"}:
+        return None
+    if normalized == "credit":
+        return "Credit"
+    if normalized == "debit":
+        return "Debit"
+    return "__invalid__"
+
+
+def _normalize_withdraw_status(raw_value):
+    if raw_value in (None, ""):
+        return None
+
+    normalized = str(raw_value).strip().lower()
+    if normalized in {"all", "*"}:
+        return None
+
+    aliases = {
+        "pending": "Pending",
+        "processed": "Processed",
+        "completed": "Completed",
+        "rejected": "Rejected",
+    }
+    return aliases.get(normalized, "__invalid__")
 
 
 class PartnerHeaderAuthenticationAPIView(APIView):
@@ -201,11 +273,17 @@ class ManagePartnerWithdrawView(PartnerHeaderAuthenticationAPIView):
                 type=openapi.TYPE_STRING,
                 required=False,
                 description='Optional for documented legacy/admin compatibility only.',
-            )
+            ),
+            openapi.Parameter('status', openapi.IN_QUERY, type=openapi.TYPE_STRING, required=False),
+            openapi.Parameter('search', openapi.IN_QUERY, type=openapi.TYPE_STRING, required=False),
+            openapi.Parameter('from_date', openapi.IN_QUERY, type=openapi.TYPE_STRING, required=False),
+            openapi.Parameter('to_date', openapi.IN_QUERY, type=openapi.TYPE_STRING, required=False),
+            openapi.Parameter('sort', openapi.IN_QUERY, type=openapi.TYPE_STRING, required=False),
+            openapi.Parameter('page', openapi.IN_QUERY, type=openapi.TYPE_INTEGER, required=False),
+            openapi.Parameter('page_size', openapi.IN_QUERY, type=openapi.TYPE_INTEGER, required=False),
         ],
         responses={
-            200: openapi.Response("Successful retrieval of withdrawal requests", PartnerWithdrawSerializer),
-            404: "Not Found: User or withdrawal requests not found",
+            200: openapi.Response("Successful retrieval of withdrawal requests", PartnerWithdrawSerializer(many=True)),
             400: "Bad Request: Invalid input data",
             500: "Server Error: Internal server error"
         }
@@ -216,13 +294,59 @@ class ManagePartnerWithdrawView(PartnerHeaderAuthenticationAPIView):
             if error_response:
                 return error_response
 
-            # Check if there are withdrawal requests for the user
-            check_exist = PartnerWithdraw.objects.filter(withdraw_for_partner=user)
-            if check_exist.exists():
-                serialized_package = PartnerWithdrawSerializer(check_exist, many=True)
-                return Response(serialized_package.data, status=status.HTTP_200_OK)
-            else:
-                return Response({"message": "Withdraw request not exist."}, status=status.HTTP_404_NOT_FOUND)
+            queryset = (
+                PartnerWithdraw.objects.filter(withdraw_for_partner=user)
+                .select_related("withdraw_bank")
+                .order_by("-request_time")
+            )
+
+            status_filter = _normalize_withdraw_status(request.GET.get("status"))
+            if status_filter == "__invalid__":
+                return Response(
+                    {"message": "Invalid status filter. Allowed values: Pending, Processed, Completed, Rejected."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if status_filter:
+                queryset = queryset.filter(withdraw_status=status_filter)
+
+            search_query = (request.GET.get("search") or "").strip()
+            if search_query:
+                safe_query = search_query[:100]
+                queryset = queryset.filter(
+                    Q(withdraw_bank__account_title__icontains=safe_query)
+                    | Q(withdraw_bank__account_number__icontains=safe_query)
+                    | Q(withdraw_bank__bank_name__icontains=safe_query)
+                )
+
+            from_date = _parse_iso_date_param(request.GET.get("from_date"))
+            if request.GET.get("from_date") and not from_date:
+                return Response(
+                    {"message": "Invalid from_date. Expected format: YYYY-MM-DD."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if from_date:
+                queryset = queryset.filter(request_time__date__gte=from_date)
+
+            to_date = _parse_iso_date_param(request.GET.get("to_date"))
+            if request.GET.get("to_date") and not to_date:
+                return Response(
+                    {"message": "Invalid to_date. Expected format: YYYY-MM-DD."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if to_date:
+                queryset = queryset.filter(request_time__date__lte=to_date)
+
+            sort_order = _normalize_sort_param(
+                request.GET.get("sort"),
+                WITHDRAW_ALLOWED_SORTS,
+                "-request_time",
+            )
+            queryset = queryset.order_by(sort_order, "-withdraw_id")
+
+            paginator = WalletPagination()
+            paginated_queryset = paginator.paginate_queryset(queryset, request)
+            serialized_package = PartnerWithdrawSerializer(paginated_queryset, many=True)
+            return paginator.get_paginated_response(serialized_package.data)
 
         except Exception as e:
             # Error adding in Logs file
@@ -318,17 +442,23 @@ class GetPartnerAllTransactionHistoryView(PartnerHeaderAuthenticationAPIView):
             "the Authorization header."
         ),
         manual_parameters=[
-            openapi.Parameter(
-                'partner_session_token',
-                openapi.IN_QUERY,
-                type=openapi.TYPE_STRING,
-                required=False,
-                description='Optional for documented legacy/admin compatibility only.',
-            )
+                openapi.Parameter(
+                    'partner_session_token',
+                    openapi.IN_QUERY,
+                    type=openapi.TYPE_STRING,
+                    required=False,
+                    description='Optional for documented legacy/admin compatibility only.',
+                ),
+                openapi.Parameter('transaction_type', openapi.IN_QUERY, type=openapi.TYPE_STRING, required=False),
+                openapi.Parameter('search', openapi.IN_QUERY, type=openapi.TYPE_STRING, required=False),
+                openapi.Parameter('from_date', openapi.IN_QUERY, type=openapi.TYPE_STRING, required=False),
+                openapi.Parameter('to_date', openapi.IN_QUERY, type=openapi.TYPE_STRING, required=False),
+                openapi.Parameter('sort', openapi.IN_QUERY, type=openapi.TYPE_STRING, required=False),
+                openapi.Parameter('page', openapi.IN_QUERY, type=openapi.TYPE_INTEGER, required=False),
+                openapi.Parameter('page_size', openapi.IN_QUERY, type=openapi.TYPE_INTEGER, required=False),
         ],
         responses={
             200: openapi.Response("Successful retrieval of transaction history", PartnerTransactionSerializer(many=True)),
-            404: "Not Found: User or transaction history not found",
             400: "Bad Request: Invalid input data",
             500: "Server Error: Internal server error"
         }
@@ -339,16 +469,58 @@ class GetPartnerAllTransactionHistoryView(PartnerHeaderAuthenticationAPIView):
             if error_response:
                 return error_response
 
-            # Retrieve user transactions based on user session_token
-            exist_trans = PartnerTransactionHistory.objects.filter(
+            queryset = PartnerTransactionHistory.objects.filter(
                 transaction_for_partner=user
             ).order_by('-transaction_time')
 
-            if not exist_trans.exists():
-                return Response({"message": "Transaction records not found."}, status=status.HTTP_404_NOT_FOUND)
+            normalized_transaction_type = _normalize_transaction_type(
+                request.GET.get("transaction_type")
+            )
+            if normalized_transaction_type == "__invalid__":
+                return Response(
+                    {"message": "Invalid transaction_type. Allowed values: Credit, Debit."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if normalized_transaction_type:
+                queryset = queryset.filter(transaction_type=normalized_transaction_type)
 
-            serialized_trans = PartnerTransactionSerializer(exist_trans, many=True)
-            return Response(serialized_trans.data, status=status.HTTP_200_OK)
+            search_query = (request.GET.get("search") or "").strip()
+            if search_query:
+                safe_query = search_query[:100]
+                queryset = queryset.filter(
+                    Q(transaction_code__icontains=safe_query)
+                    | Q(transaction_description__icontains=safe_query)
+                )
+
+            from_date = _parse_iso_date_param(request.GET.get("from_date"))
+            if request.GET.get("from_date") and not from_date:
+                return Response(
+                    {"message": "Invalid from_date. Expected format: YYYY-MM-DD."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if from_date:
+                queryset = queryset.filter(transaction_time__date__gte=from_date)
+
+            to_date = _parse_iso_date_param(request.GET.get("to_date"))
+            if request.GET.get("to_date") and not to_date:
+                return Response(
+                    {"message": "Invalid to_date. Expected format: YYYY-MM-DD."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if to_date:
+                queryset = queryset.filter(transaction_time__date__lte=to_date)
+
+            sort_order = _normalize_sort_param(
+                request.GET.get("sort"),
+                TRANSACTION_ALLOWED_SORTS,
+                "-transaction_time",
+            )
+            queryset = queryset.order_by(sort_order, "-transaction_id")
+
+            paginator = WalletPagination()
+            paginated_queryset = paginator.paginate_queryset(queryset, request)
+            serialized_trans = PartnerTransactionSerializer(paginated_queryset, many=True)
+            return paginator.get_paginated_response(serialized_trans.data)
 
         except Exception as e:
             # Error adding in Logs file

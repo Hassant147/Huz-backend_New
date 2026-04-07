@@ -170,10 +170,11 @@ def get_airline_detail(obj):
 
 
 def get_rating_count(obj):
-    prefetched_ratings = _get_prefetched_items(obj, "rating_for_package")
-    if prefetched_ratings is not None:
-        total_stars = sum((rating.partner_total_stars or 0) for rating in prefetched_ratings)
-        rating_count = len(prefetched_ratings)
+    annotated_rating_count = getattr(obj, "package_rating_total_count", None)
+    annotated_total_stars = getattr(obj, "package_rating_total_stars", None)
+    if annotated_rating_count is not None or annotated_total_stars is not None:
+        total_stars = float(annotated_total_stars or 0)
+        rating_count = int(annotated_rating_count or 0)
         average_stars = round(total_stars / rating_count, 1) if rating_count else 0
         return {
             'total_stars': total_stars,
@@ -181,11 +182,10 @@ def get_rating_count(obj):
             'average_stars': average_stars
         }
 
-    annotated_rating_count = getattr(obj, "package_rating_total_count", None)
-    annotated_total_stars = getattr(obj, "package_rating_total_stars", None)
-    if annotated_rating_count is not None or annotated_total_stars is not None:
-        total_stars = float(annotated_total_stars or 0)
-        rating_count = int(annotated_rating_count or 0)
+    prefetched_ratings = _get_prefetched_items(obj, "rating_for_package")
+    if prefetched_ratings is not None:
+        total_stars = sum((rating.partner_total_stars or 0) for rating in prefetched_ratings)
+        rating_count = len(prefetched_ratings)
         average_stars = round(total_stars / rating_count, 1) if rating_count else 0
         return {
             'total_stars': total_stars,
@@ -497,21 +497,29 @@ class HuzZiyarahSerializer(serializers.ModelSerializer):
 
 
 def _get_sorted_package_date_ranges(obj):
-    range_items = _list_related_items(obj, "package_date_ranges")
-    if not range_items:
+    cached_ranges = getattr(obj, "_sorted_package_date_ranges_cache", None)
+    if cached_ranges is not None:
+        return cached_ranges
+
+    prefetched_range_items = _get_prefetched_items(obj, "package_date_ranges")
+    if prefetched_range_items is not None:
+        range_items = prefetched_range_items
+    else:
         range_items = list(
             HuzPackageDateRange.objects.filter(date_range_for_package=obj).order_by(
                 "start_date", "end_date"
             )
         )
 
-    return sorted(
+    sorted_ranges = sorted(
         range_items,
         key=lambda item: (
             getattr(item, "start_date", None) or timezone.now(),
             getattr(item, "end_date", None) or timezone.now(),
         ),
     )
+    setattr(obj, "_sorted_package_date_ranges_cache", sorted_ranges)
+    return sorted_ranges
 
 
 def _serialize_package_date_ranges(obj):
@@ -615,33 +623,33 @@ class HuzAlignedPackageSerializer(serializers.ModelSerializer):
         ]
 
     def _get_airline_items(self, obj):
-        items = _list_related_items(obj, "airline_for_package")
-        if items:
-            return items
+        prefetched_items = _get_prefetched_items(obj, "airline_for_package")
+        if prefetched_items is not None:
+            return prefetched_items
 
         airline = HuzAirlineDetail.objects.filter(airline_for_package=obj).first()
         return [airline] if airline else []
 
     def _get_transport_items(self, obj):
-        items = _list_related_items(obj, "transport_for_package")
-        if items:
-            return items
+        prefetched_items = _get_prefetched_items(obj, "transport_for_package")
+        if prefetched_items is not None:
+            return prefetched_items
 
         transport = HuzTransportDetail.objects.filter(transport_for_package=obj).first()
         return [transport] if transport else []
 
     def _get_ziyarah_items(self, obj):
-        items = _list_related_items(obj, "ziyarah_for_package")
-        if items:
-            return items
+        prefetched_items = _get_prefetched_items(obj, "ziyarah_for_package")
+        if prefetched_items is not None:
+            return prefetched_items
 
         ziyarah = HuzZiyarahDetail.objects.filter(ziyarah_for_package=obj).first()
         return [ziyarah] if ziyarah else []
 
     def _get_hotel_items(self, obj):
-        items = _list_related_items(obj, "hotel_for_package")
-        if items:
-            return items
+        prefetched_items = _get_prefetched_items(obj, "hotel_for_package")
+        if prefetched_items is not None:
+            return prefetched_items
 
         return list(
             HuzHotelDetail.objects.filter(hotel_for_package=obj)

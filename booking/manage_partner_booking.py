@@ -1,6 +1,7 @@
 import json
 from decimal import Decimal
 
+from django.conf import settings
 from django.db import transaction
 from django.db.models import Sum, Count, Q
 from django.utils import timezone
@@ -20,7 +21,13 @@ from common.permissions import IsAdminOrAuthenticatedPartnerProfile
 from common.utility import validate_required_fields, check_file_format_and_size, save_file_in_directory, delete_file_from_directory, send_objection_email, send_booking_documents_email
 from common.logs_file import logger
 from management.authentication import ManagementSessionAuthentication
-from partners.models import PartnerProfile, HuzBasicDetail, HuzHotelDetail
+from partners.models import (
+    HuzBasicDetail,
+    HuzHotelDetail,
+    PartnerProfile,
+    PartnerTransactionHistory,
+    Wallet as PartnerWallet,
+)
 from .models import (
     Booking,
     BookingAirlineDetail,
@@ -37,12 +44,14 @@ from .models import (
     TravelerIssue,
 )
 from .querysets import (
+    annotate_partner_booking_list_metrics,
     annotate_effective_booking_status,
     build_partner_workflow_bucket_q,
     filter_partner_booking_queryset,
 )
 from .serializers import (
     DetailBookingSerializer,
+    PartnerBookingMutationPatchSerializer,
     PartnerBookingListSerializer,
     PartnersBookingPaymentSerializer,
     BookingComplaintsSerializer,
@@ -63,6 +72,7 @@ from .statuses import (
     ISSUE_STATUS_OPERATOR_OBJECTION,
     ISSUE_STATUS_REPORTED,
     WORKFLOW_BUCKET_CHOICES,
+    WORKFLOW_BUCKET_READY,
     WORKFLOW_BUCKET_REQUEST_CHOICES,
 )
 from .workflow import (
@@ -161,6 +171,7 @@ VALID_BOOKING_STATUSES = tuple(status_name for status_name, _ in BOOKING_STATUS_
 BOOKING_STATUS_NORMALIZER = {status_name.lower(): status_name for status_name in VALID_BOOKING_STATUSES}
 VALID_BOOKING_UPDATE_STATUSES = (BOOKING_STATUS_IN_FULFILLMENT, BOOKING_STATUS_READY_FOR_TRAVEL)
 VALID_BOOKING_DOCUMENT_TYPES = ("eVisa", "airline", "hotel", "transport")
+SUPPORTED_DASHBOARD_PACKAGE_TYPES = ("Hajj", "Umrah")
 VALID_BOOKING_DOCUMENT_SCOPES = (
     BookingDocuments.DOCUMENT_SCOPE_BOOKING,
     BookingDocuments.DOCUMENT_SCOPE_GROUP,
@@ -263,24 +274,9 @@ COMPLETE_BOOKING_STATUS_FLAGS = (
     "is_transport_completed",
 )
 
-BOOKING_LIST_SELECT_RELATED = ("order_by", "order_to", "package_token")
+BOOKING_LIST_SELECT_RELATED = ("order_by", "package_token")
 BOOKING_LIST_PREFETCH_RELATED = (
     "order_by__mailing_session",
-    "order_to__company_of_partner",
-    "passport_for_booking_number__booking_group",
-    "passport_for_booking_number__traveler_issues",
-    "passport_for_booking_number",
-    "booking_token",
-    "booking_groups",
-    "booking_groups__documents",
-    "booking_groups__travelers",
-    "booking_groups__travelers__traveler_issues",
-    "document_for_booking_token",
-    "package_token__airline_for_package",
-    "package_token__hotel_for_package",
-    "package_token__transport_for_package",
-    "hotel_fulfillments",
-    "traveler_issues",
 )
 BOOKING_STATS_PREFETCH_RELATED = (
     "passport_for_booking_number",
@@ -328,8 +324,10 @@ def get_partner_bookings_queryset(include_detail_relations=False):
         return Booking.objects.select_related(*BOOKING_DETAIL_SELECT_RELATED).prefetch_related(
             *BOOKING_DETAIL_PREFETCH_RELATED
         )
-    return Booking.objects.select_related(*BOOKING_LIST_SELECT_RELATED).prefetch_related(
-        *BOOKING_LIST_PREFETCH_RELATED
+    return annotate_partner_booking_list_metrics(
+        Booking.objects.select_related(*BOOKING_LIST_SELECT_RELATED).prefetch_related(
+            *BOOKING_LIST_PREFETCH_RELATED
+        )
     )
 
 
@@ -439,6 +437,16 @@ def _build_partner_booking_response(request, booking_detail):
         context={"request": request, "hide_payment_detail": True},
     )
     return serialized_booking.data
+
+
+def _build_partner_booking_mutation_patch_response(request, booking_detail):
+    sync_booking_state(booking_detail, save=True)
+    clear_booking_runtime_caches(booking_detail)
+    serializer = PartnerBookingMutationPatchSerializer(
+        booking_detail,
+        context={"request": request},
+    )
+    return serializer.data
 
 
 def resolve_partner_for_request(request, partner_session_token=""):
@@ -778,6 +786,23 @@ def normalize_complaint_status(value):
     return COMPLAINT_STATUS_NORMALIZER.get(normalized, "")
 
 
+def _partner_complaints_queryset(partner):
+    return (
+        BookingComplaints.objects.select_related(
+            "complaint_by_user",
+            "complaint_for_booking",
+            "complaint_for_package",
+            "complaint_for_partner",
+        )
+        .prefetch_related(
+            "complaint_by_user__mailing_session",
+            "complaint_for_partner__company_of_partner",
+        )
+        .filter(complaint_for_partner=partner)
+        .order_by("-complaint_time")
+    )
+
+
 def build_star_distribution(queryset, key_prefix):
     aggregate_keys = {}
     aggregate_filters = (
@@ -795,6 +820,316 @@ def build_star_distribution(queryset, key_prefix):
         f"{key_prefix}_{star}": int(aggregated_counts.get(f"star_{star}") or 0)
         for star in range(5, 0, -1)
     }
+
+
+def _parse_positive_int(value, *, default, field_name, minimum=1, maximum=100):
+    if value in (None, ""):
+        return default, None
+
+    try:
+        parsed_value = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None, Response(
+            {"message": f"Invalid {field_name}. Expected an integer between {minimum} and {maximum}."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if parsed_value < minimum or parsed_value > maximum:
+        return None, Response(
+            {"message": f"Invalid {field_name}. Expected a value between {minimum} and {maximum}."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    return parsed_value, None
+
+
+class GetOperatorDashboardSummaryView(APIView):
+    permission_classes = [IsAdminOrPartnerSessionToken]
+
+    @swagger_auto_schema(
+        manual_parameters=[
+            openapi.Parameter(
+                "partner_session_token",
+                openapi.IN_QUERY,
+                description="Optional for documented legacy/admin compatibility only.",
+                type=openapi.TYPE_STRING,
+                required=False,
+            ),
+            openapi.Parameter(
+                "year",
+                openapi.IN_QUERY,
+                description="Yearly earnings year. Defaults to current year.",
+                type=openapi.TYPE_INTEGER,
+                required=False,
+            ),
+            openapi.Parameter(
+                "recent_bookings_limit",
+                openapi.IN_QUERY,
+                description="Number of recent bookings to include (1-50). Default 5.",
+                type=openapi.TYPE_INTEGER,
+                required=False,
+            ),
+            openapi.Parameter(
+                "recent_bookings_scope",
+                openapi.IN_QUERY,
+                description="Recent booking scope. One of: READY, ALL. Default READY.",
+                type=openapi.TYPE_STRING,
+                required=False,
+            ),
+            openapi.Parameter(
+                "receivables_limit",
+                openapi.IN_QUERY,
+                description="Number of receivable rows to include (1-100). Default 50.",
+                type=openapi.TYPE_INTEGER,
+                required=False,
+            ),
+        ],
+        responses={
+            200: "Success: Unified operator dashboard summary.",
+            400: "Bad Request: Invalid query parameter values.",
+            401: "Unauthorized: Admin permissions required.",
+            404: "Not Found: User not found.",
+            500: "Server Error: Internal server error.",
+        },
+    )
+    def get(self, request):
+        try:
+            if not getattr(settings, "ENABLE_OPERATOR_DASHBOARD_SUMMARY_ENDPOINT", True):
+                return Response(
+                    {"message": "Dashboard summary endpoint is disabled."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            year_value = request.GET.get("year")
+            if year_value in (None, ""):
+                year = timezone.now().year
+            else:
+                try:
+                    year = int(str(year_value).strip())
+                except (TypeError, ValueError):
+                    return Response(
+                        {"message": "Invalid year. Expected a numeric year like 2026."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+            recent_bookings_limit, limit_error = _parse_positive_int(
+                request.GET.get("recent_bookings_limit"),
+                default=5,
+                field_name="recent_bookings_limit",
+                minimum=1,
+                maximum=50,
+            )
+            if limit_error:
+                return limit_error
+
+            receivables_limit, receivables_error = _parse_positive_int(
+                request.GET.get("receivables_limit"),
+                default=50,
+                field_name="receivables_limit",
+                minimum=1,
+                maximum=100,
+            )
+            if receivables_error:
+                return receivables_error
+
+            recent_scope = str(request.GET.get("recent_bookings_scope") or "READY").strip().upper()
+            if recent_scope not in {"READY", "ALL"}:
+                return Response(
+                    {"message": "Invalid recent_bookings_scope. Must be one of: READY, ALL."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            user, error_response = resolve_partner_or_error_response(
+                request,
+                missing_message="Missing required data fields.",
+                not_found_message="User not found.",
+            )
+            if error_response:
+                return error_response
+
+            allow_hidden = request_has_partner_visibility_override(request)
+
+            bookings_queryset = annotate_effective_booking_status(
+                Booking.objects.filter(order_to=user)
+            )
+            status_aliases = {
+                f"status_{index}": status_name
+                for index, (status_name, _) in enumerate(BOOKING_STATUS_CHOICES)
+            }
+            workflow_bucket_aliases = {
+                f"workflow_bucket_{index}": workflow_bucket
+                for index, workflow_bucket in enumerate(sorted(WORKFLOW_BUCKET_CHOICES))
+            }
+            aggregate_kwargs = {
+                alias: Count("pk", filter=Q(effective_booking_status=status_name))
+                for alias, status_name in status_aliases.items()
+            }
+            aggregate_kwargs.update(
+                {
+                    alias: Count("pk", filter=build_partner_workflow_bucket_q(workflow_bucket))
+                    for alias, workflow_bucket in workflow_bucket_aliases.items()
+                }
+            )
+            aggregate_counts = bookings_queryset.aggregate(**aggregate_kwargs)
+            booking_status_counts = {
+                status_name: int(aggregate_counts.get(alias) or 0)
+                for alias, status_name in status_aliases.items()
+            }
+            workflow_bucket_counts = {
+                workflow_bucket: int(aggregate_counts.get(alias) or 0)
+                for alias, workflow_bucket in workflow_bucket_aliases.items()
+            }
+
+            recent_bookings_queryset = (
+                get_partner_bookings_queryset(include_detail_relations=False)
+                .filter(order_to=user)
+                .order_by("-order_time")
+            )
+            recent_bookings_queryset = filter_partner_booking_queryset(
+                recent_bookings_queryset,
+                workflow_bucket=WORKFLOW_BUCKET_READY if recent_scope == "READY" else "",
+                allow_hidden=allow_hidden,
+            )
+            recent_bookings_count = recent_bookings_queryset.count()
+            recent_bookings_page = list(recent_bookings_queryset[:recent_bookings_limit])
+            serialized_recent_bookings = PartnerBookingListSerializer(
+                recent_bookings_page,
+                many=True,
+                context={"request": request},
+            ).data
+
+            package_statuses = [status_name for status_name, _ in HuzBasicDetail.PACKAGE_STATUS_CHOICES]
+            package_counts = {status_name: 0 for status_name in package_statuses}
+            package_count_queryset = (
+                HuzBasicDetail.objects.filter(
+                    package_provider=user,
+                    package_type__in=SUPPORTED_DASHBOARD_PACKAGE_TYPES,
+                )
+                .values("package_status")
+                .annotate(total_count=Count("huz_id"))
+            )
+            for item in package_count_queryset:
+                status_name = item.get("package_status")
+                if status_name:
+                    package_counts[status_name] = int(item.get("total_count", 0))
+
+            complaint_status_counts = {status_name: 0 for status_name in VALID_COMPLAINT_STATUSES}
+            complaint_counts = (
+                BookingComplaints.objects.filter(complaint_for_partner=user)
+                .values("complaint_status")
+                .annotate(total_count=Count("complaint_id"))
+                .order_by("complaint_status")
+            )
+            for item in complaint_counts:
+                normalized_status = normalize_complaint_status(item.get("complaint_status"))
+                if normalized_status:
+                    complaint_status_counts[normalized_status] += int(item.get("total_count") or 0)
+
+            rating_summary = build_star_distribution(
+                BookingRatingAndReview.objects.filter(rating_for_partner=user),
+                "total_star",
+            )
+
+            credit_transaction = PartnerTransactionHistory.objects.filter(
+                transaction_for_partner=user,
+                transaction_type="Credit",
+            ).aggregate(
+                total_amount=Sum("transaction_amount"),
+                total_count=Count("transaction_id"),
+            )
+            debit_transaction = PartnerTransactionHistory.objects.filter(
+                transaction_for_partner=user,
+                transaction_type="Debit",
+            ).aggregate(
+                total_amount=Sum("transaction_amount"),
+                total_count=Count("transaction_id"),
+            )
+            wallet_summary = {
+                "credit_transaction_amount": credit_transaction.get("total_amount") or 0,
+                "debit_transaction_amount": debit_transaction.get("total_amount") or 0,
+                "credit_number_transactions": int(credit_transaction.get("total_count") or 0),
+                "debit_number_transactions": int(debit_transaction.get("total_count") or 0),
+            }
+            available_balance = (
+                PartnerWallet.objects.filter(wallet_session=user).aggregate(
+                    total_amount=Sum("wallet_amount")
+                ).get("total_amount")
+                or 0
+            )
+
+            receivables_queryset = (
+                PartnersBookingPayment.objects.select_related(
+                    "payment_for_booking",
+                    "payment_for_package",
+                    "payment_for_partner",
+                )
+                .prefetch_related("payment_for_partner__company_of_partner")
+                .filter(payment_for_partner=user)
+                .order_by("-create_date")
+            )
+            receivables_count = receivables_queryset.count()
+            receivables_page = list(receivables_queryset[:receivables_limit])
+            receivables_results = PartnersBookingPaymentSerializer(
+                receivables_page,
+                many=True,
+                context={"request": request},
+            ).data
+
+            yearly_earning = Booking.objects.filter(
+                order_to=user,
+                booking_status__in=[BOOKING_STATUS_READY_FOR_TRAVEL, BOOKING_STATUS_COMPLETED],
+                order_time__year=year,
+            ).aggregate(total_price=Sum("total_price"))
+            income_amount = yearly_earning.get("total_price") or 0
+
+            payload = {
+                "meta": {
+                    "generated_at": timezone.now().isoformat(),
+                    "summary_mode": "aggregate",
+                    "recent_bookings_scope": recent_scope,
+                },
+                "bookings": {
+                    "summary": {
+                        **booking_status_counts,
+                        **workflow_bucket_counts,
+                    },
+                    "recent": {
+                        "count": recent_bookings_count,
+                        "next": None,
+                        "previous": None,
+                        "results": serialized_recent_bookings,
+                    },
+                },
+                "packages": {
+                    "summary": package_counts,
+                },
+                "complaints": {
+                    "summary": complaint_status_counts,
+                },
+                "ratings": rating_summary,
+                "wallet": {
+                    "available_balance": available_balance,
+                    "summary": wallet_summary,
+                    "receivables": {
+                        "count": receivables_count,
+                        "next": None,
+                        "previous": None,
+                        "results": receivables_results,
+                    },
+                },
+                "income": {
+                    "year": year,
+                    "amount": income_amount,
+                },
+            }
+
+            return Response(payload, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.error(f"GetOperatorDashboardSummaryView: {str(e)}", exc_info=True)
+            return Response(
+                {"message": "Failed to fetch dashboard summary. Internal server error."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 def finalize_booking_if_all_documents_completed(booking_detail, doc, package_detail, partner):
@@ -954,7 +1289,10 @@ class TakeActionView(AuthenticatedPartnerBookingMutationAPIView):
             }
         ),
         responses={
-            201: openapi.Response('Created: Booking status updated successfully.', DetailBookingSerializer(many=False)),
+            201: openapi.Response(
+                'Created: Booking status updated successfully.',
+                PartnerBookingMutationPatchSerializer(many=False),
+            ),
             400: "Bad Request: Missing or invalid input data.",
             401: "Unauthorized: Admin permissions required.",
             404: "Not Found: User or booking detail not found.",
@@ -1015,8 +1353,10 @@ class TakeActionView(AuthenticatedPartnerBookingMutationAPIView):
                 booking_detail.save(update_fields=update_fields)
                 sync_booking_state(booking_detail, save=True)
 
-                serialized_package = DetailBookingSerializer(booking_detail, context={"request": request, "hide_payment_detail": True})
-                return Response(serialized_package.data, status=status.HTTP_201_CREATED)
+                return Response(
+                    _build_partner_booking_mutation_patch_response(request, booking_detail),
+                    status=status.HTTP_201_CREATED,
+                )
 
             return Response({"message": "Only ready-for-operator bookings can be updated."}, status=status.HTTP_409_CONFLICT)
         except Exception as e:
@@ -1981,20 +2321,7 @@ class GetPartnerComplaintsView(APIView):
             if error_response:
                 return error_response
 
-            complaints = (
-                BookingComplaints.objects.select_related(
-                    'complaint_by_user',
-                    'complaint_for_booking',
-                    'complaint_for_package',
-                    'complaint_for_partner',
-                )
-                .prefetch_related(
-                    'complaint_by_user__mailing_session',
-                    'complaint_for_partner__company_of_partner',
-                )
-                .filter(complaint_for_partner=user)
-                .order_by('-complaint_time')
-            )
+            complaints = _partner_complaints_queryset(user)
 
             if normalized_complaint_status:
                 complaints = complaints.filter(complaint_status=normalized_complaint_status)
@@ -2030,6 +2357,76 @@ class GetPartnerComplaintsView(APIView):
             # Log the error with exception information
             logger.error(f"Error in GetPartnerComplaintsView: {str(e)}", exc_info=True)
             return Response({"message": "An unexpected error occurred."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class GetPartnerComplaintDetailView(APIView):
+    permission_classes = [IsAdminOrPartnerSessionToken]
+
+    @swagger_auto_schema(
+        manual_parameters=[
+            openapi.Parameter(
+                "partner_session_token",
+                openapi.IN_QUERY,
+                description="Session token of the partner",
+                type=openapi.TYPE_STRING,
+                required=True,
+            ),
+            openapi.Parameter(
+                "complaint_id",
+                openapi.IN_QUERY,
+                description="Complaint ID (exact match)",
+                type=openapi.TYPE_STRING,
+                required=True,
+            ),
+        ],
+        responses={
+            200: "Complaint detail payload for the scoped partner",
+            400: "Missing required data fields",
+            401: "Unauthorized: Admin permissions required.",
+            404: "User or complaint not found",
+            500: "An unexpected error occurred",
+        },
+    )
+    def get(self, request):
+        try:
+            complaint_id = str(request.GET.get("complaint_id") or "").strip()
+            if not complaint_id:
+                return Response(
+                    {"message": "Missing required data fields."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            user, error_response = resolve_partner_or_error_response(
+                request,
+                missing_message="Missing required data fields.",
+                not_found_message="User not found.",
+            )
+            if error_response:
+                return error_response
+
+            complaint = _partner_complaints_queryset(user).filter(
+                complaint_id=complaint_id
+            ).first()
+            if not complaint:
+                return Response(
+                    {"message": "Complaint not found."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            serialized_complaint = BookingComplaintsSerializer(
+                complaint,
+                context={"request": request},
+            )
+            return Response(serialized_complaint.data, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.error(
+                f"Error in GetPartnerComplaintDetailView: {str(e)}",
+                exc_info=True,
+            )
+            return Response(
+                {"message": "An unexpected error occurred."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 class GiveUpdateOnComplaintsView(APIView):
@@ -2323,7 +2720,10 @@ class CloseBookingView(APIView):
             },
         ),
         responses={
-            200: openapi.Response(description="Booking status successfully updated to 'COMPLETED'", schema=DetailBookingSerializer),
+            200: openapi.Response(
+                description="Booking status successfully updated to 'COMPLETED'",
+                schema=PartnerBookingMutationPatchSerializer,
+            ),
             400: openapi.Response(description="Bad Request - Missing or invalid fields"),
             401: 'Unauthorized: Partner permissions required',
             404: openapi.Response(description="Not Found - Partner or booking detail not found"),
@@ -2370,10 +2770,11 @@ class CloseBookingView(APIView):
             booking_detail.booking_status = BOOKING_STATUS_COMPLETED
             booking_detail.save(update_fields=["booking_status"])
 
-            # Serialize updated booking details
             sync_booking_state(booking_detail, save=True)
-            serialized_booking = DetailBookingSerializer(booking_detail, context={"request": request, "hide_payment_detail": True})
-            return Response(serialized_booking.data, status=status.HTTP_200_OK)
+            return Response(
+                _build_partner_booking_mutation_patch_response(request, booking_detail),
+                status=status.HTTP_200_OK,
+            )
 
         except Exception as e:
             # Log the error and return an internal server error response
@@ -2489,7 +2890,10 @@ class ReportBookingView(APIView):
             except ValueError as exc:
                 return Response({"message": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-            return Response(_build_partner_booking_response(request, booking), status=status.HTTP_200_OK)
+            return Response(
+                _build_partner_booking_mutation_patch_response(request, booking),
+                status=status.HTTP_200_OK,
+            )
 
         except Exception as e:
             # Log the error and return an internal server error response

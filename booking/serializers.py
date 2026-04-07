@@ -257,6 +257,8 @@ def should_hide_payment_detail(serializer):
 
 
 class BookingWorkflowFieldsMixin(serializers.Serializer):
+    skip_workflow_state_sync = False
+
     initial_payment_status = serializers.SerializerMethodField()
     issue_status = serializers.CharField(read_only=True)
     minimum_payment_status = serializers.SerializerMethodField()
@@ -276,76 +278,85 @@ class BookingWorkflowFieldsMixin(serializers.Serializer):
     remaining_amount_due = serializers.SerializerMethodField()
     workflow_bucket = serializers.SerializerMethodField()
 
+    def _resolve_workflow_state(self, instance):
+        if self.skip_workflow_state_sync or bool(
+            getattr(self, "context", {}).get("skip_workflow_state_sync")
+        ):
+            setattr(instance, "_workflow_read_resolved", True)
+            return instance
+
+        return _resolve_workflow_read_state(instance)
+
     def to_representation(self, instance):
-        _resolve_workflow_read_state(instance)
+        self._resolve_workflow_state(instance)
         return super().to_representation(instance)
 
     def get_minimum_payment_status(self, obj):
-        _resolve_workflow_read_state(obj)
+        self._resolve_workflow_state(obj)
         return get_payment_stage_status(obj, "Minimum")
 
     def get_full_payment_status(self, obj):
-        _resolve_workflow_read_state(obj)
+        self._resolve_workflow_state(obj)
         return get_payment_stage_status(obj, "Full")
 
     def get_initial_payment_status(self, obj):
-        _resolve_workflow_read_state(obj)
+        self._resolve_workflow_state(obj)
         return get_initial_payment_status(obj)
 
     def get_client_workflow_stage(self, obj):
-        _resolve_workflow_read_state(obj)
+        self._resolve_workflow_state(obj)
         return resolve_client_workflow_stage(obj)
 
     def get_client_workflow_step(self, obj):
-        _resolve_workflow_read_state(obj)
+        self._resolve_workflow_state(obj)
         return resolve_client_workflow_step(obj)
 
     def get_operator_visible(self, obj):
-        _resolve_workflow_read_state(obj)
+        self._resolve_workflow_state(obj)
         return booking_has_operator_visibility(obj)
 
     def get_operator_can_act(self, obj):
-        _resolve_workflow_read_state(obj)
+        self._resolve_workflow_state(obj)
         return booking_allows_operator_action(obj)
 
     def get_can_take_decision(self, obj):
-        _resolve_workflow_read_state(obj)
+        self._resolve_workflow_state(obj)
         return booking_can_take_decision(obj)
 
     def get_can_edit_fulfillment(self, obj):
-        _resolve_workflow_read_state(obj)
+        self._resolve_workflow_state(obj)
         return booking_can_edit_fulfillment(obj)
 
     def get_can_manage_traveler_issues(self, obj):
-        _resolve_workflow_read_state(obj)
+        self._resolve_workflow_state(obj)
         return booking_can_manage_traveler_issues(obj)
 
     def get_can_complete_booking(self, obj):
-        _resolve_workflow_read_state(obj)
+        self._resolve_workflow_state(obj)
         return booking_can_complete(obj)
 
     def get_client_can_edit_travellers(self, obj):
-        _resolve_workflow_read_state(obj)
+        self._resolve_workflow_state(obj)
         return booking_allows_client_traveller_updates(obj)
 
     def get_client_can_submit_initial_payment(self, obj):
-        _resolve_workflow_read_state(obj)
+        self._resolve_workflow_state(obj)
         return booking_allows_minimum_payment_submission(obj)
 
     def get_client_can_submit_minimum_payment(self, obj):
-        _resolve_workflow_read_state(obj)
+        self._resolve_workflow_state(obj)
         return booking_allows_minimum_payment_submission(obj)
 
     def get_client_can_submit_full_payment(self, obj):
-        _resolve_workflow_read_state(obj)
+        self._resolve_workflow_state(obj)
         return booking_allows_full_payment_submission(obj)
 
     def get_remaining_amount_due(self, obj):
-        _resolve_workflow_read_state(obj)
+        self._resolve_workflow_state(obj)
         return get_remaining_amount_due(obj)
 
     def get_workflow_bucket(self, obj):
-        _resolve_workflow_read_state(obj)
+        self._resolve_workflow_state(obj)
         return resolve_operator_workflow_bucket(obj)
 
 
@@ -520,7 +531,49 @@ class BookingMutationSerializer(CurrentUserBookingListSerializer):
         return "mutation_summary"
 
 
+class PartnerBookingMutationPatchSerializer(BookingWorkflowFieldsMixin, serializers.ModelSerializer):
+    booking_objections = serializers.SerializerMethodField()
+    traveler_issues = serializers.SerializerMethodField()
+    response_mode = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Booking
+        fields = (
+            "booking_number",
+            "booking_status",
+            "issue_status",
+            "partner_remarks",
+            "initial_payment_status",
+            "minimum_payment_status",
+            "full_payment_status",
+            "client_workflow_stage",
+            "client_workflow_step",
+            "operator_visible",
+            "operator_can_act",
+            "can_take_decision",
+            "can_edit_fulfillment",
+            "can_manage_traveler_issues",
+            "can_complete_booking",
+            "remaining_amount_due",
+            "workflow_bucket",
+            "booking_objections",
+            "traveler_issues",
+            "response_mode",
+        )
+
+    def get_booking_objections(self, obj):
+        return get_booking_objections(obj)
+
+    def get_traveler_issues(self, obj):
+        return get_traveler_issues(obj)
+
+    def get_response_mode(self, _obj):
+        return "mutation_patch"
+
+
 class PartnerBookingListSerializer(BookingWorkflowFieldsMixin, serializers.ModelSerializer):
+    skip_workflow_state_sync = True
+
     user_session_token = serializers.CharField(source="order_by.session_token", read_only=True)
     user_fullName = serializers.CharField(source="order_by.name", read_only=True)
     user_fullname = serializers.CharField(source="order_by.name", read_only=True)

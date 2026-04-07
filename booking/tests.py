@@ -1,3 +1,5 @@
+import json
+import os
 from datetime import datetime, timedelta
 from unittest.mock import patch
 from uuid import uuid4
@@ -7,6 +9,7 @@ from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection
+from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework import status
@@ -14,10 +17,21 @@ from rest_framework.test import APIRequestFactory, APITransactionTestCase, force
 
 from common.models import MailingDetail, UserProfile
 from management.approval_task import FetchPaidBookingView
-from partners.models import BusinessProfile, HuzAirlineDetail, HuzBasicDetail, HuzHotelDetail, HuzPackageDateRange, HuzTransportDetail, PartnerProfile, Wallet
+from partners.models import (
+    BusinessProfile,
+    HuzAirlineDetail,
+    HuzBasicDetail,
+    HuzHotelDetail,
+    HuzPackageDateRange,
+    HuzTransportDetail,
+    PartnerProfile,
+    PartnerTransactionHistory,
+    Wallet,
+)
 
 from .manage_partner_booking import (
     GetOverallPartnerComplaintsView,
+    GetOperatorDashboardSummaryView,
     GetRatingPackageWiseView,
     GetPackageOverallRatingView,
     GetOverallRatingView,
@@ -26,6 +40,7 @@ from .manage_partner_booking import (
     CloseBookingView,
     DeleteBookingDocumentsView,
     GetBookingDetailByBookingNumberForPartnerView,
+    GetPartnerComplaintDetailView,
     GetPartnerComplaintsView,
     GetPartnersOverallBookingStatisticsView,
     GetBookingShortDetailForPartnersView,
@@ -59,6 +74,7 @@ from .serializers import (
     BookingRequestSerializer,
     DetailBookingSerializer,
     PartnerRatingSerializer,
+    PartnerBookingListSerializer,
 )
 from .services import (
     get_booking_by_identifier_for_user,
@@ -2600,6 +2616,45 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
             package_token=package,
         )
 
+    def _collect_booking_list_profile(self, *, booking_count=4, page_size=20):
+        prefix = f"BK-LIST-PROFILE-{uuid4().hex[:6]}-"
+        for index in range(booking_count):
+            self._create_booking(
+                partner=self.partner_a,
+                package=self.package_a,
+                booking_number=f"{prefix}{index + 1:03d}",
+                booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+            )
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get(
+                "/api/v1/operator/bookings/",
+                {
+                    "workflow_bucket": "FULFILLMENT",
+                    "booking_number": prefix,
+                    "page": 1,
+                    "page_size": page_size,
+                },
+                HTTP_AUTHORIZATION=f"Bearer {self.partner_a.partner_session_token}",
+            )
+
+        payload_size_bytes = len(json.dumps(response.data, default=str).encode("utf-8"))
+        profile = {
+            "status_code": response.status_code,
+            "count": response.data.get("count"),
+            "query_count": len(queries),
+            "payload_size_bytes": payload_size_bytes,
+            "booking_prefix": prefix,
+        }
+
+        if os.getenv("BOOKING_LIST_QUERY_PROFILE_OUTPUT") == "1":
+            print(
+                "BOOKING_LIST_QUERY_PROFILE",
+                json.dumps(profile, sort_keys=True),
+            )
+
+        return profile
+
     def _authenticated_request(self, request):
         force_authenticate(request, user=self.admin_user)
         return request
@@ -2751,6 +2806,78 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
             complaint_for_partner=partner,
             complaint_for_package=package,
             complaint_for_booking=booking,
+        )
+
+    def _seed_dashboard_summary_data(self):
+        ready_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-DASH-READY-001",
+            booking_status=BOOKING_STATUS_HOLD,
+        )
+        self._mark_ready_for_operator(ready_booking)
+
+        in_fulfillment_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-DASH-FULFILL-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(in_fulfillment_booking)
+
+        ready_for_travel_booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-DASH-INCOME-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_ready_for_travel(ready_for_travel_booking)
+
+        self._create_complaint(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking=ready_booking,
+            status_value="Open",
+            ticket="CMP-DASH-OPEN-001",
+        )
+
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=4.8,
+            partner_comment="Dashboard parity review",
+            rating_for_partner=self.partner_a,
+            rating_for_package=self.package_a,
+            rating_for_booking=ready_booking,
+            rating_by_user=self.customer,
+        )
+
+        wallet = Wallet.objects.create(
+            wallet_code=f"wallet-dash-{uuid4().hex[:10]}",
+            wallet_amount=2500,
+            wallet_session=self.partner_a,
+        )
+        PartnerTransactionHistory.objects.create(
+            transaction_code=f"dash-credit-{uuid4().hex[:8]}",
+            transaction_amount=250.0,
+            transaction_type="Credit",
+            transaction_for_partner=self.partner_a,
+            transaction_wallet_token=wallet,
+        )
+        PartnerTransactionHistory.objects.create(
+            transaction_code=f"dash-debit-{uuid4().hex[:8]}",
+            transaction_amount=80.0,
+            transaction_type="Debit",
+            transaction_for_partner=self.partner_a,
+            transaction_wallet_token=wallet,
+        )
+
+        PartnersBookingPayment.objects.create(
+            receivable_amount=1000.0,
+            pending_amount=100.0,
+            processed_amount=0.0,
+            payment_status="NotPaid",
+            payment_for_partner=self.partner_a,
+            payment_for_package=self.package_a,
+            payment_for_booking=ready_booking,
         )
 
     def test_booking_list_returns_paginated_empty_payload(self):
@@ -3020,6 +3147,115 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         self.assertEqual(
             response.data.get("results")[0].get("booking_number"),
             booking.booking_number,
+        )
+
+    def test_booking_list_payload_keeps_list_contract_and_excludes_detail_only_fields(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-LIST-CONTRACT-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        self._mark_in_fulfillment(booking)
+
+        response = self.client.get(
+            "/api/v1/operator/bookings/",
+            {
+                "workflow_bucket": "FULFILLMENT",
+                "page": 1,
+                "page_size": 10,
+            },
+            HTTP_AUTHORIZATION=f"Bearer {self.partner_a.partner_session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 1)
+        payload = response.data.get("results")[0]
+
+        required_fields = {
+            "booking_number",
+            "adults",
+            "child",
+            "infants",
+            "start_date",
+            "end_date",
+            "total_price",
+            "booking_status",
+            "issue_status",
+            "initial_payment_status",
+            "minimum_payment_status",
+            "full_payment_status",
+            "remaining_amount_due",
+            "workflow_bucket",
+            "user_fullName",
+            "user_fullname",
+            "user_email",
+            "user_country_code",
+            "user_phone_number",
+            "user_photo",
+            "package_name",
+            "package_type",
+            "package_cost",
+        }
+        self.assertTrue(required_fields.issubset(set(payload.keys())))
+
+        detail_only_fields = {
+            "partner_email",
+            "partner_name",
+            "partner_username",
+            "partner_address_detail",
+            "booking_documents_status",
+            "booking_documents",
+            "user_documents",
+            "booking_airline_details",
+            "booking_rating",
+            "booking_objections",
+            "package_defaults",
+            "booking_fulfillment",
+            "traveler_groups",
+            "traveler_issues",
+            "cost_for_sharing",
+            "cost_for_quad",
+            "cost_for_triple",
+            "cost_for_double",
+            "cost_for_single",
+            "sharing",
+            "quad",
+            "triple",
+            "double",
+            "single",
+            "special_request",
+            "partner_remarks",
+            "payment_detail",
+        }
+        self.assertTrue(detail_only_fields.isdisjoint(set(payload.keys())))
+
+    def test_booking_list_query_count_and_payload_size_are_bounded(self):
+        profile = self._collect_booking_list_profile(
+            booking_count=4,
+            page_size=20,
+        )
+
+        self.assertEqual(profile["status_code"], status.HTTP_200_OK)
+        self.assertEqual(profile["count"], 4)
+        self.assertLessEqual(profile["query_count"], 6)
+        self.assertLessEqual(profile["payload_size_bytes"], 450 * 1024)
+
+    def test_booking_list_query_count_does_not_scale_with_result_size(self):
+        small_profile = self._collect_booking_list_profile(
+            booking_count=1,
+            page_size=20,
+        )
+        larger_profile = self._collect_booking_list_profile(
+            booking_count=8,
+            page_size=20,
+        )
+
+        self.assertEqual(small_profile["status_code"], status.HTTP_200_OK)
+        self.assertEqual(larger_profile["status_code"], status.HTTP_200_OK)
+        self.assertLessEqual(
+            larger_profile["query_count"] - small_profile["query_count"],
+            1,
         )
 
     def test_staff_can_fetch_non_visible_partner_booking_detail(self):
@@ -3658,6 +3894,10 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data.get("response_mode"), "mutation_patch")
+        self.assertEqual(response.data.get("booking_status"), BOOKING_STATUS_IN_FULFILLMENT)
+        self.assertNotIn("booking_fulfillment", response.data)
+        self.assertNotIn("booking_documents", response.data)
         mocked_send_objection.assert_not_called()
         booking.refresh_from_db()
         self.assertEqual(booking.booking_status, BOOKING_STATUS_IN_FULFILLMENT)
@@ -3791,6 +4031,10 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("response_mode"), "mutation_patch")
+        self.assertEqual(response.data.get("booking_status"), BOOKING_STATUS_COMPLETED)
+        self.assertNotIn("booking_fulfillment", response.data)
+        self.assertNotIn("booking_documents", response.data)
         booking.refresh_from_db()
         self.assertEqual(booking.booking_status, BOOKING_STATUS_COMPLETED)
 
@@ -3934,6 +4178,65 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
         first_result = response.data.get("results")[0]
         self.assertEqual(first_result.get("complaint_id"), str(matched_complaint.complaint_id))
         self.assertEqual(first_result.get("complaint_status"), "Open")
+
+    def test_complaint_detail_returns_single_scoped_payload(self):
+        booking = self._create_booking(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking_number="BK-CMP-DETAIL-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        complaint = self._create_complaint(
+            partner=self.partner_a,
+            package=self.package_a,
+            booking=booking,
+            status_value="Open",
+            ticket="CMP-DETAIL-001",
+            title="Complaint detail ticket",
+        )
+
+        request = self._authenticated_request(
+            self.factory.get(
+                "/api/v1/operator/bookings/complaints/detail/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "complaint_id": str(complaint.complaint_id),
+                },
+            )
+        )
+
+        response = GetPartnerComplaintDetailView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("complaint_id"), str(complaint.complaint_id))
+        self.assertEqual(response.data.get("complaint_status"), "Open")
+
+    def test_complaint_detail_is_scoped_to_partner(self):
+        booking = self._create_booking(
+            partner=self.partner_b,
+            package=self.package_b,
+            booking_number="BK-CMP-DETAIL-SCOPE-001",
+            booking_status=BOOKING_STATUS_IN_FULFILLMENT,
+        )
+        complaint = self._create_complaint(
+            partner=self.partner_b,
+            package=self.package_b,
+            booking=booking,
+            status_value="Open",
+            ticket="CMP-DETAIL-SCOPE-001",
+        )
+
+        request = self._authenticated_request(
+            self.factory.get(
+                "/api/v1/operator/bookings/complaints/detail/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                    "complaint_id": str(complaint.complaint_id),
+                },
+            )
+        )
+
+        response = GetPartnerComplaintDetailView.as_view()(request)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_complaint_status_update_rejects_invalid_transition(self):
         booking = self._create_booking(
@@ -4483,7 +4786,10 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         response = ReportBookingView.as_view()(request)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("response_mode"), "mutation_patch")
         self.assertEqual(response.data.get("issue_status"), ISSUE_STATUS_REPORTED)
+        self.assertNotIn("booking_fulfillment", response.data)
+        self.assertNotIn("booking_documents", response.data)
         self.assertTrue(
             any(
                 str(issue.get("traveler_id")) == str(passport.passport_id)
@@ -4695,6 +5001,152 @@ class ManagePartnerBookingViewsTests(APITransactionTestCase):
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertLessEqual(len(queries), 2)
+
+    def test_dashboard_summary_aggregates_existing_dashboard_endpoint_sections(self):
+        self._seed_dashboard_summary_data()
+        year = timezone.now().year
+        auth_headers = self._partner_auth_headers(self.partner_a)
+
+        summary_response = self.client.get(
+            "/api/v1/operator/dashboard/summary/",
+            {
+                "year": year,
+                "recent_bookings_limit": 5,
+                "receivables_limit": 50,
+            },
+            **auth_headers,
+        )
+        booking_stats_response = self.client.get(
+            "/api/v1/operator/bookings/statistics/",
+            **auth_headers,
+        )
+        recent_bookings_response = self.client.get(
+            "/api/v1/operator/bookings/",
+            {
+                "workflow_bucket": "READY",
+                "page": 1,
+                "page_size": 5,
+            },
+            **auth_headers,
+        )
+        package_stats_response = self.client.get(
+            "/api/v1/operator/me/packages/statistics/",
+            **auth_headers,
+        )
+        complaints_summary_response = self.client.get(
+            "/api/v1/operator/bookings/complaints/summary/",
+            **auth_headers,
+        )
+        ratings_summary_response = self.client.get(
+            "/api/v1/operator/bookings/ratings/summary/",
+            **auth_headers,
+        )
+        wallet_summary_response = self.client.get(
+            "/api/v1/operator/me/wallet/summary/",
+            **auth_headers,
+        )
+        receivables_response = self.client.get(
+            "/api/v1/operator/bookings/payments/",
+            {"page": 1, "page_size": 50},
+            **auth_headers,
+        )
+        yearly_income_response = self.client.get(
+            "/api/v1/operator/bookings/earnings/yearly/",
+            {"year": year},
+            **auth_headers,
+        )
+
+        self.assertEqual(summary_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(booking_stats_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(recent_bookings_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(package_stats_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(complaints_summary_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(ratings_summary_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(wallet_summary_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(receivables_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(yearly_income_response.status_code, status.HTTP_200_OK)
+
+        summary_payload = summary_response.data
+        self.assertEqual(
+            summary_payload["bookings"]["summary"],
+            booking_stats_response.data,
+        )
+        self.assertEqual(
+            summary_payload["packages"]["summary"],
+            package_stats_response.data,
+        )
+        self.assertEqual(
+            summary_payload["complaints"]["summary"],
+            complaints_summary_response.data,
+        )
+        self.assertEqual(
+            summary_payload["ratings"],
+            ratings_summary_response.data,
+        )
+        self.assertEqual(
+            summary_payload["wallet"]["summary"],
+            wallet_summary_response.data,
+        )
+        self.assertEqual(
+            summary_payload["income"]["amount"],
+            yearly_income_response.data,
+        )
+
+        legacy_recent_numbers = [
+            item.get("booking_number")
+            for item in recent_bookings_response.data.get("results", [])
+        ]
+        summary_recent_numbers = [
+            item.get("booking_number")
+            for item in summary_payload["bookings"]["recent"]["results"]
+        ]
+        self.assertEqual(summary_recent_numbers, legacy_recent_numbers)
+
+        legacy_receivable_numbers = [
+            item.get("booking_number")
+            for item in receivables_response.data.get("results", [])
+        ]
+        summary_receivable_numbers = [
+            item.get("booking_number")
+            for item in summary_payload["wallet"]["receivables"]["results"]
+        ]
+        self.assertEqual(summary_receivable_numbers, legacy_receivable_numbers)
+
+    def test_dashboard_summary_rejects_invalid_recent_booking_limit(self):
+        response = self.client.get(
+            "/api/v1/operator/dashboard/summary/",
+            {"recent_bookings_limit": "0"},
+            **self._partner_auth_headers(self.partner_a),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("recent_bookings_limit", response.data.get("message", ""))
+
+    @override_settings(ENABLE_OPERATOR_DASHBOARD_SUMMARY_ENDPOINT=False)
+    def test_dashboard_summary_can_be_disabled_with_feature_flag(self):
+        response = self.client.get(
+            "/api/v1/operator/dashboard/summary/",
+            **self._partner_auth_headers(self.partner_a),
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertIn("disabled", response.data.get("message", "").lower())
+
+    def test_dashboard_summary_supports_admin_partner_token_flow(self):
+        self._seed_dashboard_summary_data()
+        request = self._authenticated_request(
+            self.factory.get(
+                "/api/v1/admin/operators/dashboard/summary/",
+                {
+                    "partner_session_token": self.partner_a.partner_session_token,
+                },
+            )
+        )
+        response = GetOperatorDashboardSummaryView.as_view()(request)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("bookings", response.data)
+        self.assertIn("wallet", response.data)
 
     def test_receivable_payment_statistics_returns_paginated_empty_payload(self):
         request = self._authenticated_request(
@@ -5397,6 +5849,69 @@ class BookingSerializerQueryTests(APITransactionTestCase):
 
         self.assertEqual(len(queries), 0)
         self.assertEqual(data.get("company_detail", {}).get("company_name"), "Serializer Travel")
+
+    def test_partner_booking_list_serializer_field_boundary_matches_detail_contract(self):
+        list_fields = set(PartnerBookingListSerializer.Meta.fields)
+        detail_fields = set(DetailBookingSerializer.Meta.fields)
+
+        compatibility_fields = {
+            "booking_number",
+            "adults",
+            "child",
+            "infants",
+            "start_date",
+            "end_date",
+            "total_price",
+            "booking_status",
+            "issue_status",
+            "initial_payment_status",
+            "minimum_payment_status",
+            "full_payment_status",
+            "remaining_amount_due",
+            "workflow_bucket",
+            "user_fullName",
+            "user_fullname",
+            "user_email",
+            "user_country_code",
+            "user_phone_number",
+            "user_photo",
+            "package_name",
+            "package_type",
+            "package_cost",
+        }
+        self.assertTrue(compatibility_fields.issubset(list_fields))
+
+        detail_only_fields = {
+            "partner_email",
+            "partner_name",
+            "partner_username",
+            "partner_address_detail",
+            "booking_documents_status",
+            "booking_documents",
+            "user_documents",
+            "booking_airline_details",
+            "booking_rating",
+            "booking_objections",
+            "package_defaults",
+            "booking_fulfillment",
+            "traveler_groups",
+            "traveler_issues",
+            "cost_for_sharing",
+            "cost_for_quad",
+            "cost_for_triple",
+            "cost_for_double",
+            "cost_for_single",
+            "sharing",
+            "quad",
+            "triple",
+            "double",
+            "single",
+            "special_request",
+            "partner_remarks",
+            "payment_detail",
+        }
+        self.assertTrue(detail_only_fields.issubset(detail_fields))
+        self.assertTrue(detail_only_fields.isdisjoint(list_fields))
 
     def test_detail_serializer_exposes_backend_action_flags_for_issue_state(self):
         self._create_fulfillment_artifacts(self.booking)

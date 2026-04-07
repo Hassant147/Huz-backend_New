@@ -67,6 +67,13 @@ SECRET_KEY_FALLBACKS = [
 DEBUG = False
 # DEBUG = True
 ENABLE_API_DOCS = config('ENABLE_API_DOCS', cast=bool, default=False)
+ENABLE_PERF_METRICS = config('ENABLE_PERF_METRICS', cast=bool, default=False)
+PERF_METRICS_REQUEST_HEADER = config('PERF_METRICS_REQUEST_HEADER', default='X-Perf-Metrics').strip() or 'X-Perf-Metrics'
+ENABLE_OPERATOR_DASHBOARD_SUMMARY_ENDPOINT = config(
+    'ENABLE_OPERATOR_DASHBOARD_SUMMARY_ENDPOINT',
+    cast=bool,
+    default=True,
+)
 IS_RUNSERVER = len(sys.argv) > 1 and sys.argv[1].startswith("runserver")
 APP_ENV = config("APP_ENV", default="development").strip().lower()
 IS_PRODUCTION = APP_ENV == "production"
@@ -144,6 +151,7 @@ MIDDLEWARE = [
     'django.contrib.sessions.middleware.SessionMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
+    'common.middleware.RequestPerformanceMetricsMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',

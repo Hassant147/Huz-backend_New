@@ -1,4 +1,5 @@
 from datetime import timedelta
+import time
 from unittest.mock import patch
 
 from django.apps import apps
@@ -39,6 +40,7 @@ from .partner_accounts_and_transactions import (
 )
 from .package_management_operator import (
     CreateHuzPackageView,
+    MASTER_HOTEL_PACKAGE_TOKEN,
     GetPartnersOverallPackagesStatisticsView,
     GetHuzPackageDetailByTokenView,
     GetHuzShortPackageByTokenView,
@@ -263,6 +265,44 @@ class PartnerProfileSignupTests(APITransactionTestCase):
         )
         mocked_sms.assert_called_once_with("+923001234567", "123456")
 
+    @patch("partners.partner_profile.send_partner_verification_sms", return_value=True)
+    @patch("partners.partner_profile.send_verification_email")
+    def test_dispatch_partner_verification_email_is_non_blocking_when_wait_for_result_is_false(
+        self,
+        mocked_email,
+        mocked_sms,
+    ):
+        def delayed_email_send(*_args, **_kwargs):
+            time.sleep(0.5)
+            return True
+
+        mocked_email.side_effect = delayed_email_send
+
+        start_time = time.perf_counter()
+        is_sent = dispatch_partner_verification_email(
+            "operator-signup@example.com",
+            "Operator Signup",
+            "123456",
+            "+923001234567",
+            wait_for_result=False,
+        )
+        elapsed_seconds = time.perf_counter() - start_time
+
+        self.assertTrue(is_sent)
+        self.assertLess(elapsed_seconds, 0.3)
+
+        deadline = time.time() + 1.0
+        while mocked_email.call_count == 0 and time.time() < deadline:
+            time.sleep(0.01)
+
+        mocked_email.assert_called_once_with(
+            "operator-signup@example.com",
+            "Operator Signup",
+            "123456",
+            wait_for_result=True,
+        )
+        mocked_sms.assert_not_called()
+
     @patch("partners.partner_profile.dispatch_partner_verification_email", return_value=True)
     @patch("partners.partner_profile.random_six_digits", return_value="654321")
     def test_resend_otp_returns_success_and_queues_background_delivery(
@@ -300,6 +340,60 @@ class PartnerProfileSignupTests(APITransactionTestCase):
             "+923001234568",
             wait_for_result=False,
         )
+
+    @patch("partners.partner_profile.send_partner_verification_sms", return_value=True)
+    @patch("partners.partner_profile.send_verification_email")
+    @patch("partners.partner_profile.random_six_digits", return_value="654321")
+    def test_resend_otp_response_is_non_blocking_when_provider_is_slow(
+        self,
+        mocked_otp,
+        mocked_send_email,
+        mocked_sms,
+    ):
+        def delayed_email_send(*_args, **_kwargs):
+            time.sleep(0.5)
+            return True
+
+        mocked_send_email.side_effect = delayed_email_send
+
+        partner = PartnerProfile.objects.create(
+            partner_session_token="partner-slow-provider-session-token",
+            email="operator-slow-provider@example.com",
+            name="Operator Slow Provider",
+            country_code="+92",
+            phone_number="3001234570",
+            partner_type="NA",
+            sign_type="Email",
+        )
+
+        start_time = time.perf_counter()
+        response = self.client.put(
+            "/api/v1/operator/auth/otp/resend/",
+            {},
+            format="json",
+            HTTP_AUTHORIZATION=f"Bearer {partner.partner_session_token}",
+        )
+        elapsed_seconds = time.perf_counter() - start_time
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["message"], "OTP sent successfully.")
+        self.assertLess(elapsed_seconds, 0.3)
+
+        partner.refresh_from_db()
+        self.assertEqual(partner.otp, "654321")
+        mocked_otp.assert_called_once()
+
+        deadline = time.time() + 1.0
+        while mocked_send_email.call_count == 0 and time.time() < deadline:
+            time.sleep(0.01)
+
+        mocked_send_email.assert_called_once_with(
+            partner.email,
+            partner.name,
+            "654321",
+            wait_for_result=True,
+        )
+        mocked_sms.assert_not_called()
 
     def test_prefetched_partner_profile_snapshot_serializes_without_additional_queries(self):
         partner = PartnerProfile.objects.create(
@@ -578,6 +672,48 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
         headers = self._auth_headers(partner) if authenticated else {}
         return self.client.get("/api/v1/operator/me/packages/", query_params, **headers)
 
+    def _request_master_hotels(self, *, authenticated=True, partner=None, **query_params):
+        headers = self._auth_headers(partner) if authenticated else {}
+        return self.client.get("/api/v1/operator/me/hotels/", query_params, **headers)
+
+    def _create_master_hotel_catalog_package(self):
+        start_date = timezone.now() + timedelta(days=20)
+        return HuzBasicDetail.objects.create(
+            huz_token=MASTER_HOTEL_PACKAGE_TOKEN,
+            package_type="Umrah",
+            package_name="System Master Hotel Catalog",
+            start_date=start_date,
+            end_date=start_date + timedelta(days=30),
+            description="System package used for hotel catalog records.",
+            package_status="Active",
+            package_provider=self.partner,
+        )
+
+    def _create_package(
+        self,
+        *,
+        token,
+        start_offset_days,
+        end_offset_days,
+        package_status="Active",
+        package_validity=None,
+        package_type="Hajj",
+        partner=None,
+        package_name="Generated Package",
+        description="Generated package for tests.",
+    ):
+        return HuzBasicDetail.objects.create(
+            huz_token=token,
+            package_type=package_type,
+            package_name=package_name,
+            start_date=timezone.now() + timedelta(days=start_offset_days),
+            end_date=timezone.now() + timedelta(days=end_offset_days),
+            description=description,
+            package_status=package_status,
+            package_validity=package_validity,
+            package_provider=partner or self.partner,
+        )
+
     def test_get_package_detail_returns_single_item_list(self):
         response = self.client.get(
             "/api/v1/operator/me/packages/detail/",
@@ -622,6 +758,102 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
         self.assertNotIn("hotel_images", hotel_payload)
         self.assertNotIn("hotel_detail", hotel_payload)
         self.assertNotIn("huz_hotel_id", hotel_payload)
+
+    def test_master_hotel_catalog_endpoint_uses_pagination_defaults(self):
+        catalog_package = self._create_master_hotel_catalog_package()
+        for index in range(30):
+            HuzHotelDetail.objects.create(
+                hotel_city="Makkah",
+                hotel_name=f"Master Hotel {index + 1:02d}",
+                hotel_rating="5 Star",
+                room_sharing_type="Quad",
+                hotel_distance="1",
+                distance_type="KM",
+                hotel_for_package=catalog_package,
+            )
+
+        response = self._request_master_hotels(city="Makkah")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 30)
+        self.assertEqual(len(response.data.get("results") or []), 25)
+        self.assertTrue(response.data.get("next"))
+        self.assertIsNone(response.data.get("previous"))
+
+    def test_master_hotel_catalog_endpoint_caps_page_size_at_100(self):
+        catalog_package = self._create_master_hotel_catalog_package()
+        for index in range(130):
+            HuzHotelDetail.objects.create(
+                hotel_city="Madinah",
+                hotel_name=f"Master Madinah Hotel {index + 1:03d}",
+                hotel_rating="4 Star",
+                room_sharing_type="Quad",
+                hotel_distance="2",
+                distance_type="KM",
+                hotel_for_package=catalog_package,
+            )
+
+        response = self._request_master_hotels(city="Madinah", page=1, page_size=500)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 130)
+        self.assertEqual(len(response.data.get("results") or []), 100)
+
+    def test_master_hotel_catalog_endpoint_db_dedupes_when_catalog_package_missing(self):
+        HuzHotelDetail.objects.create(
+            hotel_city="Makkah",
+            hotel_name="Deduped Hotel",
+            hotel_rating="5 Star",
+            room_sharing_type="Quad",
+            hotel_distance="1",
+            distance_type="KM",
+            hotel_for_package=self.package,
+        )
+        HuzHotelDetail.objects.create(
+            hotel_city="Makkah",
+            hotel_name="Deduped Hotel",
+            hotel_rating="5 Star",
+            room_sharing_type="Double",
+            hotel_distance="2",
+            distance_type="KM",
+            hotel_for_package=self.completed_package,
+        )
+        HuzHotelDetail.objects.create(
+            hotel_city="Makkah",
+            hotel_name="Unique Hotel",
+            hotel_rating="4 Star",
+            room_sharing_type="Quad",
+            hotel_distance="3",
+            distance_type="KM",
+            hotel_for_package=self.package,
+        )
+
+        response = self._request_master_hotels(city="Makkah", page_size=100)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 2)
+        hotel_names = [item.get("hotel_name") for item in (response.data.get("results") or [])]
+        self.assertEqual(hotel_names.count("Deduped Hotel"), 1)
+        self.assertIn("Unique Hotel", hotel_names)
+
+    def test_master_hotel_catalog_endpoint_query_count_is_bounded(self):
+        catalog_package = self._create_master_hotel_catalog_package()
+        for index in range(25):
+            HuzHotelDetail.objects.create(
+                hotel_city="Taif",
+                hotel_name=f"Master Taif Hotel {index + 1:02d}",
+                hotel_rating="3 Star",
+                room_sharing_type="Quad",
+                hotel_distance="4",
+                distance_type="KM",
+                hotel_for_package=catalog_package,
+            )
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self._request_master_hotels(city="Taif", page=1, page_size=25)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertLessEqual(len(queries), 8)
 
     def test_operator_create_package_accepts_package_date_range_without_summary_dates(self):
         range_start = timezone.now() + timedelta(days=14)
@@ -713,6 +945,154 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].get("huz_token"), self.completed_package.huz_token)
 
+    def test_get_short_packages_expired_status_filters_only_fully_expired_packages(self):
+        single_window_expired = self._create_package(
+            token="package-huz-token-expired-single-window",
+            start_offset_days=9,
+            end_offset_days=16,
+            package_validity=timezone.now() - timedelta(days=1),
+            package_name="Single Window Expired",
+        )
+        ranged_expired = self._create_package(
+            token="package-huz-token-expired-ranged",
+            start_offset_days=24,
+            end_offset_days=31,
+            package_validity=timezone.now() + timedelta(days=10),
+            package_name="Ranged Fully Expired",
+        )
+        HuzPackageDateRange.objects.create(
+            start_date=timezone.now() + timedelta(days=20),
+            end_date=timezone.now() + timedelta(days=26),
+            group_capacity=10,
+            package_validity=timezone.now() - timedelta(days=3),
+            date_range_for_package=ranged_expired,
+        )
+        HuzPackageDateRange.objects.create(
+            start_date=timezone.now() + timedelta(days=27),
+            end_date=timezone.now() + timedelta(days=33),
+            group_capacity=8,
+            package_validity=timezone.now() - timedelta(days=1),
+            date_range_for_package=ranged_expired,
+        )
+
+        ranged_mixed = self._create_package(
+            token="package-huz-token-expired-mixed",
+            start_offset_days=25,
+            end_offset_days=34,
+            package_name="Ranged Mixed",
+        )
+        HuzPackageDateRange.objects.create(
+            start_date=timezone.now() + timedelta(days=18),
+            end_date=timezone.now() + timedelta(days=24),
+            group_capacity=12,
+            package_validity=timezone.now() - timedelta(days=2),
+            date_range_for_package=ranged_mixed,
+        )
+        HuzPackageDateRange.objects.create(
+            start_date=timezone.now() + timedelta(days=30),
+            end_date=timezone.now() + timedelta(days=36),
+            group_capacity=12,
+            package_validity=timezone.now() + timedelta(days=5),
+            date_range_for_package=ranged_mixed,
+        )
+
+        response = self._request_short_packages(
+            partner_session_token=self.partner.partner_session_token,
+            package_type="Hajj",
+            package_status="Expired",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        returned_tokens = {item.get("huz_token") for item in response.data.get("results") or []}
+
+        self.assertIn(single_window_expired.huz_token, returned_tokens)
+        self.assertIn(ranged_expired.huz_token, returned_tokens)
+        self.assertNotIn(ranged_mixed.huz_token, returned_tokens)
+        self.assertNotIn(self.package.huz_token, returned_tokens)
+        self.assertNotIn(self.completed_package.huz_token, returned_tokens)
+
+    def test_get_short_packages_expired_status_uses_start_date_fallback_when_validity_missing(self):
+        fallback_expired_package = self._create_package(
+            token="package-huz-token-expired-fallback-1",
+            start_offset_days=1,
+            end_offset_days=8,
+            package_validity=None,
+            package_name="Fallback Expired",
+        )
+        fallback_active_package = self._create_package(
+            token="package-huz-token-expired-fallback-2",
+            start_offset_days=4,
+            end_offset_days=11,
+            package_validity=None,
+            package_name="Fallback Active",
+        )
+
+        response = self._request_short_packages(
+            partner_session_token=self.partner.partner_session_token,
+            package_type="Hajj",
+            package_status="Expired",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        returned_tokens = {item.get("huz_token") for item in response.data.get("results") or []}
+
+        self.assertIn(fallback_expired_package.huz_token, returned_tokens)
+        self.assertNotIn(fallback_active_package.huz_token, returned_tokens)
+
+    def test_get_short_packages_expired_status_preserves_pagination_shape(self):
+        expired_tokens = []
+        for index in range(3):
+            created_package = self._create_package(
+                token=f"package-huz-token-expired-page-{index + 1}",
+                start_offset_days=5 + index,
+                end_offset_days=12 + index,
+                package_validity=timezone.now() - timedelta(days=index + 1),
+                package_name=f"Expired Page {index + 1}",
+            )
+            expired_tokens.append(created_package.huz_token)
+
+        first_page = self._request_short_packages(
+            partner_session_token=self.partner.partner_session_token,
+            package_type="Hajj",
+            package_status="Expired",
+            page=1,
+            page_size=1,
+        )
+        second_page = self._request_short_packages(
+            partner_session_token=self.partner.partner_session_token,
+            package_type="Hajj",
+            package_status="Expired",
+            page=2,
+            page_size=1,
+        )
+
+        self.assertEqual(first_page.status_code, status.HTTP_200_OK)
+        self.assertEqual(second_page.status_code, status.HTTP_200_OK)
+        self.assertEqual(first_page.data.get("count"), 3)
+        self.assertEqual(second_page.data.get("count"), 3)
+        self.assertEqual(len(first_page.data.get("results") or []), 1)
+        self.assertEqual(len(second_page.data.get("results") or []), 1)
+
+        first_page_token = first_page.data["results"][0].get("huz_token")
+        second_page_token = second_page.data["results"][0].get("huz_token")
+
+        self.assertIn(first_page_token, expired_tokens)
+        self.assertIn(second_page_token, expired_tokens)
+        self.assertNotEqual(first_page_token, second_page_token)
+
+    def test_get_short_packages_rejects_expired_status_with_other_statuses(self):
+        response = self._request_short_packages(
+            partner_session_token=self.partner.partner_session_token,
+            package_type="Hajj",
+            package_status="Expired,Active",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data.get("message"),
+            "Expired status cannot be combined with other package statuses.",
+        )
+
     def test_get_short_packages_preserves_paginated_shape_with_rating_summary(self):
         BookingRatingAndReview.objects.create(
             partner_total_stars=4,
@@ -737,6 +1117,95 @@ class PackageManagementOperatorViewTests(APITransactionTestCase):
         self.assertIsInstance(rating_payload, dict)
         self.assertEqual(rating_payload.get("rating_count"), 1)
         self.assertEqual(rating_payload.get("average_stars"), 4.0)
+
+    def test_get_short_packages_rating_summary_matches_db_aggregate_parity(self):
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=5,
+            partner_comment="Outstanding",
+            rating_for_partner=self.partner,
+            rating_for_package=self.package,
+        )
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=3,
+            partner_comment="Solid",
+            rating_for_partner=self.partner,
+            rating_for_package=self.package,
+        )
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=4,
+            partner_comment="Great",
+            rating_for_partner=self.partner,
+            rating_for_package=self.completed_package,
+        )
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=1,
+            partner_comment="Other partner rating",
+            rating_for_partner=self.other_partner,
+            rating_for_package=self.other_partner_package,
+        )
+
+        response = self._request_short_packages(
+            partner_session_token=self.partner.partner_session_token,
+            package_type="Hajj",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results_by_token = {
+            item.get("huz_token"): item for item in response.data.get("results") or []
+        }
+
+        package_rating = results_by_token[self.package.huz_token].get("rating_count")
+        completed_package_rating = results_by_token[self.completed_package.huz_token].get(
+            "rating_count"
+        )
+
+        self.assertEqual(package_rating.get("rating_count"), 2)
+        self.assertEqual(package_rating.get("total_stars"), 8.0)
+        self.assertEqual(package_rating.get("average_stars"), 4.0)
+
+        self.assertEqual(completed_package_rating.get("rating_count"), 1)
+        self.assertEqual(completed_package_rating.get("total_stars"), 4.0)
+        self.assertEqual(completed_package_rating.get("average_stars"), 4.0)
+        self.assertNotIn(self.other_partner_package.huz_token, results_by_token)
+
+    def test_get_short_packages_rating_aggregation_query_count_is_bounded(self):
+        self._create_package(
+            token="package-huz-token-rating-query-1",
+            start_offset_days=13,
+            end_offset_days=21,
+            package_status="Active",
+            package_name="Rating Query Package 1",
+        )
+        self._create_package(
+            token="package-huz-token-rating-query-2",
+            start_offset_days=15,
+            end_offset_days=23,
+            package_status="Active",
+            package_name="Rating Query Package 2",
+        )
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=5,
+            partner_comment="Excellent",
+            rating_for_partner=self.partner,
+            rating_for_package=self.package,
+        )
+        BookingRatingAndReview.objects.create(
+            partner_total_stars=4,
+            partner_comment="Very good",
+            rating_for_partner=self.partner,
+            rating_for_package=self.completed_package,
+        )
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self._request_short_packages(
+                partner_session_token=self.partner.partner_session_token,
+                package_type="Hajj",
+                page=1,
+                page_size=10,
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertLessEqual(len(queries), 12)
 
     def test_get_short_packages_accept_bearer_authorization(self):
         response = self.client.get(
@@ -2018,7 +2487,115 @@ class PartnerWalletEndpointAccessTests(APITransactionTestCase):
             HTTP_AUTHORIZATION=f"Bearer {self.partner.partner_session_token}",
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(response.data), 2)
+        self.assertEqual(response.data.get("count"), 2)
+        self.assertEqual(len(response.data.get("results") or []), 2)
+
+    def test_transaction_history_supports_server_side_filters_and_pagination(self):
+        PartnerTransactionHistory.objects.create(
+            transaction_code="credit-old",
+            transaction_amount=30.0,
+            transaction_type="Credit",
+            transaction_time=timezone.now() - timedelta(days=10),
+            transaction_for_partner=self.partner,
+            transaction_wallet_token=self.wallet,
+        )
+        PartnerTransactionHistory.objects.create(
+            transaction_code="debit-new",
+            transaction_amount=130.0,
+            transaction_type="Debit",
+            transaction_for_partner=self.partner,
+            transaction_wallet_token=self.wallet,
+        )
+
+        response = self.client.get(
+            "/api/v1/operator/me/wallet/transactions/",
+            {
+                "transaction_type": "Credit",
+                "search": "credit",
+                "from_date": (timezone.now() - timedelta(days=2)).date().isoformat(),
+                "page": 1,
+                "page_size": 1,
+                "sort": "-transaction_amount",
+            },
+            HTTP_AUTHORIZATION=f"Bearer {self.partner.partner_session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 1)
+        self.assertEqual(len(response.data.get("results") or []), 1)
+        self.assertEqual(response.data["results"][0].get("transaction_code"), "credit-code-1")
+
+    def test_withdraw_history_is_paginated_and_supports_status_filter(self):
+        bank = PartnerBankAccount.objects.create(
+            account_title="Wallet Partner",
+            account_number="123456789",
+            bank_name="Filter Bank",
+            branch_code="001",
+            bank_account_for_partner=self.partner,
+        )
+        PartnerWithdraw.objects.create(
+            withdraw_for_partner=self.partner,
+            withdraw_bank=bank,
+            withdraw_amount=40.0,
+            withdraw_status="Pending",
+            request_time=timezone.now() - timedelta(days=2),
+        )
+        PartnerWithdraw.objects.create(
+            withdraw_for_partner=self.partner,
+            withdraw_bank=bank,
+            withdraw_amount=60.0,
+            withdraw_status="Pending",
+            request_time=timezone.now() - timedelta(days=1),
+        )
+        PartnerWithdraw.objects.create(
+            withdraw_for_partner=self.partner,
+            withdraw_bank=bank,
+            withdraw_amount=80.0,
+            withdraw_status="Processed",
+        )
+
+        response = self.client.get(
+            "/api/v1/operator/me/wallet/withdrawals/",
+            {
+                "status": "Pending",
+                "page": 1,
+                "page_size": 1,
+                "sort": "-request_time",
+            },
+            HTTP_AUTHORIZATION=f"Bearer {self.partner.partner_session_token}",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data.get("count"), 2)
+        self.assertEqual(len(response.data.get("results") or []), 1)
+        self.assertEqual(response.data["results"][0].get("withdraw_status"), "Pending")
+
+    def test_withdraw_history_query_count_stays_bounded_with_bank_serializer_fields(self):
+        bank = PartnerBankAccount.objects.create(
+            account_title="Wallet Partner",
+            account_number="777777",
+            bank_name="Query Bank",
+            branch_code="002",
+            bank_account_for_partner=self.partner,
+        )
+
+        for index in range(8):
+            PartnerWithdraw.objects.create(
+                withdraw_for_partner=self.partner,
+                withdraw_bank=bank,
+                withdraw_amount=10 + index,
+                withdraw_status="Pending",
+            )
+
+        with CaptureQueriesContext(connection) as context:
+            response = self.client.get(
+                "/api/v1/operator/me/wallet/withdrawals/",
+                {"page": 1, "page_size": 25},
+                HTTP_AUTHORIZATION=f"Bearer {self.partner.partner_session_token}",
+            )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertLessEqual(len(context), 10)
 
     def test_transaction_summary_requires_partner_session_token(self):
         response = self.client.get("/api/v1/operator/me/wallet/summary/")
@@ -2041,7 +2618,8 @@ class PartnerWalletEndpointAccessTests(APITransactionTestCase):
         self.assertEqual(summary_response.status_code, status.HTTP_200_OK)
         self.assertEqual(summary_response.data.get("credit_transaction_amount"), 250.0)
         self.assertEqual(transactions_response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(transactions_response.data), 2)
+        self.assertEqual(transactions_response.data.get("count"), 2)
+        self.assertEqual(len(transactions_response.data.get("results") or []), 2)
         self.assertEqual(profile_response.status_code, status.HTTP_200_OK)
         self.assertEqual(profile_response.data.get("partner_session_token"), self.partner.partner_session_token)
 

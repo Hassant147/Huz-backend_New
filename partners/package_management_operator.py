@@ -3,8 +3,18 @@ from uuid import UUID
 import json
 
 from django.db import transaction
-from django.db.models import Count, FloatField, Q, Sum, Value
-from django.db.models.functions import Coalesce
+from django.db.models import (
+    Count,
+    FloatField,
+    IntegerField,
+    Min,
+    OuterRef,
+    Q,
+    Subquery,
+    Sum,
+    Value,
+)
+from django.db.models.functions import Coalesce, Lower, Trim
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 from rest_framework import serializers, status
@@ -60,6 +70,10 @@ PACKAGE_PREFETCH_RELATED = (
     "package_date_ranges",
     "rating_for_package",
     "package_provider__company_of_partner",
+)
+
+PACKAGE_PREFETCH_RELATED_WITHOUT_RATINGS = tuple(
+    relation for relation in PACKAGE_PREFETCH_RELATED if relation != "rating_for_package"
 )
 
 BASIC_FLOAT_FIELDS = (
@@ -126,6 +140,11 @@ STATUS_NORMALIZER = {
 SUPPORTED_PACKAGE_TYPES = ("Hajj", "Umrah")
 PACKAGE_BOOKING_VALIDITY_LEAD_DAYS = 2
 MASTER_HOTEL_PACKAGE_TOKEN = "__system_master_hotel_package__"
+
+
+class MasterHotelCatalogPagination(CustomPagination):
+    page_size = 25
+    max_page_size = 100
 
 
 def _to_mutable_dict(data):
@@ -245,6 +264,91 @@ def _serialize_catalog_hotel(hotel):
     return payload
 
 
+def _apply_master_hotel_db_dedupe(queryset):
+    dedupe_queryset = queryset.annotate(
+        dedupe_city=Lower(Trim(Coalesce("hotel_city", Value("")))),
+        dedupe_name=Lower(Trim(Coalesce("hotel_name", Value("")))),
+        dedupe_rating=Lower(Trim(Coalesce("hotel_rating", Value("")))),
+    )
+    representative_hotel_ids = (
+        dedupe_queryset.values("dedupe_city", "dedupe_name", "dedupe_rating")
+        .annotate(representative_hotel_id=Min("hotel_id"))
+        .values("representative_hotel_id")
+    )
+    return dedupe_queryset.filter(hotel_id__in=Subquery(representative_hotel_ids))
+
+
+def _apply_expired_package_filter(queryset, reference_date=None):
+    today = reference_date or timezone.localdate()
+    fallback_start_date_min = today + timedelta(days=2)
+
+    annotated_queryset = queryset.annotate(
+        package_date_range_count=Count("package_date_ranges", distinct=True),
+        valid_package_date_range_count=Count(
+            "package_date_ranges",
+            filter=(
+                Q(package_date_ranges__package_validity__date__gte=today)
+                | (
+                    Q(package_date_ranges__package_validity__isnull=True)
+                    & Q(package_date_ranges__start_date__date__gte=fallback_start_date_min)
+                )
+            ),
+            distinct=True,
+        ),
+    )
+
+    ranges_fully_expired_filter = Q(
+        package_date_range_count__gt=0,
+        valid_package_date_range_count=0,
+    )
+    single_window_fully_expired_filter = Q(
+        package_date_range_count=0,
+    ) & (
+        Q(package_validity__date__lt=today)
+        | (
+            Q(package_validity__isnull=True)
+            & Q(start_date__date__lt=fallback_start_date_min)
+        )
+    )
+
+    return annotated_queryset.filter(
+        ranges_fully_expired_filter | single_window_fully_expired_filter
+    )
+
+
+def _annotate_package_rating_summary(queryset):
+    rating_base_queryset = BookingRatingAndReview.objects.filter(
+        rating_for_package=OuterRef("pk")
+    ).values("rating_for_package")
+    package_rating_total_stars_subquery = (
+        rating_base_queryset.annotate(total_stars=Sum("partner_total_stars"))
+        .values("total_stars")[:1]
+    )
+    package_rating_total_count_subquery = (
+        rating_base_queryset.annotate(rating_count=Count("rating_id"))
+        .values("rating_count")[:1]
+    )
+
+    return queryset.annotate(
+        package_rating_total_stars=Coalesce(
+            Subquery(
+                package_rating_total_stars_subquery,
+                output_field=FloatField(),
+            ),
+            Value(0.0),
+            output_field=FloatField(),
+        ),
+        package_rating_total_count=Coalesce(
+            Subquery(
+                package_rating_total_count_subquery,
+                output_field=IntegerField(),
+            ),
+            Value(0),
+            output_field=IntegerField(),
+        ),
+    )
+
+
 class OperatorHuzPackageSerializer(HuzAlignedPackageSerializer):
     pass
 
@@ -311,6 +415,14 @@ class OperatorPackageBaseView(APIView):
             HuzBasicDetail.objects.filter(package_type__in=SUPPORTED_PACKAGE_TYPES)
             .select_related("package_provider")
             .prefetch_related(*PACKAGE_PREFETCH_RELATED)
+        )
+
+    @staticmethod
+    def _package_list_queryset():
+        return (
+            HuzBasicDetail.objects.filter(package_type__in=SUPPORTED_PACKAGE_TYPES)
+            .select_related("package_provider")
+            .prefetch_related(*PACKAGE_PREFETCH_RELATED_WITHOUT_RATINGS)
         )
 
     @staticmethod
@@ -1453,6 +1565,18 @@ class GetAllHotelsWithImagesView(OperatorPackageBaseView):
                 description="Optional search filter",
                 type=openapi.TYPE_STRING,
             ),
+            openapi.Parameter(
+                "page",
+                openapi.IN_QUERY,
+                description="Page number (default 1).",
+                type=openapi.TYPE_INTEGER,
+            ),
+            openapi.Parameter(
+                "page_size",
+                openapi.IN_QUERY,
+                description="Page size (default 25, max 100).",
+                type=openapi.TYPE_INTEGER,
+            ),
         ],
     )
     def get(self, request, *args, **kwargs):
@@ -1473,11 +1597,6 @@ class GetAllHotelsWithImagesView(OperatorPackageBaseView):
             else:
                 queryset = HuzHotelDetail.objects.all()
 
-            queryset = queryset.select_related("catalog_hotel").prefetch_related(
-                "hotel_images",
-                "catalog_hotel__hotel_images",
-            )
-
             if city_filter:
                 queryset = queryset.filter(hotel_city__iexact=city_filter)
             if search_filter:
@@ -1488,24 +1607,25 @@ class GetAllHotelsWithImagesView(OperatorPackageBaseView):
                     | Q(room_sharing_type__icontains=search_filter)
                 )
 
-            hotel_list = list(queryset.order_by("hotel_city", "hotel_name"))
             if not catalog_package:
-                unique_map = {}
-                for hotel in hotel_list:
-                    dedupe_key = (
-                        f"{(hotel.hotel_city or '').strip().lower()}::"
-                        f"{(hotel.hotel_name or '').strip().lower()}::"
-                        f"{(hotel.hotel_rating or '').strip().lower()}"
-                    )
-                    if dedupe_key not in unique_map:
-                        unique_map[dedupe_key] = hotel
-                hotel_list = list(unique_map.values())
+                queryset = _apply_master_hotel_db_dedupe(queryset)
 
-            results = [_serialize_catalog_hotel(hotel) for hotel in hotel_list]
+            queryset = queryset.order_by("hotel_city", "hotel_name", "hotel_id").select_related(
+                "catalog_hotel"
+            ).prefetch_related(
+                "hotel_images",
+                "catalog_hotel__hotel_images",
+            )
+
+            paginator = MasterHotelCatalogPagination()
+            paginated_hotels = paginator.paginate_queryset(queryset, request)
+            results = [_serialize_catalog_hotel(hotel) for hotel in paginated_hotels]
             return Response(
                 {
                     "message": "Hotels fetched successfully.",
-                    "count": len(results),
+                    "count": paginator.page.paginator.count if getattr(paginator, "page", None) else len(results),
+                    "next": paginator.get_next_link(),
+                    "previous": paginator.get_previous_link(),
                     "results": results,
                     "requested_by": partner.partner_session_token,
                 },
@@ -1599,7 +1719,7 @@ class GetHuzShortPackageByTokenView(OperatorPackageBaseView):
             openapi.Parameter(
                 "package_status",
                 openapi.IN_QUERY,
-                description="Optional status filter",
+                description="Optional status filter (supports Expired).",
                 type=openapi.TYPE_STRING,
             ),
             openapi.Parameter(
@@ -1632,7 +1752,7 @@ class GetHuzShortPackageByTokenView(OperatorPackageBaseView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            queryset = self._package_queryset().filter(
+            queryset = self._package_list_queryset().filter(
                 package_provider=partner,
                 package_type=normalized_package_type,
             ).order_by("-created_time")
@@ -1651,18 +1771,37 @@ class GetHuzShortPackageByTokenView(OperatorPackageBaseView):
                 raw_statuses = [
                     item.strip() for item in str(package_status).split(",") if item.strip()
                 ]
+                requests_expired_status = any(
+                    status_item.lower() == "expired" for status_item in raw_statuses
+                )
+                non_expired_statuses = []
                 normalized_statuses = []
                 for item in raw_statuses:
+                    if item.lower() == "expired":
+                        continue
                     normalized_status = STATUS_NORMALIZER.get(item.lower())
-                    normalized_statuses.append(normalized_status or item)
-                queryset = queryset.filter(package_status__in=normalized_statuses)
+                    resolved_status = normalized_status or item
+                    normalized_statuses.append(resolved_status)
+                    non_expired_statuses.append(resolved_status)
 
+                if requests_expired_status and non_expired_statuses:
+                    return Response(
+                        {"message": "Expired status cannot be combined with other package statuses."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                if requests_expired_status:
+                    queryset = _apply_expired_package_filter(queryset)
+                elif normalized_statuses:
+                    queryset = queryset.filter(package_status__in=normalized_statuses)
+
+            queryset = _annotate_package_rating_summary(queryset)
             paginator = CustomPagination()
             paginated_queryset = paginator.paginate_queryset(queryset, request)
             serializer = OperatorHuzPackageSerializer(
                 paginated_queryset,
                 many=True,
-                context={"partner_rating_cache": {}, "request": request},
+                context={"package_rating_cache": {}, "request": request},
             )
             return paginator.get_paginated_response(serializer.data)
         except Exception as exc:
@@ -1726,7 +1865,7 @@ class GetHuzPackageDetailByTokenView(OperatorPackageBaseView):
             serializer = OperatorHuzPackageSerializer(
                 [package],
                 many=True,
-                context={"partner_rating_cache": {}, "request": request},
+                context={"package_rating_cache": {}, "request": request},
             )
             return Response(serializer.data, status=status.HTTP_200_OK)
         except Exception as exc:

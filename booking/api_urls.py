@@ -43,11 +43,13 @@ urlpatterns = [
     path("operator/bookings/ratings/package/", manage_partner_booking.GetRatingPackageWiseView.as_view(), name="v1-operator-rating-package"),
     path("operator/bookings/ratings/package-summary/", manage_partner_booking.GetPackageOverallRatingView.as_view(), name="v1-operator-rating-package-summary"),
     path("operator/bookings/complaints/", manage_partner_booking.GetPartnerComplaintsView.as_view(), name="v1-operator-complaints"),
+    path("operator/bookings/complaints/detail/", manage_partner_booking.GetPartnerComplaintDetailView.as_view(), name="v1-operator-complaints-detail"),
     path("operator/bookings/complaints/summary/", manage_partner_booking.GetOverallPartnerComplaintsView.as_view(), name="v1-operator-complaints-summary"),
     path("operator/bookings/complaints/respond/", manage_partner_booking.GiveUpdateOnComplaintsView.as_view(), name="v1-operator-complaints-respond"),
     path("operator/bookings/statistics/", manage_partner_booking.GetPartnersOverallBookingStatisticsView.as_view(), name="v1-operator-booking-statistics"),
     path("operator/bookings/earnings/yearly/", manage_partner_booking.GetYearlyBookingStatisticsView.as_view(), name="v1-operator-booking-earnings"),
     path("operator/bookings/payments/", manage_partner_booking.PartnersBookingPaymentView.as_view(), name="v1-operator-booking-payments"),
+    path("operator/dashboard/summary/", manage_partner_booking.GetOperatorDashboardSummaryView.as_view(), name="v1-operator-dashboard-summary"),
 ]
 
 urlpatterns += router.urls

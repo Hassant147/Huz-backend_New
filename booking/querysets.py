@@ -1,8 +1,23 @@
-from django.db.models import Case, CharField, F, IntegerField, OuterRef, Q, Subquery, Value, When
+from django.db.models import (
+    BooleanField,
+    Case,
+    CharField,
+    Count,
+    Exists,
+    F,
+    FloatField,
+    IntegerField,
+    OuterRef,
+    Q,
+    Subquery,
+    Sum,
+    Value,
+    When,
+)
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
-from .models import Payment
+from .models import PassportValidity, Payment, TravelerIssue
 from .statuses import (
     BOOKING_STATUS_AWAITING_FINAL_PAYMENT,
     BOOKING_STATUS_CANCELLED,
@@ -67,6 +82,79 @@ def _latest_payment_status_subquery(stage):
         .order_by("-transaction_time")
         .values("payment_status")[:1],
         output_field=CharField(),
+    )
+
+
+def _approved_payment_total_subquery():
+    return Subquery(
+        Payment.objects.filter(
+            booking_token=OuterRef("pk"),
+            payment_status__iexact="APPROVED",
+        )
+        .values("booking_token")
+        .annotate(total_amount=Sum("transaction_amount"))
+        .values("total_amount")[:1],
+        output_field=FloatField(),
+    )
+
+
+def _complete_passport_count_subquery():
+    return Subquery(
+        PassportValidity.objects.filter(
+            passport_for_booking_number=OuterRef("pk"),
+            user_passport__isnull=False,
+            user_photo__isnull=False,
+            first_name__isnull=False,
+            last_name__isnull=False,
+            date_of_birth__isnull=False,
+            passport_number__isnull=False,
+            passport_country__isnull=False,
+            expiry_date__isnull=False,
+        )
+        .exclude(first_name="")
+        .exclude(last_name="")
+        .exclude(passport_number="")
+        .exclude(passport_country="")
+        .values("passport_for_booking_number")
+        .annotate(total=Count("passport_id"))
+        .values("total")[:1],
+        output_field=IntegerField(),
+    )
+
+
+def annotate_partner_booking_list_metrics(queryset):
+    queryset = queryset.annotate(
+        annotated_total_approved_payment_amount=Coalesce(
+            _approved_payment_total_subquery(),
+            Value(0.0),
+            output_field=FloatField(),
+        ),
+        annotated_has_open_traveler_issues=Exists(
+            TravelerIssue.objects.filter(
+                booking=OuterRef("pk"),
+                status__iexact=TravelerIssue.STATUS_OPEN,
+            )
+        ),
+        annotated_complete_passport_count=Coalesce(
+            _complete_passport_count_subquery(),
+            Value(0),
+            output_field=IntegerField(),
+        ),
+        annotated_expected_traveller_count=(
+            Coalesce(F("adults"), Value(0), output_field=IntegerField())
+            + Coalesce(F("child"), Value(0), output_field=IntegerField())
+            + Coalesce(F("infants"), Value(0), output_field=IntegerField())
+        ),
+    )
+    return queryset.annotate(
+        annotated_passports_complete=Case(
+            When(
+                annotated_complete_passport_count__gte=F("annotated_expected_traveller_count"),
+                then=Value(True),
+            ),
+            default=Value(False),
+            output_field=BooleanField(),
+        )
     )
 
 
