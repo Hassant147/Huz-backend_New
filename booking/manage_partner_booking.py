@@ -1645,6 +1645,12 @@ class BookingAirlineDetailsView(AuthenticatedPartnerBookingMutationAPIView):
                     flight_time=request.data.get('flight_time'),
                     flight_from=request.data.get('flight_from'),
                     flight_to=request.data.get('flight_to'),
+                    # Phase 6 – ticket / operational fields (all optional)
+                    airline_name=request.data.get('airline_name') or None,
+                    flight_number=request.data.get('flight_number') or None,
+                    pnr=request.data.get('pnr') or None,
+                    baggage_note=request.data.get('baggage_note') or None,
+                    route_note=request.data.get('route_note') or None,
                     airline_for_booking=booking_detail
                 )
 
@@ -1747,6 +1753,17 @@ class BookingAirlineDetailsView(AuthenticatedPartnerBookingMutationAPIView):
                 airline_detail.flight_time = data.get('flight_time')
                 airline_detail.flight_from = data.get('flight_from')
                 airline_detail.flight_to = data.get('flight_to')
+                # Phase 6 – ticket / operational fields (all optional; allow clearing by sending '')
+                if 'airline_name' in data:
+                    airline_detail.airline_name = data.get('airline_name') or None
+                if 'flight_number' in data:
+                    airline_detail.flight_number = data.get('flight_number') or None
+                if 'pnr' in data:
+                    airline_detail.pnr = data.get('pnr') or None
+                if 'baggage_note' in data:
+                    airline_detail.baggage_note = data.get('baggage_note') or None
+                if 'route_note' in data:
+                    airline_detail.route_note = data.get('route_note') or None
                 airline_detail.save()
 
                 doc = sync_booking_document_status(booking_detail)

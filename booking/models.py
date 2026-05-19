@@ -260,11 +260,17 @@ class BookingAirlineDetail(models.Model):
     flight_time = models.TimeField()
     flight_from = models.CharField(max_length=100)
     flight_to = models.CharField(max_length=100, null=True)
+    # Ticket / operational fields (Phase 6)
+    airline_name = models.CharField(max_length=150, null=True, blank=True)
+    flight_number = models.CharField(max_length=20, null=True, blank=True)
+    pnr = models.CharField(max_length=20, null=True, blank=True)
+    baggage_note = models.TextField(null=True, blank=True)
+    route_note = models.TextField(null=True, blank=True)
     # Reference to the related booking
     airline_for_booking = models.ForeignKey(Booking, related_name='airline_for_booking', on_delete=models.SET_NULL, null=True)
 
     def __str__(self):
-        return self.booking_airline_id
+        return str(self.booking_airline_id)
 
 
 class BookingHotelFulfillment(models.Model):

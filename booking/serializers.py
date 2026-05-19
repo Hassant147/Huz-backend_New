@@ -969,7 +969,20 @@ class DocumentsStatusSerializer(serializers.ModelSerializer):
 class BookingAirlineSerializer(serializers.ModelSerializer):
     class Meta:
         model = BookingAirlineDetail
-        fields = ['booking_airline_id', 'flight_direction', 'flight_date', 'flight_time', 'flight_from', 'flight_to']
+        fields = [
+            'booking_airline_id',
+            'flight_direction',
+            'flight_date',
+            'flight_time',
+            'flight_from',
+            'flight_to',
+            # Phase 6 – ticket / operational fields
+            'airline_name',
+            'flight_number',
+            'pnr',
+            'baggage_note',
+            'route_note',
+        ]
 
 
 class BookingHotelFulfillmentSerializer(serializers.ModelSerializer):
